@@ -1,0 +1,19 @@
+[package]
+name = "raxosentinel-email"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Email and MIME parsing, attachment extraction and analysis for RaxoSentinel"
+
+[dependencies]
+raxosentinel-core = { path = "../raxosentinel-core" }
+raxosentinel-filetypes = { path = "../raxosentinel-filetypes" }
+raxosentinel-signatures = { path = "../raxosentinel-signatures" }
+mail-parser.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

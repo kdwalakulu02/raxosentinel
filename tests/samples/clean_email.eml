@@ -1,0 +1,15 @@
+From: alice@corporate.example.com
+To: bob@client.example.com
+Subject: Project Status Update
+Date: Sun, 1 Nov 2026 10:00:00 +0000
+Message-ID: <1234567890@corporate.example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Hi Bob,
+
+Phase 1 development is progressing ahead of schedule.
+All quality gates and unit tests are passing.
+
+Regards,
+Alice

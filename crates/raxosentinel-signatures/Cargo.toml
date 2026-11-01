@@ -1,0 +1,18 @@
+[package]
+name = "raxosentinel-signatures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native hash and byte-pattern signature matching engine for RaxoSentinel"
+
+[dependencies]
+raxosentinel-core = { path = "../raxosentinel-core" }
+aho-corasick.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

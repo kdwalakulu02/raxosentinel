@@ -1,0 +1,139 @@
+# RaxoSentinel Core — Development Phase 1
+
+We are starting a new independent Rust project called **RaxoSentinel Core**.
+
+## Project objective
+
+Build the foundation of a native Rust malware-detection engine, initially specialising in email infrastructure.
+
+Long-term, the engine should compete with established scanners in email-specific detection quality, memory efficiency and performance.
+
+It must eventually be independently usable by third-party developers.
+
+This is NOT a ClamAV wrapper, desktop antivirus, dashboard or cloud SaaS project.
+
+## Critical boundaries
+
+1. Create a completely separate project named `raxosentinel`.
+2. Do not modify the existing Raxo Email application.
+3. Do not access, modify or restart any services on our production VPS.
+4. Do not remove or replace ClamAV.
+5. Do not copy ClamAV's scanning engine or source code.
+6. Do not publish this project publicly yet.
+7. Preserve any existing work and Git history if the project directory already exists.
+
+## Licensing
+
+The intended licence for original RaxoSentinel source code is **GPL-2.0-or-later**.
+
+Use appropriate copyright and licence notices. Review third-party dependency licences.
+
+Do not incorporate third-party code or signature databases without checking redistribution permissions.
+
+## Phase 1 architecture
+
+Create a Rust workspace containing:
+
+- `raxosentinel-core`: Core scanning interfaces, detection results and resource limits.
+- `raxosentinel-filetypes`: Content-based file identification.
+- `raxosentinel-signatures`: Initial native signature-matching functionality.
+- `raxosentinel-email`: Email/MIME parsing and attachment extraction.
+- `raxosentinel-cli`: Command-line scanner.
+
+Use Rust stable and established, maintained dependencies.
+
+Do not introduce PostgreSQL, NATS, S3, React, billing or customer authentication.
+
+## First functional milestone
+
+Implement a standalone CLI:
+
+`raxosentinel scan <file-path> --json`
+
+Initially support:
+
+1. File identification using actual content, not just filename extensions.
+2. SHA-256 hashing with bounded-memory file reading.
+3. Basic native hash and byte-pattern signature matching.
+4. MIME email parsing and attachment identification.
+5. Configurable file-size and resource limits.
+6. Structured JSON scan results.
+7. Clear differentiation between detected threats, no detection, unsupported content and scanning failures.
+
+Do not describe a file as universally safe merely because the initial detection engine found nothing.
+
+## Security requirements
+
+- Treat all input files as untrusted.
+- Reject malformed inputs safely.
+- Avoid uncontrolled memory allocation.
+- Enforce processing limits.
+- No network access or external file uploads during scanning.
+- Do not log raw email content or attachments.
+- Avoid `unsafe` Rust unless clearly justified.
+- Do not bundle real malware samples in the repository.
+- Keep file processing independent from Raxo's private infrastructure.
+
+## Testing
+
+Write automated tests covering:
+
+- Valid and invalid file headers
+- Malformed MIME messages
+- Multipart attachment extraction
+- File-size enforcement
+- Known benign samples
+- Synthetic signature matches
+- EICAR antivirus test-string detection
+- Unsupported input handling
+- Empty and truncated files
+
+Add performance benchmarks measuring:
+
+- Scan duration
+- Throughput
+- Peak memory usage
+- Normal memory usage
+
+Do not claim superiority over ClamAV until comparative testing has been performed.
+
+## Required quality checks
+
+Run and report:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+
+All checks must pass.
+
+## Documentation
+
+Create:
+
+- `README.md`
+- `ARCHITECTURE.md`
+- `THREAT_MODEL.md`
+- `ROADMAP.md`
+- `LICENSE`
+- `CONTRIBUTING.md`
+- `SECURITY.md`
+
+Document what the engine currently detects and, equally importantly, what it cannot detect.
+
+## Handover
+
+When Phase 1 is complete, report:
+
+1. Rust workspace structure.
+2. Implemented functionality.
+3. Test results.
+4. CLI demonstration.
+5. Measured memory consumption.
+6. Known limitations.
+7. Security concerns.
+8. Recommended Phase 2 work.
+
+**Do not implement Phase 2 or publish the repository without approval.**
+
+Our immediate objective is a tested, independently functioning Rust-native scanning foundation. Do not claim production-grade antivirus protection at this stage.
