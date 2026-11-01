@@ -6,6 +6,7 @@ members = [
     "crates/raxosentinel-email",
     "crates/raxosentinel-cli",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

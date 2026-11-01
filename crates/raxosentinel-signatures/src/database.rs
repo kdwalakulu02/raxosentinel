@@ -134,7 +134,7 @@ impl SignatureDatabase {
             threats.push(rule.to_threat(start_offset));
         }
 
-        self.deduplicate_threats(threats)
+        Self::deduplicate_threats(threats)
     }
 
     /// Scans a streaming reader with bounded memory buffers while seamlessly preserving
@@ -227,16 +227,20 @@ impl SignatureDatabase {
             stream_offset += n;
         }
 
-        Ok(self.deduplicate_threats(threats))
+        Ok(Self::deduplicate_threats(threats))
     }
 
-    fn deduplicate_threats(&self, threats: Vec<Threat>) -> Vec<Threat> {
+    pub fn deduplicate_threats(threats: Vec<Threat>) -> Vec<Threat> {
         let mut deduped: Vec<Threat> = Vec::new();
         for threat in threats {
-            if !deduped
-                .iter()
-                .any(|t| t.name == threat.name && t.location == threat.location)
+            if let Some(existing) = deduped
+                .iter_mut()
+                .find(|t| t.name == threat.name && t.location == threat.location)
             {
+                if !existing.matched_by.contains(&threat.matched_by) {
+                    existing.matched_by = format!("{}; {}", existing.matched_by, threat.matched_by);
+                }
+            } else {
                 deduped.push(threat);
             }
         }

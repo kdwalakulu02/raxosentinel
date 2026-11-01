@@ -44,16 +44,18 @@ pub fn detect_type(header: &[u8]) -> FileType {
                 u32::from_le_bytes([header[0x3C], header[0x3D], header[0x3E], header[0x3F]])
                     as usize;
 
-            if header.len() >= pe_offset + 4 && &header[pe_offset..pe_offset + 4] == b"PE\0\0" {
-                return FileType::new(
-                    "application/vnd.microsoft.portable-executable",
-                    FileCategory::Executable,
-                    "Windows PE Executable / Dynamic Link Library",
-                    &["exe", "dll", "sys", "scr", "ocx", "cpl"],
-                    true,
-                    true,
-                    false,
-                );
+            if let Some(pe_end) = pe_offset.checked_add(4) {
+                if header.len() >= pe_end && &header[pe_offset..pe_end] == b"PE\0\0" {
+                    return FileType::new(
+                        "application/vnd.microsoft.portable-executable",
+                        FileCategory::Executable,
+                        "Windows PE Executable / Dynamic Link Library",
+                        &["exe", "dll", "sys", "scr", "ocx", "cpl"],
+                        true,
+                        true,
+                        false,
+                    );
+                }
             }
         }
         return FileType::new(
@@ -416,8 +418,43 @@ pub fn detect_file_type(path: &Path) -> std::io::Result<FileType> {
     Ok(detect_type(&buffer[..bytes_read]))
 }
 
-/// Identifies deceptive filename extensions (e.g. executable or script disguised as PDF/JPG).
+/// Identifies deceptive filename extensions (e.g. executable or script disguised as PDF/JPG, RTLO, double extensions).
 pub fn check_extension_mismatch(filename: &str, detected_type: &FileType) -> Option<Threat> {
+    // 1. Check for Right-To-Left Override (RTLO) and directional spoofing (U+202A..=U+202E, U+2066..=U+2069, U+200E, U+200F)
+    if filename.chars().any(|c| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')) {
+        return Some(Threat::new(
+            "Suspicious.Filename.RightToLeftOverride",
+            ThreatCategory::ExtensionMismatch,
+            Severity::Critical,
+            format!("Malicious Unicode directional override (RTLO) detected in filename: '{}'", filename),
+            "filename_security_audit",
+        ).with_location(filename));
+    }
+
+    // 2. Check for trailing space or dot evasion (e.g., 'payload.exe.' or 'invoice.pdf.exe ')
+    let trimmed = filename.trim().trim_end_matches('.');
+    if trimmed != filename && !trimmed.is_empty() {
+        let p_trimmed = Path::new(trimmed);
+        if let Some(t_ext) = p_trimmed
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+        {
+            let dangerous_exts = [
+                "exe", "scr", "bat", "cmd", "vbs", "ps1", "pif", "com", "hta", "jar", "dll",
+            ];
+            if dangerous_exts.contains(&t_ext.as_str()) {
+                return Some(Threat::new(
+                    "Suspicious.Filename.TrailingDelimiterEvasion",
+                    ThreatCategory::ExtensionMismatch,
+                    Severity::High,
+                    format!("Filename '{}' conceals dangerous extension '.{}' via trailing spaces or dots", filename, t_ext),
+                    "filename_security_audit",
+                ).with_location(filename));
+            }
+        }
+    }
+
     let path = Path::new(filename);
     let ext = path.extension()?.to_str()?.to_lowercase();
 

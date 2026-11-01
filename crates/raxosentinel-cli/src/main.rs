@@ -202,6 +202,33 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
             );
         }
     };
+    // Reject non-regular files (directories, fifos, sockets, character/block devices)
+    if !metadata.is_file() {
+        let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
+        let mime = if metadata.is_dir() {
+            "inode/directory"
+        } else {
+            "inode/special"
+        };
+        return ScanReport::new(
+            TargetMetadata {
+                path: Some(path.display().to_string()),
+                file_name: path.file_name().map(|n| n.to_string_lossy().to_string()),
+                file_size_bytes: metadata.len(),
+                sha256: String::new(),
+                detected_mime: mime.to_string(),
+                declared_mime: None,
+            },
+            ScanStatus::Unsupported,
+            Vec::new(),
+            Vec::new(),
+            duration_ms,
+            Some(format!(
+                "Target is not a regular file (directory or special device): {}",
+                path.display()
+            )),
+        );
+    }
 
     if let Err(e) = tracker.check_file_size(metadata.len()) {
         let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
@@ -320,6 +347,7 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
     }
 
     // 3. Scan byte patterns across file stream
+    tracker.reset_bytes_read();
     match File::open(path) {
         Ok(file) => {
             let mut reader = std::io::BufReader::with_capacity(tracker.limits().buffer_size, file);
@@ -364,6 +392,8 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
             );
         }
     }
+
+    let threats = SignatureDatabase::deduplicate_threats(threats);
 
     let status = if !threats.is_empty() {
         ScanStatus::Infected
@@ -432,11 +462,12 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
             println!("Detected Threats ({}):", report.threats.len());
             for (idx, t) in report.threats.iter().enumerate() {
                 println!(
-                    "  [{}] {} | Category: {} | Severity: {}",
+                    "  [{}] {} | Category: {} | Severity: {} | Type: {}",
                     idx + 1,
                     t.name,
                     t.category,
-                    t.severity
+                    t.severity,
+                    t.detection_type,
                 );
                 println!("      Description : {}", t.description);
                 println!("      Triggered By: {}", t.matched_by);
@@ -541,5 +572,21 @@ mod tests {
 
         let report = scan_path(path, &db, &mut tracker);
         assert_eq!(report.status, ScanStatus::Failed);
+    }
+
+    #[test]
+    fn test_cli_scan_directory_target() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = SignatureDatabase::with_defaults();
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scan_path(temp_dir.path(), &db, &mut tracker);
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("not a regular file"));
     }
 }

@@ -40,6 +40,25 @@ impl std::fmt::Display for Severity {
     }
 }
 
+/// Distinguishes strong deterministic signature matches from heuristic suspicion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionType {
+    /// Deterministic match against an exact hash or verified static byte sequence.
+    Deterministic,
+    /// Heuristic anomaly, structural defect, extension mismatch, or suspicious pattern.
+    Heuristic,
+}
+
+impl std::fmt::Display for DetectionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetectionType::Deterministic => write!(f, "Deterministic Signature"),
+            DetectionType::Heuristic => write!(f, "Heuristic Suspicion"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreatCategory {
@@ -56,6 +75,34 @@ pub enum ThreatCategory {
     ExtensionMismatch,
     SuspiciousExecutable,
     Other(String),
+}
+
+impl ThreatCategory {
+    pub fn default_detection_type(&self) -> DetectionType {
+        match self {
+            ThreatCategory::TestSignature
+            | ThreatCategory::Virus
+            | ThreatCategory::Trojan
+            | ThreatCategory::Worm
+            | ThreatCategory::Ransomware
+            | ThreatCategory::Exploit => DetectionType::Deterministic,
+            ThreatCategory::Phishing
+            | ThreatCategory::SuspiciousScript
+            | ThreatCategory::MacroMalware
+            | ThreatCategory::SuspiciousArchive
+            | ThreatCategory::ExtensionMismatch
+            | ThreatCategory::SuspiciousExecutable
+            | ThreatCategory::Other(_) => DetectionType::Heuristic,
+        }
+    }
+
+    pub fn is_deterministic(&self) -> bool {
+        self.default_detection_type() == DetectionType::Deterministic
+    }
+
+    pub fn is_heuristic(&self) -> bool {
+        self.default_detection_type() == DetectionType::Heuristic
+    }
 }
 
 impl std::fmt::Display for ThreatCategory {
@@ -85,6 +132,8 @@ pub struct Threat {
     pub name: String,
     /// Categorization of the threat
     pub category: ThreatCategory,
+    /// Strong signature match vs heuristic suspicion
+    pub detection_type: DetectionType,
     /// Assessed severity level
     pub severity: Severity,
     /// Human-readable explanation of why this was flagged
@@ -103,14 +152,21 @@ impl Threat {
         description: impl Into<String>,
         matched_by: impl Into<String>,
     ) -> Self {
+        let detection_type = category.default_detection_type();
         Self {
             name: name.into(),
             category,
+            detection_type,
             severity,
             description: description.into(),
             matched_by: matched_by.into(),
             location: None,
         }
+    }
+
+    pub fn with_detection_type(mut self, detection_type: DetectionType) -> Self {
+        self.detection_type = detection_type;
+        self
     }
 
     pub fn with_location(mut self, location: impl Into<String>) -> Self {

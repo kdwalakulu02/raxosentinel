@@ -41,6 +41,8 @@ impl<'a> EmailScanner<'a> {
         path_hint: Option<&str>,
         tracker: &mut ResourceTracker,
     ) -> Result<ScanReport, ScanError> {
+        tracker.check_file_size(raw_bytes.len() as u64)?;
+        tracker.record_bytes_read(raw_bytes.len())?;
         self.scan_internal(raw_bytes, path_hint, tracker, 0)
     }
 
@@ -54,6 +56,13 @@ impl<'a> EmailScanner<'a> {
             path: path.to_path_buf(),
             source: e,
         })?;
+
+        if !metadata.is_file() {
+            return Err(ScanError::UnsupportedFormat(format!(
+                "Target '{}' is not a regular file",
+                path.display()
+            )));
+        }
 
         tracker.check_file_size(metadata.len())?;
         let bytes = std::fs::read(path).map_err(|e| ScanError::IoWithPath {
@@ -74,6 +83,7 @@ impl<'a> EmailScanner<'a> {
     ) -> Result<ScanReport, ScanError> {
         let start_ms = tracker.elapsed_millis();
         tracker.check_depth(depth)?;
+        tracker.check_timeout()?;
 
         let sha256 = hash_bytes(raw_bytes);
         let detected_type = detect_type(raw_bytes);
@@ -117,16 +127,27 @@ impl<'a> EmailScanner<'a> {
         }
 
         // 2. Scan email bodies (text and html)
-        self.scan_bodies(&parsed, &mut threats);
+        self.scan_bodies(&parsed, &mut threats, tracker)?;
 
-        // 3. Scan attachments and embedded parts
+        // 3. Scan attachments and embedded parts (including inline payloads)
         self.scan_attachments(&parsed, &mut threats, &mut sub_reports, tracker, depth)?;
+
+        // Consolidate duplicate threats across bodies or attachments
+        let threats = SignatureDatabase::deduplicate_threats(threats);
 
         let has_threats =
             !threats.is_empty() || sub_reports.iter().any(|r| r.status == ScanStatus::Infected);
 
+        // Critical verdict semantics: scanning failures or unsupported parts must never return Clean!
         let overall_status = if has_threats {
             ScanStatus::Infected
+        } else if sub_reports.iter().any(|r| r.status == ScanStatus::Failed) {
+            ScanStatus::Failed
+        } else if sub_reports
+            .iter()
+            .any(|r| r.status == ScanStatus::Unsupported)
+        {
+            ScanStatus::Unsupported
         } else {
             ScanStatus::Clean
         };
@@ -152,24 +173,44 @@ impl<'a> EmailScanner<'a> {
         ))
     }
 
-    fn scan_bodies(&self, msg: &Message, threats: &mut Vec<Threat>) {
-        // Scan text bodies
-        for (idx, text) in msg.text_bodies().enumerate() {
-            let body_bytes = text.as_bytes();
-            let body_threats = self.db.match_bytes(body_bytes);
-            for t in body_threats {
-                threats.push(t.with_location(format!("body:text/plain:part_{}", idx)));
+    fn scan_bodies(
+        &self,
+        msg: &Message,
+        threats: &mut Vec<Threat>,
+        tracker: &ResourceTracker,
+    ) -> Result<(), ScanError> {
+        tracker.check_timeout()?;
+
+        // Scan text bodies if message has plain text parts or default unlabelled body
+        let has_plain_body = msg
+            .text_body()
+            .any(|p| p.is_content_type("text", "plain") || p.content_type().is_none());
+        if has_plain_body {
+            for (idx, text) in msg.text_bodies().enumerate() {
+                tracker.check_timeout()?;
+                let body_bytes = text.as_bytes();
+                let body_threats = self.db.match_bytes(body_bytes);
+                for t in body_threats {
+                    threats.push(t.with_location(format!("body:text/plain:part_{}", idx)));
+                }
             }
         }
 
-        // Scan HTML bodies
-        for (idx, html) in msg.html_bodies().enumerate() {
-            let body_bytes = html.as_bytes();
-            let body_threats = self.db.match_bytes(body_bytes);
-            for t in body_threats {
-                threats.push(t.with_location(format!("body:text/html:part_{}", idx)));
+        // Scan HTML bodies only if the email actually contained distinct HTML part(s),
+        // preventing duplicate scans and duplicate threat reports from mail-parser's synthetic conversion.
+        let has_explicit_html = msg.html_body().any(|p| p.is_content_type("text", "html"));
+        if has_explicit_html {
+            for (idx, html) in msg.html_bodies().enumerate() {
+                tracker.check_timeout()?;
+                let body_bytes = html.as_bytes();
+                let body_threats = self.db.match_bytes(body_bytes);
+                for t in body_threats {
+                    threats.push(t.with_location(format!("body:text/html:part_{}", idx)));
+                }
             }
         }
+
+        Ok(())
     }
 
     fn scan_attachments(
@@ -180,12 +221,15 @@ impl<'a> EmailScanner<'a> {
         tracker: &mut ResourceTracker,
         depth: usize,
     ) -> Result<(), ScanError> {
+        // 1. Scan explicit attachments
         for (idx, attachment) in msg.attachments().enumerate() {
-            let decoded_data = attachment.decoded();
-            let attachment_size = decoded_data.len() as u64;
+            tracker.check_timeout()?;
 
-            // Enforce resource limits per attachment
-            tracker.register_attachment(attachment_size)?;
+            // Pre-check estimated decoded length to prevent Base64 / QP memory expansion bomb!
+            let estimated_size = attachment.decoded_len() as u64;
+            tracker.register_attachment(estimated_size)?;
+
+            let decoded_data = attachment.decoded();
 
             let filename = attachment
                 .attachment_name()
@@ -205,7 +249,43 @@ impl<'a> EmailScanner<'a> {
                 depth,
             )?;
 
-            // If sub-target has threats, also roll them up to parent threat list with location tag
+            for t in &sub_report.threats {
+                threats.push(t.clone());
+            }
+
+            sub_reports.push(sub_report);
+        }
+
+        // 2. Scan other parts (e.g. inline attachments, unclassified non-body parts)
+        for (idx, part) in msg.other_parts().enumerate() {
+            tracker.check_timeout()?;
+            if part.in_text_body() || part.in_html_body() {
+                continue;
+            }
+
+            let estimated_size = part.decoded_len() as u64;
+            tracker.register_attachment(estimated_size)?;
+
+            let decoded_data = part.decoded();
+
+            let filename = part
+                .attachment_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("inline_part_{}", idx));
+
+            let declared_mime = part
+                .content_type()
+                .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("*")));
+
+            let sub_report = self.scan_single_attachment(
+                &filename,
+                declared_mime.as_deref(),
+                &part,
+                &decoded_data,
+                tracker,
+                depth,
+            )?;
+
             for t in &sub_report.threats {
                 threats.push(t.clone());
             }
@@ -226,6 +306,8 @@ impl<'a> EmailScanner<'a> {
         depth: usize,
     ) -> Result<ScanReport, ScanError> {
         let start_ms = tracker.elapsed_millis();
+        tracker.check_timeout()?;
+
         let sha256 = hash_bytes(data);
         let detected_type = detect_type(data);
 
@@ -252,6 +334,9 @@ impl<'a> EmailScanner<'a> {
         for t in pattern_threats {
             part_threats.push(t.with_location(format!("attachment:{}", filename)));
         }
+
+        // Deduplicate threats on the same attachment (e.g. hash + pattern match)
+        let part_threats = SignatureDatabase::deduplicate_threats(part_threats);
 
         let status = if !part_threats.is_empty() {
             ScanStatus::Infected
@@ -312,7 +397,7 @@ mod tests {
             .scan_bytes(email, Some("eicar_body.eml"), &mut tracker)
             .unwrap();
         assert_eq!(report.status, ScanStatus::Infected);
-        assert!(!report.threats.is_empty());
+        assert_eq!(report.threats.len(), 1);
         assert_eq!(report.threats[0].name, "EICAR-Standard-Antivirus-Test-File");
     }
 
@@ -350,15 +435,13 @@ X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\r\n\
             report.sub_targets[0].target.file_name.as_deref(),
             Some("eicar.com")
         );
-        assert!(report
-            .threats
-            .iter()
-            .any(|t| t.name == "EICAR-Standard-Antivirus-Test-File"));
+        // Deduplicated threat consolidated
+        assert_eq!(report.threats.len(), 1);
+        assert_eq!(report.threats[0].name, "EICAR-Standard-Antivirus-Test-File");
     }
 
     #[test]
     fn test_scan_multipart_disguised_executable_mismatch() {
-        // Attachment named "invoice.pdf" containing a Windows PE header MZ ... PE\0\0
         let mut pe_bytes = vec![0u8; 128];
         pe_bytes[0] = b'M';
         pe_bytes[1] = b'Z';
@@ -425,7 +508,6 @@ B\r\n\
 
         let db = SignatureDatabase::with_defaults();
         let scanner = EmailScanner::new(&db);
-        // Set attachment limit to 1
         let limits = ResourceLimits {
             max_email_attachments: 1,
             ..Default::default()
@@ -441,6 +523,61 @@ B\r\n\
     }
 
     #[test]
+    fn test_scan_bytes_enforces_file_size_limit() {
+        let large_email = vec![b'A'; 2000];
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits {
+            max_file_size: 1000,
+            ..Default::default()
+        };
+        let mut tracker = ResourceTracker::new(limits);
+
+        let res = scanner.scan_bytes(&large_email, None, &mut tracker);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            ScanError::FileSizeLimitExceeded { limit, actual } => {
+                assert_eq!(limit, 1000);
+                assert_eq!(actual, 2000);
+            }
+            other => panic!("Unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scan_inline_attachment_covered() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+From: sender@example.com\r\n\
+To: recipient@example.com\r\n\
+Subject: Inline Test\r\n\
+Content-Type: multipart/related; boundary=\"REL_BOUND\"\r\n\
+\r\n\
+--REL_BOUND\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<p>Look at inline payload</p>\r\n\
+--REL_BOUND\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: inline; filename=\"inline_eicar.com\"\r\n\
+\r\n\
+X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\r\n\
+--REL_BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("inline.eml"), &mut tracker)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Infected);
+        assert!(!report.sub_targets.is_empty());
+        assert_eq!(report.threats.len(), 1);
+        assert_eq!(report.threats[0].name, "EICAR-Standard-Antivirus-Test-File");
+    }
+
+    #[test]
     fn test_malformed_mime_handled_gracefully() {
         let malformed = b"\x00\x01\x02\x03\xff\xfe\x00";
         let db = SignatureDatabase::with_defaults();
@@ -448,7 +585,6 @@ B\r\n\
         let limits = ResourceLimits::default();
         let mut tracker = ResourceTracker::new(limits);
 
-        // Should return a report without panicking
         let report = scanner
             .scan_bytes(malformed, Some("bad.eml"), &mut tracker)
             .unwrap();

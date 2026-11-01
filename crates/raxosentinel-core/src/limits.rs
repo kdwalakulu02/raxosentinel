@@ -110,6 +110,11 @@ impl ResourceTracker {
         Ok(())
     }
 
+    /// Resets stream byte counter before a new pass over the same target file.
+    pub fn reset_bytes_read(&mut self) {
+        self.total_bytes_read = 0;
+    }
+
     /// Checks if a file with known size exceeds max_file_size limit.
     pub fn check_file_size(&self, size: u64) -> Result<(), ScanError> {
         if size > self.limits.max_file_size {

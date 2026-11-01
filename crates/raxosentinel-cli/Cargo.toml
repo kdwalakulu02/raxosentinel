@@ -10,6 +10,10 @@ description = "Command-line malware scanner for RaxoSentinel"
 name = "raxosentinel"
 path = "src/main.rs"
 
+[[bin]]
+name = "stress_benchmark"
+path = "src/bin/stress_benchmark.rs"
+
 [dependencies]
 raxosentinel-core = { path = "../raxosentinel-core" }
 raxosentinel-filetypes = { path = "../raxosentinel-filetypes" }

@@ -27,12 +27,14 @@ RaxoSentinel is organized as a modular Rust workspace consisting of 5 specialize
 
 ## Detection Capabilities
 
-### What the Engine Currently Detects (Phase 1)
+### What the Engine Currently Detects (Phase 1 & Phase 1.1)
 1. **Content-Based File Identification**:
    - Identifies executables (`PE`, `MS-DOS`, `ELF`, `Mach-O`, `Java Class`, `WebAssembly`), documents (`PDF`, `RTF`, `OLE CFBF`, `Office Open XML`), archives (`ZIP`, `GZIP`, `BZIP2`, `7z`, `RAR`, `TAR`, `XZ`), email messages (`RFC 822 / MIME`), scripts (`Shell`, `Python`, `Batch`, `PowerShell`, `HTML/XML`), and images (`PNG`, `JPEG`, `GIF`, `BMP`, `WebP`).
-2. **Deceptive Extension Mismatches & Disguised Executables**:
+2. **Deceptive Extension Mismatches & Advanced Evasion Analysis**:
    - Detects executables disguised under benign extensions (e.g., a Windows PE executable named `invoice.pdf` or `photo.jpg`).
-   - Detects dangerous double extensions (e.g., `document.pdf.exe`).
+   - Detects deceptive double extensions (e.g., `document.pdf.exe`).
+   - Detects Right-to-Left Override (RTLO) Unicode directional spoofing (e.g., `invoice\u{202E}cod.exe` disguised as `invoiceexe.doc`).
+   - Detects trailing space and dot evasion attempts (e.g., `payload.exe. ` or `script.vbs.`).
 3. **Exact SHA-256 Hash Matching**:
    - Matches file or attachment digests against precompiled and user-supplied hash databases with zero memory overhead.
 4. **Streaming Byte-Pattern Matching (Aho-Corasick)**:
@@ -48,10 +50,14 @@ RaxoSentinel is organized as a modular Rust workspace consisting of 5 specialize
    - Extracts and scans attachments in `multipart/mixed`, `multipart/related`, and `multipart/alternative` messages.
    - Recursively inspects nested `message/rfc822` email attachments up to configurable depth limits.
    - Scans plain text and HTML email bodies for embedded threats and payload strings.
+   - Prevents Base64 and Quoted-Printable decompression memory bombs via pre-check of estimated decoded lengths.
+   - Distinguishes deterministic signature hits from heuristic suspicion.
+   - Enforces verdict integrity: scanning errors or unsupported encrypted attachments never return false `CLEAN` verdicts.
 
-### What the Engine CANNOT Detect Yet (Phase 1 Limitations)
+### What the Engine CANNOT Detect Yet (Phase 1 / 1.1 Boundaries)
 To maintain technical integrity and security transparency, the following limitations are explicitly noted:
-- **Packed and Cryptor-Protected Binaries**: The engine does not yet include runtime PE unpackers (e.g., UPX decompressors) or generic emulation to unpack dynamically packed binaries.
+- **Packed and Cryptor-Protected Binaries**: The engine does not yet include runtime PE unpackers (e.g., UPX decompressors) or generic emulation to unpack dynamically packed binaries (planned for Phase 2).
+- **Archive Unpackers**: Zip, tar, and rar decompression within attachments is deferred to Phase 2.
 - **Polymorphic / Metamorphic Malware**: Samples that mutate their code sequence on every compile or infection without recognizable byte markers require behavioral or heuristic engines planned for future phases.
 - **Password-Protected / Encrypted Containers**: Encrypted ZIPs, password-protected PDFs, or encrypted RAR archives cannot be inspected without keys and are classified as `UNSUPPORTED`.
 - **Active Memory or In-Process Scanning**: RaxoSentinel is a file and email stream scanner; it does not inspect running process memory or kernel hooks.
@@ -207,14 +213,14 @@ Measured using Criterion on modern Linux x86_64:
 - **MIME Email Parsing & Attachment Inspection**:
   - Full multipart email parsing, attachment extraction, hashing, and signature matching: **~7.61 µs** per message (**~64.4 MiB/s**).
 - **Process Memory Consumption**:
-  - Resident Set Size (RSS): **~3.47 MiB**
-  - Peak Resident Set Size (Peak RSS): **~3.47 MiB**
+  - Resident Set Size (RSS): **~3.04 - 3.47 MiB** across files up to 100 MiB
+  - See detailed stress and comparative ClamAV benchmarks in [`BENCHMARKS_PHASE1_1.md`](BENCHMARKS_PHASE1_1.md).
 
 ---
 
-## Quality Gates
+## Quality Gates & Verification
 
-All checks pass with zero errors and zero warnings:
+All quality gates pass cleanly with zero errors and zero warnings:
 
 ```bash
 # 1. Format verification
@@ -223,8 +229,17 @@ cargo fmt --all -- --check
 # 2. Strict linter verification (warnings treated as errors)
 cargo clippy --workspace --all-targets -- -D warnings
 
-# 3. Complete test suite (39 unit and integration tests)
+# 3. Complete test suite (44 unit and integration tests)
 cargo test --workspace
+
+# 4. Release compilation
+cargo build --release
+
+# 5. Dependency vulnerability audit
+cargo audit
+
+# 6. Fuzz testing campaign (4 libFuzzer targets, >1.2M executions)
+cargo +nightly fuzz build
 ```
 
 ---

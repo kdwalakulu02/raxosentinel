@@ -30,4 +30,4 @@ pub use limits::{ResourceLimits, ResourceTracker};
 pub use memory::MemoryUsage;
 pub use report::{ScanReport, TargetMetadata};
 pub use status::ScanStatus;
-pub use threat::{Severity, Threat, ThreatCategory};
+pub use threat::{DetectionType, Severity, Threat, ThreatCategory};

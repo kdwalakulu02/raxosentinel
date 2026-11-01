@@ -1,0 +1,46 @@
+[package]
+name = "raxosentinel-fuzz"
+version = "0.1.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+raxosentinel-core = { path = "../crates/raxosentinel-core" }
+raxosentinel-email = { path = "../crates/raxosentinel-email" }
+raxosentinel-filetypes = { path = "../crates/raxosentinel-filetypes" }
+raxosentinel-signatures = { path = "../crates/raxosentinel-signatures" }
+
+[[bin]]
+name = "fuzz_email_mime"
+path = "fuzz_targets/fuzz_email_mime.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_file_identification"
+path = "fuzz_targets/fuzz_file_identification.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rule_loading"
+path = "fuzz_targets/fuzz_rule_loading.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_signature_matching"
+path = "fuzz_targets/fuzz_signature_matching.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
