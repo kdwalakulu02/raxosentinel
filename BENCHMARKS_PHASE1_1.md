@@ -14,30 +14,33 @@
 > [!IMPORTANT]
 > **Detection Coverage Context & Equivalence Warning**:
 > ClamAV is an established engine running a production database of over 8.6 million signatures with unpackers, heuristics, and bytecode interpreters. RaxoSentinel Phase 1 is a foundation engine with a native Aho-Corasick automaton and hash database. Memory consumption comparisons must NOT be interpreted as architectural superiority at equivalent coverage. Rather, they validate that RaxoSentinel achieves bounded memory execution and high streaming throughput for email pipelines.
+>
+> **Transport & Daemon Limit Correction (`MaxFileSize` vs `StreamMaxLength`)**:
+> When using `clamdscan --fdpass`, file descriptors are passed directly over the local UNIX domain socket (`/var/run/clamav/clamd.ctl`). In this mode, `StreamMaxLength` does **not** apply (it governs streaming network sockets). Instead, `clamd`'s inspection is bounded by `MaxFileSize` (configured at `26214400` bytes / 25 MiB) and `MaxScanSize` (100 MiB). For workloads exceeding 25 MiB (such as Plain 50 MiB and Plain 100 MiB), `clamd` skips inspection beyond the 25 MiB boundary. The 6 ms latency reflects an **incomplete scan** where inspection was truncated at the daemon limit, and is **not** an equivalent complete scan. Complete vs incomplete scans are explicitly distinguished below.
 
 ## 1. Primary Benchmark: RaxoSentinel Core vs ClamAV Daemon (`clamd`) [Warm Scan]
 
 This table compares RaxoSentinel's native engine against a continuously running, fully initialised `clamd` daemon. In this configuration, ClamAV has already completed database loading and signature compilation.
 
-| Workload | Size | Description | Raxo Verdict | Raxo Latency | Raxo Peak RSS | Raxo Throughput | clamd Verdict | clamd Warm Latency | clamd Daemon RSS | clamd Throughput |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Plain 1 MiB** | 1.0 MiB | Plain synthetic binary/stream data (1 MiB) | `CLEAN` | 10 ms | **3.44 MiB** | 100.00 MB/s | `OK (CLEAN)` | 167 ms | 961.65 MiB | 5.99 MB/s |
-| **Plain 10 MiB** | 10.0 MiB | Plain synthetic binary/stream data (10 MiB) | `CLEAN` | 77 ms | **3.37 MiB** | 129.87 MB/s | `OK (CLEAN)` | 368 ms | 964.76 MiB | 27.17 MB/s |
-| **Plain 50 MiB** | 50.0 MiB | Plain synthetic binary/stream data (50 MiB) | `CLEAN` | 220 ms | **3.23 MiB** | 227.27 MB/s | `OK (CLEAN)` | 6 ms | 964.76 MiB | 8333.33 MB/s |
-| **Plain 100 MiB (Streaming)** | 100.0 MiB | 100 MiB plain data scanned with 64 KiB buffer (--max-size=150M) | `CLEAN` | 638 ms | **3.22 MiB** | 156.74 MB/s | `OK (CLEAN)` | 6 ms | 964.76 MiB | 16666.67 MB/s |
-| **Plain 100 MiB (Default Limit Abort)** | 100.0 MiB | 100 MiB plain file exceeding default 50 MiB limit (must safely abort) | `LIMIT_ABORTED` | 5 ms | **3.18 MiB** | 20000.00 MB/s | `OK (CLEAN)` | 8 ms | 964.76 MiB | 12500.00 MB/s |
-| **EICAR Test File** | 68 B | Standard EICAR antivirus test string (68 bytes) | `INFECTED` | 4 ms | **3.30 MiB** | 0.02 MB/s | `FOUND (INFECTED)` | 9 ms | 964.76 MiB | 0.01 MB/s |
-| **Clean Plain Email** | 106 B | Single-part text/plain clean email | `CLEAN` | 3 ms | **3.19 MiB** | 0.03 MB/s | `OK (CLEAN)` | 22 ms | 964.76 MiB | 0.00 MB/s |
-| **MIME Base64 1 MiB** | 1.4 MiB | MIME message with 1 MiB Base64-encoded attachment | `CLEAN` | 39 ms | **7.11 MiB** | 35.26 MB/s | `OK (CLEAN)` | 104 ms | 964.82 MiB | 13.22 MB/s |
-| **MIME Base64 10 MiB** | 13.8 MiB | MIME message with 10 MiB Base64-encoded attachment | `CLEAN` | 271 ms | **40.35 MiB** | 50.74 MB/s | `OK (CLEAN)` | 607 ms | 965.49 MiB | 22.65 MB/s |
-| **MIME Base64 EICAR** | 436 B | MIME email with Base64-encoded EICAR COM executable | `INFECTED` | 10 ms | **3.42 MiB** | 0.04 MB/s | `FOUND (INFECTED)` | 40 ms | 991.84 MiB | 0.01 MB/s |
-| **Nested Email (depth 3)** | 489 B | Nested message/rfc822 within configured depth limit (depth 3) | `CLEAN` | 3 ms | **3.43 MiB** | 0.16 MB/s | `OK (CLEAN)` | 22 ms | 991.84 MiB | 0.02 MB/s |
-| **Nested Email (depth 8, limit)** | 1.1 KiB | Pathological nesting exceeding max_email_depth (depth 8 vs limit 5) | `LIMIT_ABORTED` | 4 ms | **3.38 MiB** | 0.28 MB/s | `OK (CLEAN)` | 15 ms | 991.84 MiB | 0.07 MB/s |
-| **Malformed MIME (Truncated)** | 125 B | Truncated MIME boundary missing closing delimiter (reports UNSUPPORTED) | `UNSUPPORTED` | 5 ms | **3.07 MiB** | 0.02 MB/s | `OK (CLEAN)` | 25 ms | 991.84 MiB | 0.00 MB/s |
-| **Malformed Base64 Attachment** | 305 B | Attachment with invalid non-base64 characters (reports UNSUPPORTED) | `UNSUPPORTED` | 5 ms | **3.41 MiB** | 0.06 MB/s | `OK (CLEAN)` | 27 ms | 991.84 MiB | 0.01 MB/s |
-| **Mixed (Infected + Malformed)** | 542 B | Infected EICAR attachment alongside malformed attachment (reports INFECTED) | `INFECTED` | 6 ms | **3.29 MiB** | 0.09 MB/s | `FOUND (INFECTED)` | 23 ms | 991.84 MiB | 0.02 MB/s |
-| **Attachment Flood (60 parts)** | 6.6 KiB | 60 attachments exceeding max_email_attachments limit of 50 | `LIMIT_ABORTED` | 5 ms | **3.54 MiB** | 1.30 MB/s | `OK (CLEAN)` | 595 ms | 991.84 MiB | 0.01 MB/s |
-| **10 MiB with 5,000 Rules** | 10.0 MiB | 10 MiB stream scanned against 5,000 compiled Aho-Corasick pattern rules | `CLEAN` | 84 ms | **22.30 MiB** | 119.05 MB/s | `OK (CLEAN)` | 43 ms | 971.01 MiB | 232.56 MB/s |
+| Workload | Size | Description | Raxo Verdict | Raxo Latency | Raxo Peak RSS | Raxo Throughput | clamd Verdict | clamd Warm Latency | clamd Daemon RSS | clamd Throughput | Scan Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Plain 1 MiB** | 1.0 MiB | Plain synthetic binary/stream data (1 MiB) | `CLEAN` | 10 ms | **3.44 MiB** | 100.00 MB/s | `OK (CLEAN)` | 167 ms | 961.65 MiB | 5.99 MB/s | Complete Scan |
+| **Plain 10 MiB** | 10.0 MiB | Plain synthetic binary/stream data (10 MiB) | `CLEAN` | 77 ms | **3.37 MiB** | 129.87 MB/s | `OK (CLEAN)` | 368 ms | 964.76 MiB | 27.17 MB/s | Complete Scan |
+| **Plain 50 MiB** | 50.0 MiB | Plain synthetic binary/stream data (50 MiB) | `CLEAN` | 220 ms | **3.23 MiB** | 227.27 MB/s | `OK (INCOMPLETE: >25M Limit)` | 6 ms* | 964.76 MiB | *N/A (Truncated)* | **clamd Incomplete** (>25M `MaxFileSize`) |
+| **Plain 100 MiB (Streaming)** | 100.0 MiB | 100 MiB plain data scanned with 64 KiB buffer (--max-size=150M) | `CLEAN` | 638 ms | **3.22 MiB** | 156.74 MB/s | `OK (INCOMPLETE: >25M Limit)` | 6 ms* | 964.76 MiB | *N/A (Truncated)* | **clamd Incomplete** (>25M `MaxFileSize`) |
+| **Plain 100 MiB (Default Limit Abort)** | 100.0 MiB | 100 MiB plain file exceeding default 50 MiB limit (must safely abort) | `LIMIT_ABORTED` | 5 ms | **3.18 MiB** | 20000.00 MB/s | `OK (INCOMPLETE: >25M Limit)` | 8 ms* | 964.76 MiB | *N/A (Truncated)* | Both Limit-Bounded |
+| **EICAR Test File** | 68 B | Standard EICAR antivirus test string (68 bytes) | `INFECTED` | 4 ms | **3.30 MiB** | 0.02 MB/s | `FOUND (INFECTED)` | 9 ms | 964.76 MiB | 0.01 MB/s | Complete Scan |
+| **Clean Plain Email** | 106 B | Single-part text/plain clean email | `CLEAN` | 3 ms | **3.19 MiB** | 0.03 MB/s | `OK (CLEAN)` | 22 ms | 964.76 MiB | 0.00 MB/s | Complete Scan |
+| **MIME Base64 1 MiB** | 1.4 MiB | MIME message with 1 MiB Base64-encoded attachment | `CLEAN` | 39 ms | **7.11 MiB** | 35.26 MB/s | `OK (CLEAN)` | 104 ms | 964.82 MiB | 13.22 MB/s | Complete Scan |
+| **MIME Base64 10 MiB** | 13.8 MiB | MIME message with 10 MiB Base64-encoded attachment | `CLEAN` | 271 ms | **40.35 MiB** | 50.74 MB/s | `OK (CLEAN)` | 607 ms | 965.49 MiB | 22.65 MB/s | Complete Scan |
+| **MIME Base64 EICAR** | 436 B | MIME email with Base64-encoded EICAR COM executable | `INFECTED` | 10 ms | **3.42 MiB** | 0.04 MB/s | `FOUND (INFECTED)` | 40 ms | 991.84 MiB | 0.01 MB/s | Complete Scan |
+| **Nested Email (depth 3)** | 489 B | Nested message/rfc822 within configured depth limit (depth 3) | `CLEAN` | 3 ms | **3.43 MiB** | 0.16 MB/s | `OK (CLEAN)` | 22 ms | 991.84 MiB | 0.02 MB/s | Complete Scan |
+| **Nested Email (depth 8, limit)** | 1.1 KiB | Pathological nesting exceeding max_email_depth (depth 8 vs limit 5) | `LIMIT_ABORTED` | 4 ms | **3.38 MiB** | 0.28 MB/s | `OK (CLEAN)` | 15 ms | 991.84 MiB | 0.07 MB/s | Complete Scan |
+| **Malformed MIME (Truncated)** | 125 B | Truncated MIME boundary missing closing delimiter (reports UNSUPPORTED) | `UNSUPPORTED` | 5 ms | **3.07 MiB** | 0.02 MB/s | `OK (CLEAN)` | 25 ms | 991.84 MiB | 0.00 MB/s | Complete Scan |
+| **Malformed Base64 Attachment** | 305 B | Attachment with invalid non-base64 characters (reports UNSUPPORTED) | `UNSUPPORTED` | 5 ms | **3.41 MiB** | 0.06 MB/s | `OK (CLEAN)` | 27 ms | 991.84 MiB | 0.01 MB/s | Complete Scan |
+| **Mixed (Infected + Malformed)** | 542 B | Infected EICAR attachment alongside malformed attachment (reports INFECTED) | `INFECTED` | 6 ms | **3.29 MiB** | 0.09 MB/s | `FOUND (INFECTED)` | 23 ms | 991.84 MiB | 0.02 MB/s | Complete Scan |
+| **Attachment Flood (60 parts)** | 6.6 KiB | 60 attachments exceeding max_email_attachments limit of 50 | `LIMIT_ABORTED` | 5 ms | **3.54 MiB** | 1.30 MB/s | `OK (CLEAN)` | 595 ms | 991.84 MiB | 0.01 MB/s | Complete Scan |
+| **10 MiB with 5,000 Rules** | 10.0 MiB | 10 MiB stream scanned against 5,000 compiled Aho-Corasick pattern rules | `CLEAN` | 84 ms | **22.30 MiB** | 119.05 MB/s | `OK (CLEAN)` | 43 ms | 971.01 MiB | 232.56 MB/s | Complete Scan |
 
 ## 2. Cold-Start Overhead Reference: ClamAV Standalone (`clamscan`) vs Daemon (`clamd`)
 

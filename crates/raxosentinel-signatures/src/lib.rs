@@ -20,6 +20,7 @@ pub mod builtin;
 pub mod database;
 pub mod loader;
 pub mod models;
+pub mod rsidb;
 
 pub use builtin::{default_hash_rules, default_pattern_rules};
 pub use database::SignatureDatabase;

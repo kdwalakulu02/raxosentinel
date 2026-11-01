@@ -33,3 +33,7 @@ aho-corasick = "1.1"
 mail-parser = "1.0"
 tempfile = "3.16"
 criterion = { version = "0.5", features = ["html_reports"] }
+memmap2 = "0.9"
+sha1 = "0.10"
+md-5 = "0.10"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

@@ -505,15 +505,26 @@ fn run_comparison(
                 let clamd_stdout = String::from_utf8_lossy(&out.stdout);
                 let clamd_stderr = String::from_utf8_lossy(&out.stderr);
 
+                let is_clamd_size_exceeded = file_size_bytes > 25 * 1024 * 1024;
                 let clamd_verdict = if clamd_stdout.contains("OK") {
-                    "OK (CLEAN)".to_string()
+                    if is_clamd_size_exceeded {
+                        "OK (INCOMPLETE: >25M Limit)".to_string()
+                    } else {
+                        "OK (CLEAN)".to_string()
+                    }
                 } else if clamd_stdout.contains("FOUND") {
                     "FOUND (INFECTED)".to_string()
                 } else if clamd_stdout.contains("ERROR") || clamd_stderr.contains("ERROR") {
                     "ERROR".to_string()
                 } else {
                     match out.status.code() {
-                        Some(0) => "OK (CLEAN)".to_string(),
+                        Some(0) => {
+                            if is_clamd_size_exceeded {
+                                "OK (INCOMPLETE: >25M Limit)".to_string()
+                            } else {
+                                "OK (CLEAN)".to_string()
+                            }
+                        }
                         Some(1) => "FOUND (INFECTED)".to_string(),
                         _ => "ERROR/LIMIT".to_string(),
                     }
@@ -521,7 +532,10 @@ fn run_comparison(
 
                 let clam_mb = file_size_bytes as f64 / (1024.0 * 1024.0);
                 let clam_sec = (clamd_duration_ms as f64) / 1000.0;
-                let clamd_throughput_mb_s = if clam_sec > 0.0001 && clam_mb > 0.0 {
+                let clamd_throughput_mb_s = if is_clamd_size_exceeded {
+                    // Do not present truncated/bypassed scans as equivalent high-speed throughput
+                    0.0
+                } else if clam_sec > 0.0001 && clam_mb > 0.0 {
                     clam_mb / clam_sec
                 } else {
                     0.0
@@ -653,15 +667,19 @@ fn format_markdown_report(results: &[BenchmarkResult]) -> String {
 
     out.push_str("> [!IMPORTANT]\n");
     out.push_str("> **Detection Coverage Context & Equivalence Warning**:\n");
-    out.push_str("> ClamAV is an established engine running a production database of over 8.6 million signatures with unpackers, heuristics, and bytecode interpreters. RaxoSentinel Phase 1 is a foundation engine with a native Aho-Corasick automaton and hash database. Memory consumption comparisons must NOT be interpreted as architectural superiority at equivalent coverage. Rather, they validate that RaxoSentinel achieves bounded memory execution and high streaming throughput for email pipelines.\n\n");
+    out.push_str("> ClamAV is an established engine running a production database of over 8.6 million signatures with unpackers, heuristics, and bytecode interpreters. RaxoSentinel Phase 1 is a foundation engine with a native Aho-Corasick automaton and hash database. Memory consumption comparisons must NOT be interpreted as architectural superiority at equivalent coverage. Rather, they validate that RaxoSentinel achieves bounded memory execution and high streaming throughput for email pipelines.\n>\n");
+    out.push_str(
+        "> **Transport & Daemon Limit Correction (`MaxFileSize` vs `StreamMaxLength`)**:\n",
+    );
+    out.push_str("> When using `clamdscan --fdpass`, file descriptors are passed directly over the local UNIX domain socket (`/var/run/clamav/clamd.ctl`). In this mode, `StreamMaxLength` does **not** apply (it governs streaming network sockets). Instead, `clamd`'s inspection is bounded by `MaxFileSize` (configured at `26214400` bytes / 25 MiB) and `MaxScanSize` (100 MiB). For workloads exceeding 25 MiB (such as Plain 50 MiB and Plain 100 MiB), `clamd` skips inspection beyond the 25 MiB boundary. The 6 ms latency reflects an **incomplete scan** where inspection was truncated at the daemon limit, and is **not** an equivalent complete scan. Complete vs incomplete scans are explicitly distinguished below.\n\n");
 
     out.push_str(
         "## 1. Primary Benchmark: RaxoSentinel Core vs ClamAV Daemon (`clamd`) [Warm Scan]\n\n",
     );
     out.push_str("This table compares RaxoSentinel's native engine against a continuously running, fully initialised `clamd` daemon. In this configuration, ClamAV has already completed database loading and signature compilation.\n\n");
-    out.push_str("| Workload | Size | Description | Raxo Verdict | Raxo Latency | Raxo Peak RSS | Raxo Throughput | clamd Verdict | clamd Warm Latency | clamd Daemon RSS | clamd Throughput |\n");
+    out.push_str("| Workload | Size | Description | Raxo Verdict | Raxo Latency | Raxo Peak RSS | Raxo Throughput | clamd Verdict | clamd Warm Latency | clamd Daemon RSS | clamd Throughput | Scan Status |\n");
     out.push_str(
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
     );
 
     for r in results {
@@ -673,8 +691,20 @@ fn format_markdown_report(results: &[BenchmarkResult]) -> String {
             format!("{:.1} MiB", r.file_size_bytes as f64 / (1024.0 * 1024.0))
         };
 
+        let scan_status = if r.file_size_bytes > 25 * 1024 * 1024 {
+            "**clamd Incomplete** (>25M `MaxFileSize`)"
+        } else {
+            "Complete Scan"
+        };
+
+        let clamd_throughput_str = if r.file_size_bytes > 25 * 1024 * 1024 {
+            "*N/A (Truncated)*".to_string()
+        } else {
+            format!("{:.2} MB/s", r.clamd_throughput_mb_s)
+        };
+
         out.push_str(&format!(
-            "| **{}** | {} | {} | `{}` | {} ms | **{:.2} MiB** | {:.2} MB/s | `{}` | {} ms | {:.2} MiB | {:.2} MB/s |\n",
+            "| **{}** | {} | {} | `{}` | {} ms | **{:.2} MiB** | {:.2} MB/s | `{}` | {} ms | {:.2} MiB | {} | {} |\n",
             r.test_name,
             size_str,
             r.description,
@@ -685,7 +715,8 @@ fn format_markdown_report(results: &[BenchmarkResult]) -> String {
             r.clamd_verdict,
             r.clamd_duration_ms,
             r.clamd_daemon_rss_mb,
-            r.clamd_throughput_mb_s,
+            clamd_throughput_str,
+            scan_status,
         ));
     }
 
