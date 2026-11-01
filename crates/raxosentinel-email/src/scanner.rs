@@ -118,6 +118,13 @@ impl<'a> EmailScanner<'a> {
             }
         };
 
+        // Validate MIME container boundary integrity
+        let (container_status, container_details) =
+            match validate_mime_boundaries(raw_bytes, &parsed) {
+                Ok(()) => (ScanStatus::Clean, None),
+                Err(err) => (ScanStatus::Unsupported, Some(err)),
+            };
+
         let mut threats: Vec<Threat> = Vec::new();
         let mut sub_reports: Vec<ScanReport> = Vec::new();
 
@@ -130,7 +137,14 @@ impl<'a> EmailScanner<'a> {
         self.scan_bodies(&parsed, &mut threats, tracker)?;
 
         // 3. Scan attachments and embedded parts (including inline payloads)
-        self.scan_attachments(&parsed, &mut threats, &mut sub_reports, tracker, depth)?;
+        self.scan_attachments(
+            raw_bytes,
+            &parsed,
+            &mut threats,
+            &mut sub_reports,
+            tracker,
+            depth,
+        )?;
 
         // Consolidate duplicate threats across bodies or attachments
         let threats = SignatureDatabase::deduplicate_threats(threats);
@@ -138,18 +152,38 @@ impl<'a> EmailScanner<'a> {
         let has_threats =
             !threats.is_empty() || sub_reports.iter().any(|r| r.status == ScanStatus::Infected);
 
-        // Critical verdict semantics: scanning failures or unsupported parts must never return Clean!
-        let overall_status = if has_threats {
-            ScanStatus::Infected
-        } else if sub_reports.iter().any(|r| r.status == ScanStatus::Failed) {
-            ScanStatus::Failed
-        } else if sub_reports
-            .iter()
-            .any(|r| r.status == ScanStatus::Unsupported)
+        // Critical verdict semantics:
+        // Status precedence: Infected > Failed > Unsupported > Clean
+        let (overall_status, overall_details) = if has_threats {
+            (ScanStatus::Infected, None)
+        } else if container_status == ScanStatus::Failed
+            || sub_reports.iter().any(|r| r.status == ScanStatus::Failed)
         {
-            ScanStatus::Unsupported
+            let details = if container_status == ScanStatus::Failed {
+                container_details
+            } else {
+                sub_reports
+                    .iter()
+                    .find(|r| r.status == ScanStatus::Failed)
+                    .and_then(|r| r.error.clone())
+            };
+            (ScanStatus::Failed, details)
+        } else if container_status == ScanStatus::Unsupported
+            || sub_reports
+                .iter()
+                .any(|r| r.status == ScanStatus::Unsupported)
+        {
+            let details = if container_status == ScanStatus::Unsupported {
+                container_details
+            } else {
+                sub_reports
+                    .iter()
+                    .find(|r| r.status == ScanStatus::Unsupported)
+                    .and_then(|r| r.error.clone())
+            };
+            (ScanStatus::Unsupported, details)
         } else {
-            ScanStatus::Clean
+            (ScanStatus::Clean, None)
         };
 
         let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
@@ -169,7 +203,7 @@ impl<'a> EmailScanner<'a> {
             threats,
             sub_reports,
             duration_ms,
-            None,
+            overall_details,
         ))
     }
 
@@ -215,6 +249,7 @@ impl<'a> EmailScanner<'a> {
 
     fn scan_attachments(
         &self,
+        raw_bytes: &[u8],
         msg: &Message,
         threats: &mut Vec<Threat>,
         sub_reports: &mut Vec<ScanReport>,
@@ -225,12 +260,6 @@ impl<'a> EmailScanner<'a> {
         for (idx, attachment) in msg.attachments().enumerate() {
             tracker.check_timeout()?;
 
-            // Pre-check estimated decoded length to prevent Base64 / QP memory expansion bomb!
-            let estimated_size = attachment.decoded_len() as u64;
-            tracker.register_attachment(estimated_size)?;
-
-            let decoded_data = attachment.decoded();
-
             let filename = attachment
                 .attachment_name()
                 .map(|s| s.to_string())
@@ -240,20 +269,76 @@ impl<'a> EmailScanner<'a> {
                 .content_type()
                 .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("*")));
 
-            let sub_report = self.scan_single_attachment(
+            // Pre-check estimated decoded length to prevent Base64 / QP memory expansion bomb!
+            let estimated_size = attachment.decoded_len() as u64;
+            if let Err(e) = tracker.register_attachment(estimated_size) {
+                match e {
+                    ScanError::AttachmentLimitExceeded { .. }
+                    | ScanError::ExtractedSizeLimitExceeded { .. }
+                    | ScanError::Timeout { .. } => return Err(e),
+                    _ => {
+                        let sub_report = ScanReport::new(
+                            TargetMetadata {
+                                path: None,
+                                file_name: Some(filename),
+                                file_size_bytes: estimated_size,
+                                sha256: String::new(),
+                                detected_mime: "application/octet-stream".to_string(),
+                                declared_mime,
+                            },
+                            ScanStatus::Failed,
+                            Vec::new(),
+                            Vec::new(),
+                            0,
+                            Some(format!("Attachment quota error: {}", e)),
+                        );
+                        sub_reports.push(sub_report);
+                        continue;
+                    }
+                }
+            }
+
+            let decoded_data = attachment.decoded();
+
+            let sub_report_res = self.scan_single_attachment(
                 &filename,
                 declared_mime.as_deref(),
                 &attachment,
+                raw_bytes,
                 &decoded_data,
                 tracker,
                 depth,
-            )?;
+            );
 
-            for t in &sub_report.threats {
-                threats.push(t.clone());
+            match sub_report_res {
+                Ok(sub_report) => {
+                    for t in &sub_report.threats {
+                        threats.push(t.clone());
+                    }
+                    sub_reports.push(sub_report);
+                }
+                Err(e) => match e {
+                    ScanError::Timeout { .. } => return Err(e),
+                    _ => {
+                        let sub_report = ScanReport::new(
+                            TargetMetadata {
+                                path: None,
+                                file_name: Some(filename),
+                                file_size_bytes: decoded_data.len() as u64,
+                                sha256: hash_bytes(&decoded_data),
+                                detected_mime: detect_type(&decoded_data).mime_type,
+                                declared_mime,
+                            },
+                            ScanStatus::Failed,
+                            Vec::new(),
+                            Vec::new(),
+                            0,
+                            Some(format!("Attachment scan failed: {}", e)),
+                        );
+                        sub_reports.push(sub_report);
+                    }
+                },
             }
-
-            sub_reports.push(sub_report);
         }
 
         // 2. Scan other parts (e.g. inline attachments, unclassified non-body parts)
@@ -262,11 +347,6 @@ impl<'a> EmailScanner<'a> {
             if part.in_text_body() || part.in_html_body() {
                 continue;
             }
-
-            let estimated_size = part.decoded_len() as u64;
-            tracker.register_attachment(estimated_size)?;
-
-            let decoded_data = part.decoded();
 
             let filename = part
                 .attachment_name()
@@ -277,30 +357,87 @@ impl<'a> EmailScanner<'a> {
                 .content_type()
                 .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("*")));
 
-            let sub_report = self.scan_single_attachment(
+            let estimated_size = part.decoded_len() as u64;
+            if let Err(e) = tracker.register_attachment(estimated_size) {
+                match e {
+                    ScanError::AttachmentLimitExceeded { .. }
+                    | ScanError::ExtractedSizeLimitExceeded { .. }
+                    | ScanError::Timeout { .. } => return Err(e),
+                    _ => {
+                        let sub_report = ScanReport::new(
+                            TargetMetadata {
+                                path: None,
+                                file_name: Some(filename),
+                                file_size_bytes: estimated_size,
+                                sha256: String::new(),
+                                detected_mime: "application/octet-stream".to_string(),
+                                declared_mime,
+                            },
+                            ScanStatus::Failed,
+                            Vec::new(),
+                            Vec::new(),
+                            0,
+                            Some(format!("Attachment quota error: {}", e)),
+                        );
+                        sub_reports.push(sub_report);
+                        continue;
+                    }
+                }
+            }
+
+            let decoded_data = part.decoded();
+
+            let sub_report_res = self.scan_single_attachment(
                 &filename,
                 declared_mime.as_deref(),
                 &part,
+                raw_bytes,
                 &decoded_data,
                 tracker,
                 depth,
-            )?;
+            );
 
-            for t in &sub_report.threats {
-                threats.push(t.clone());
+            match sub_report_res {
+                Ok(sub_report) => {
+                    for t in &sub_report.threats {
+                        threats.push(t.clone());
+                    }
+                    sub_reports.push(sub_report);
+                }
+                Err(e) => match e {
+                    ScanError::Timeout { .. } => return Err(e),
+                    _ => {
+                        let sub_report = ScanReport::new(
+                            TargetMetadata {
+                                path: None,
+                                file_name: Some(filename),
+                                file_size_bytes: decoded_data.len() as u64,
+                                sha256: hash_bytes(&decoded_data),
+                                detected_mime: detect_type(&decoded_data).mime_type,
+                                declared_mime,
+                            },
+                            ScanStatus::Failed,
+                            Vec::new(),
+                            Vec::new(),
+                            0,
+                            Some(format!("Attachment scan failed: {}", e)),
+                        );
+                        sub_reports.push(sub_report);
+                    }
+                },
             }
-
-            sub_reports.push(sub_report);
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_single_attachment(
         &self,
         filename: &str,
         declared_mime: Option<&str>,
         part: &MessagePart,
+        raw_bytes: &[u8],
         data: &[u8],
         tracker: &mut ResourceTracker,
         depth: usize,
@@ -338,10 +475,18 @@ impl<'a> EmailScanner<'a> {
         // Deduplicate threats on the same attachment (e.g. hash + pattern match)
         let part_threats = SignatureDatabase::deduplicate_threats(part_threats);
 
-        let status = if !part_threats.is_empty() {
-            ScanStatus::Infected
+        // Validate encoding integrity
+        let encoding_issue = validate_attachment_encoding(part, raw_bytes, data).err();
+
+        // Status precedence for single attachment:
+        // Threats take precedence over encoding issues (an infected file is always reported Infected).
+        // If no threat is found, an encoding issue prevents a Clean verdict -> Unsupported.
+        let (status, details) = if !part_threats.is_empty() {
+            (ScanStatus::Infected, None)
+        } else if let Some(issue) = encoding_issue {
+            (ScanStatus::Unsupported, Some(issue))
         } else {
-            ScanStatus::Clean
+            (ScanStatus::Clean, None)
         };
 
         let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
@@ -359,9 +504,177 @@ impl<'a> EmailScanner<'a> {
             part_threats,
             Vec::new(),
             duration_ms,
-            None,
+            details,
         ))
     }
+}
+
+/// Helper checking if a byte slice contains a specific subslice.
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Validates RFC 2046 MIME boundary integrity.
+fn validate_mime_boundaries(raw_bytes: &[u8], msg: &Message) -> Result<(), String> {
+    // 1. Check root message Content-Type
+    if let Some(ct) = msg.content_type() {
+        if ct.ctype().eq_ignore_ascii_case("multipart") {
+            let boundary = match ct.attribute("boundary") {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    return Err(
+                        "Malformed multipart MIME: missing required 'boundary' parameter in Content-Type header"
+                            .to_string(),
+                    );
+                }
+            };
+
+            let open_delim = format!("--{}", boundary);
+            if !bytes_contains(raw_bytes, open_delim.as_bytes()) {
+                return Err(format!(
+                    "Malformed multipart MIME: boundary delimiter '--{}' not found in message",
+                    boundary
+                ));
+            }
+
+            let close_delim = format!("--{}--", boundary);
+            if !bytes_contains(raw_bytes, close_delim.as_bytes()) {
+                return Err(format!(
+                    "Incomplete multipart MIME: missing closing boundary delimiter '--{}--'",
+                    boundary
+                ));
+            }
+        }
+    }
+
+    // 2. Check any parts that declare multipart sub-structures
+    for part in msg.parts() {
+        if let Some(ct) = part.content_type() {
+            if ct.ctype().eq_ignore_ascii_case("multipart") {
+                if let Some(b) = ct.attribute("boundary") {
+                    if !b.is_empty() {
+                        let close_delim = format!("--{}--", b);
+                        if !bytes_contains(raw_bytes, close_delim.as_bytes()) {
+                            return Err(format!(
+                                "Incomplete multipart MIME: missing sub-part boundary delimiter '--{}--'",
+                                b
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates transfer encoding (Base64 / Quoted-Printable) against raw payload bytes.
+fn validate_attachment_encoding(
+    part: &MessagePart,
+    raw_bytes: &[u8],
+    decoded_data: &[u8],
+) -> Result<(), String> {
+    if let Some(enc) = part.content_transfer_encoding() {
+        let enc_clean = enc.trim().to_ascii_lowercase();
+        if enc_clean == "base64" {
+            let start = part.offset_body() as usize;
+            let end = part.offset_end() as usize;
+            if start <= end && end <= raw_bytes.len() {
+                let raw_payload = &raw_bytes[start..end];
+                let non_ws: Vec<u8> = raw_payload
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .collect();
+
+                if !non_ws.is_empty() {
+                    if decoded_data.is_empty() {
+                        return Err(
+                            "Malformed attachment: invalid base64 encoding; decoded payload is empty"
+                                .to_string(),
+                        );
+                    }
+
+                    let has_invalid_chars = non_ws.iter().any(|&b| {
+                        !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+                    });
+                    if has_invalid_chars {
+                        return Err(
+                            "Malformed attachment: invalid characters in base64 encoding stream"
+                                .to_string(),
+                        );
+                    }
+
+                    if !non_ws.len().is_multiple_of(4) {
+                        return Err(
+                            "Malformed attachment: truncated base64 stream (length is not a multiple of 4)"
+                                .to_string(),
+                        );
+                    }
+
+                    let pad_count = non_ws.iter().rev().take_while(|&&b| b == b'=').count();
+                    if pad_count > 2 {
+                        return Err(
+                            "Malformed attachment: excessive base64 padding characters".to_string()
+                        );
+                    }
+                    if non_ws[..non_ws.len() - pad_count].contains(&b'=') {
+                        return Err(
+                            "Malformed attachment: misplaced base64 padding character".to_string()
+                        );
+                    }
+                }
+            }
+        } else if enc_clean == "quoted-printable" {
+            let start = part.offset_body() as usize;
+            let end = part.offset_end() as usize;
+            if start <= end && end <= raw_bytes.len() {
+                let raw_payload = &raw_bytes[start..end];
+                let mut i = 0;
+                while i < raw_payload.len() {
+                    if raw_payload[i] == b'=' {
+                        if i + 1 >= raw_payload.len() {
+                            return Err(
+                                "Truncated Quoted-Printable attachment: trailing '=' at end of stream"
+                                    .to_string(),
+                            );
+                        }
+                        if raw_payload[i + 1] == b'\n'
+                            || (raw_payload[i + 1] == b'\r'
+                                && i + 2 < raw_payload.len()
+                                && raw_payload[i + 2] == b'\n')
+                        {
+                            i += if raw_payload[i + 1] == b'\r' { 3 } else { 2 };
+                            continue;
+                        }
+                        if i + 2 >= raw_payload.len() {
+                            return Err(
+                                "Truncated Quoted-Printable attachment: incomplete hex escape"
+                                    .to_string(),
+                            );
+                        }
+                        let h1 = raw_payload[i + 1];
+                        let h2 = raw_payload[i + 2];
+                        if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
+                            return Err(
+                                "Malformed Quoted-Printable attachment: invalid hex sequence following '='"
+                                    .to_string(),
+                            );
+                        }
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -578,16 +891,288 @@ X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*\r\n\
     }
 
     #[test]
-    fn test_malformed_mime_handled_gracefully() {
-        let malformed = b"\x00\x01\x02\x03\xff\xfe\x00";
+    fn test_truncated_mime_missing_boundary_terminator() {
+        let malformed_data = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Partial data\r\n\
+--BO";
+
         let db = SignatureDatabase::with_defaults();
         let scanner = EmailScanner::new(&db);
         let limits = ResourceLimits::default();
         let mut tracker = ResourceTracker::new(limits);
 
         let report = scanner
-            .scan_bytes(malformed, Some("bad.eml"), &mut tracker)
+            .scan_bytes(malformed_data, Some("truncated.eml"), &mut tracker)
             .unwrap();
-        assert!(report.status.is_unsupported() || report.status.is_clean());
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing closing boundary delimiter '--BOUND--'"));
+    }
+
+    #[test]
+    fn test_malformed_mime_missing_boundary_param() {
+        let malformed_data = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed\r\n\r\n\
+This multipart is missing the required boundary parameter.";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(malformed_data, Some("no_boundary_param.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing required 'boundary' parameter"));
+    }
+
+    #[test]
+    fn test_malformed_mime_boundary_not_found_in_body() {
+        let malformed_data = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"MY_MISSING_BOUND\"\r\n\r\n\
+The declared boundary was never placed in the email body.";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(malformed_data, Some("missing_bound.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("boundary delimiter '--MY_MISSING_BOUND' not found"));
+    }
+
+    #[test]
+    fn test_benign_email_with_unsupported_attachment() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Benign email message text.\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream; name=\"corrupt.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"corrupt.bin\"\r\n\r\n\
+!@#$%^&*()\r\n\
+--BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("unsupported_att.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
+        assert!(report.threats.is_empty());
+    }
+
+    #[test]
+    fn test_benign_email_with_failed_attachment_scan() {
+        // Attachment exceeds max_email_attachment_size
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Benign message.\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream; name=\"large.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"large.bin\"\r\n\r\n\
+QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk=\r\n\
+--BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits {
+            max_email_attachment_size: 10, // Quota smaller than attachment length
+            ..Default::default()
+        };
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("failed_att.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Failed);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Failed);
+        assert!(report.sub_targets[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Attachment quota error"));
+    }
+
+    #[test]
+    fn test_infected_attachment_with_unsupported_attachment() {
+        let eicar_b64 = "WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=";
+        let raw_mime = format!(
+            "MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Please inspect these two files.\r\n\
+--BOUND\r\n\
+Content-Type: application/x-dosexec\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"eicar.com\"\r\n\r\n\
+{}\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"corrupt.bin\"\r\n\r\n\
+!@#$%^&*()\r\n\
+--BOUND--\r\n",
+            eicar_b64
+        );
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime.as_bytes(), Some("mixed_threat.eml"), &mut tracker)
+            .unwrap();
+
+        // Document status precedence: Infected > Unsupported
+        assert_eq!(report.status, ScanStatus::Infected);
+        assert_eq!(report.threats.len(), 1);
+        assert_eq!(report.threats[0].name, "EICAR-Standard-Antivirus-Test-File");
+        assert_eq!(report.sub_targets.len(), 2);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Infected);
+        assert_eq!(report.sub_targets[1].status, ScanStatus::Unsupported);
+    }
+
+    #[test]
+    fn test_malformed_attachment_with_otherwise_benign_content() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Benign email message text.\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream; name=\"bad_pad.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"bad_pad.bin\"\r\n\r\n\
+AAAA====\r\n\
+--BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("bad_pad.eml"), &mut tracker)
+            .unwrap();
+
+        // Malformed attachment must not yield Clean!
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
+        assert!(report.sub_targets[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("excessive base64 padding"));
+    }
+
+    #[test]
+    fn test_mixed_valid_and_invalid_parts() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Part 1 is valid clean text.\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream; name=\"clean.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"clean.bin\"\r\n\r\n\
+dGVzdA==\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream; name=\"trunc.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"trunc.bin\"\r\n\r\n\
+QUJ\r\n\
+--BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("mixed_parts.eml"), &mut tracker)
+            .unwrap();
+
+        // One invalid attachment makes the uninfected container Unsupported
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets.len(), 2);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Clean);
+        assert_eq!(report.sub_targets[1].status, ScanStatus::Unsupported);
+        assert!(report.sub_targets[1]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("truncated base64 stream"));
+    }
+
+    #[test]
+    fn test_malformed_quoted_printable_attachment() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Benign text body.\r\n\
+--BOUND\r\n\
+Content-Type: text/plain; name=\"corrupt_qp.txt\"\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+Content-Disposition: attachment; filename=\"corrupt_qp.txt\"\r\n\r\n\
+Hello world=ZZ invalid escape\r\n\
+--BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("corrupt_qp.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
+        assert!(report.sub_targets[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("invalid hex sequence following '='"));
     }
 }
