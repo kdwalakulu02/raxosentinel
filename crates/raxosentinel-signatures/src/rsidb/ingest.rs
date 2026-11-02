@@ -98,6 +98,10 @@ pub fn is_known_synthetic_digest(digest: &[u8]) -> bool {
         "d41d8cd98f00b204e9800998ecf8427e",
         "da39a3ee5e6b4b0d3255bfef95601890afd80709",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        // Other quarantined unverified indicators from the Phase 2C audit
+        "7d1a54127b222502f5b79b5fb0803061152a44f92b37e23c65dd07f1c615456b",
+        "b0a87747805256e2eb9b4e7230419266107387399859f5be6663f915ee4e6f4a",
+        "c0228bb7c838e4a9080b06b64b1f46487e466cb9fc61a46b9a8f4c106093cb4a",
         // Common synthetic test preimages audited in Phase 2C
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", // sha256("abc")
         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff213f0ffced94b21490a0", // sha256("abcd")
@@ -326,7 +330,7 @@ impl IngestPipeline {
         self
     }
 
-    /// Explicitly certifies an authorized source ID as an authentic, verified genuine threat intelligence provider.
+    /// Records an operator source assertion; it does not verify acquisition authenticity.
     /// Without explicit operator verification, sources claiming to be genuine are demoted to SyntheticTest.
     pub fn verify_genuine_source(&mut self, source_id: impl Into<String>) -> &mut Self {
         self.verified_genuine_sources.insert(source_id.into());
@@ -466,7 +470,10 @@ impl IngestPipeline {
                     "unverified_redistribution_unauthorized".to_string(),
                 )
             } else {
-                (SourceKind::Genuine, "verified_genuine_provider".to_string())
+                (
+                    SourceKind::SyntheticTest,
+                    "unverified_acquisition".to_string(),
+                )
             }
         } else {
             (
@@ -519,7 +526,7 @@ impl IngestPipeline {
                         );
                         continue;
                     }
-                    if effective_kind == SourceKind::Genuine && is_known_synthetic_digest(&digest) {
+                    if manifest.kind == SourceKind::Genuine && is_known_synthetic_digest(&digest) {
                         report.reject(
                             line_no,
                             "synthetic_preimage_in_genuine_feed",
@@ -851,8 +858,8 @@ mod tests {
         assert_eq!(report.rejections_by_reason.get("revoked"), Some(&1));
 
         let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
-        assert_eq!(manifest.genuine_records, 1);
-        assert_eq!(manifest.synthetic_records, 0);
+        assert_eq!(manifest.genuine_records, 0);
+        assert_eq!(manifest.synthetic_records, 1);
     }
 
     #[test]
@@ -925,8 +932,8 @@ mod tests {
         );
 
         let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
-        assert_eq!(manifest.genuine_records, 1);
-        assert_eq!(manifest.synthetic_records, 0);
+        assert_eq!(manifest.genuine_records, 0);
+        assert_eq!(manifest.synthetic_records, 1);
     }
 
     #[test]

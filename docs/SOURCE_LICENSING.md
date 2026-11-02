@@ -41,7 +41,7 @@ To maintain unquestionable legal and ethical standing, public RSIDB releases are
 1. **Explicit Rights & Provenance Verification**:
    - The ingestion pipeline (`rsidb::ingest::IngestPipeline`) strictly verifies that `manifest.redistribution` is either `Allowed` or `AllowedWithAttribution`.
    - Third-party sources with unconfirmed redistribution rights are documented as **UNVERIFIED** and excluded from public builds.
-   - Operator authorization (`--allow-source`) alone **cannot** establish genuine intelligence status; explicit authenticity verification (`--verify-genuine-source`) and cryptographic content pinning (`sha256`) are mandatory.
+   - Operator authorization (`--allow-source`), `--verify-genuine-source`, and content pinning do not establish source authenticity. Local manifests are not promoted to genuine status; see `MALWAREBAZAAR.md` for the separate authenticated research acquisition path.
 
 2. **Truthful Coverage Reporting**:
    - RSIDB manifests strictly separate `genuine_records` from `synthetic_records`.

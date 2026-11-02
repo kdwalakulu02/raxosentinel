@@ -965,8 +965,8 @@ fn test_e2e_scenario_18_genuine_integrity_guarantees() {
     let report2 = pipeline
         .add_source(verified_manifest, verified_content.as_bytes())
         .unwrap();
-    assert_eq!(report2.effective_kind, SourceKind::Genuine);
-    assert_eq!(report2.authenticity_status, "verified_genuine_provider");
+    assert_eq!(report2.effective_kind, SourceKind::SyntheticTest);
+    assert_eq!(report2.authenticity_status, "unverified_acquisition");
     // 2 synthetic preimages rejected, 1 real threat accepted
     assert_eq!(report2.accepted, 1);
     assert_eq!(report2.rejected, 2);
@@ -981,7 +981,7 @@ fn test_e2e_scenario_18_genuine_integrity_guarantees() {
     let (_, manifest) = pipeline
         .build("2026.11.02.1", "2026-11-02T00:00:00Z")
         .unwrap();
-    assert_eq!(manifest.genuine_records, 1);
-    assert_eq!(manifest.synthetic_records, 1); // 1 from unverified source
+    assert_eq!(manifest.genuine_records, 0);
+    assert_eq!(manifest.synthetic_records, 2);
     assert_eq!(manifest.total_accepted, 2);
 }

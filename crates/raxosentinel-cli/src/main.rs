@@ -101,7 +101,7 @@ enum DbCommand {
         /// Explicitly authorized source identifier (repeatable; authorizes ingestion)
         #[arg(long = "allow-source")]
         allowed_sources: Vec<String>,
-        /// Explicitly certified genuine intelligence provider (repeatable; certifies authenticity)
+        /// Legacy source assertion (does not establish authenticity)
         #[arg(long = "verify-genuine-source")]
         verified_genuine_sources: Vec<String>,
         /// Permit all sources (development testing mode only)
