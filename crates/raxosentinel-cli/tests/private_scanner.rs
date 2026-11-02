@@ -94,6 +94,17 @@ fn scanner_requires_private_evidence_and_never_scans_after_failure() {
     assert!(comparison.status.success());
     let parsed: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
     assert_eq!(parsed["acquisitions_added"].as_array().unwrap().len(), 1);
+    std::fs::write(root.path().join("history/registry.json"), b"corrupt").unwrap();
+    let history_scan = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .arg("scan")
+        .arg(&target)
+        .arg("--private-db-root")
+        .arg(root.path())
+        .args(["--private-generation", "history"])
+        .output()
+        .unwrap();
+    assert_eq!(history_scan.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&history_scan.stderr).contains("private database rejected"));
     std::fs::remove_file(root.path().join("synthetic/database.rsidb.evidence")).unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
         .args(["db", "sources", "--root"])

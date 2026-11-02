@@ -29,7 +29,7 @@ cargo run --release -p raxosentinel-cli --bin raxosentinel -- db merge-private -
 cargo run --release -p raxosentinel-cli --bin raxosentinel -- db remove-private-source --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION --source malwarebazaar
 ```
 
-The production adapter currently supports MalwareBazaar only. Synthetic adapters are compiled only into unit tests and are labelled synthetic; no other provider is authenticated or supported. Merging duplicate source IDs is rejected. The Rust `private_store::multi::history::inspect` API validates and returns acquisition history and associations. Local evidence consistency is not a provider signature.
+The production adapter currently supports MalwareBazaar only. Synthetic adapters are compiled only into unit tests and are labelled synthetic; no other provider is authenticated or supported. Merging v1 and v2 generations combines distinct acquisitions for each source and deduplicates the same acquisition ID. The Rust `private_store::multi::history::inspect` API validates and returns acquisition history and associations. Local evidence consistency is not a provider signature.
 
 
 For a limited recent-results source, refresh is additive: absence from the newer response does not withdraw a prior observation. Both original responses remain in the new generation, with acquisition IDs, timestamps, digests and per-acquisition statistics. Conflicting sizes are quarantined. The input and replacement generations are never mutated.
@@ -39,4 +39,4 @@ cargo run --release -p raxosentinel-cli --bin raxosentinel -- db refresh-private
 cargo run --release -p raxosentinel-cli --bin raxosentinel -- db compare-private --root /home/USER/raxosentinel-private --before OLD --after REFRESHED
 ```
 
-Acquisition timestamps and local evidence digests are not provider-issued attestations. History generations support inspection, refresh and source removal; the older multi-source merge command currently accepts only v1 inputs. Do not interpret a recent 100-record response as an authoritative full snapshot.
+Acquisition timestamps and local evidence digests are not provider-issued attestations. History generations support verified inspection, refresh, removal and merging. New acquisition publications include a random 128-bit event nonce, so identical responses in the same second can be distinguished; legacy acquisitions without a nonce retain their prior IDs and cannot be retroactively distinguished. Do not interpret a recent 100-record response as an authoritative full snapshot.

@@ -144,9 +144,9 @@ pub fn sign(m: &Manifest, key: &SigningKey) -> Result<(Vec<u8>, [u8; 64]), Strin
     signed.extend_from_slice(&bytes);
     Ok((bytes, key.sign(&signed).to_bytes()))
 }
-/// Verify canonical manifest bytes, trusted Ed25519 key, every artifact, policy, and database structure.
-/// The caller must keep `highest` in separately protected durable state; this function does not persist it.
-pub fn verify(
+// Cryptographic and structural verification only; independent approval is checked
+// separately before the public loader returns an index.
+fn verify(
     manifest: &[u8],
     signature: &[u8],
     trusted: &BTreeMap<String, VerifyingKey>,
@@ -201,6 +201,74 @@ pub fn verify(
     // Touch the validated index before returning it to the caller.
     let _ = db.total_records();
     Ok((m, db))
+}
+
+/// An independently signed approval for one exact release manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    pub format: u32,
+    pub manifest_sha256: String,
+    pub reviewer_key_id: String,
+    pub decision: String,
+    pub expires_unix: u64,
+}
+const APPROVAL_DOMAIN: &[u8] = b"RaxoSentinel independent release approval v1\0";
+/// Sign a release approval using an independently trusted reviewer key.
+pub fn approve(
+    manifest: &[u8],
+    expires_unix: u64,
+    reviewer: &SigningKey,
+) -> Result<(Vec<u8>, [u8; 64]), String> {
+    let parsed: Manifest = serde_json::from_slice(manifest).map_err(|_| "Invalid manifest")?;
+    validate(&parsed)?;
+    if serde_json::to_vec(&parsed).map_err(|_| "Invalid manifest")? != manifest {
+        return Err("Non-canonical manifest".into());
+    }
+    let key_id = hex::encode(Sha256::digest(reviewer.verifying_key().as_bytes()));
+    if key_id == parsed.key_id {
+        return Err("Reviewer key must differ from release key".into());
+    }
+    let approval = Approval {
+        format: 1,
+        manifest_sha256: hex::encode(Sha256::digest(manifest)),
+        reviewer_key_id: key_id,
+        decision: "approved".into(),
+        expires_unix,
+    };
+    let bytes = serde_json::to_vec(&approval).map_err(|e| e.to_string())?;
+    let mut signed = APPROVAL_DOMAIN.to_vec();
+    signed.extend_from_slice(&bytes);
+    Ok((bytes, reviewer.sign(&signed).to_bytes()))
+}
+fn verify_approval(
+    manifest: &[u8],
+    approval: &[u8],
+    signature: &[u8],
+    reviewer: &VerifyingKey,
+    release_key: &VerifyingKey,
+    now: u64,
+) -> Result<(), String> {
+    if approval.len() > MAX_MANIFEST || reviewer == release_key {
+        return Err("Invalid independent approval".into());
+    }
+    let value: Approval =
+        serde_json::from_slice(approval).map_err(|_| "Invalid independent approval")?;
+    if serde_json::to_vec(&value).map_err(|_| "Invalid independent approval")? != approval
+        || value.format != 1
+        || value.decision != "approved"
+        || value.expires_unix <= now
+        || value.reviewer_key_id != hex::encode(Sha256::digest(reviewer.as_bytes()))
+        || value.manifest_sha256 != hex::encode(Sha256::digest(manifest))
+    {
+        return Err("Invalid independent approval".into());
+    }
+    let sig = Signature::from_slice(signature).map_err(|_| "Invalid approval signature")?;
+    let mut signed = APPROVAL_DOMAIN.to_vec();
+    signed.extend_from_slice(approval);
+    reviewer
+        .verify_strict(&signed, &sig)
+        .map_err(|_| "Invalid approval signature".into())
 }
 
 #[cfg(test)]
@@ -259,6 +327,29 @@ mod tests {
     fn signed_release_rejects_tampering_missing_artifacts_and_unknown_keys() {
         let (key, manifest, artifacts) = fixture();
         let (bytes, signature) = sign(&manifest, &key).unwrap();
+        assert!(approve(&bytes, 200, &key).is_err());
+        let reviewer = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (approval, approval_sig) = approve(&bytes, 200, &reviewer).unwrap();
+        assert!(verify_approval(
+            &bytes,
+            &approval,
+            &approval_sig,
+            &reviewer.verifying_key(),
+            &key.verifying_key(),
+            150
+        )
+        .is_ok());
+        let mut altered = approval_sig;
+        altered[0] ^= 1;
+        assert!(verify_approval(
+            &bytes,
+            &approval,
+            &altered,
+            &reviewer.verifying_key(),
+            &key.verifying_key(),
+            150
+        )
+        .is_err());
         let trusted = BTreeMap::from([(manifest.key_id.clone(), key.verifying_key())]);
         let check = |data: &BTreeMap<String, Vec<u8>>| {
             verify(&bytes, &signature, &trusted, data, 150, 2, "0.1.0")
@@ -322,18 +413,50 @@ mod tests {
         let (bytes, sig) = sign(&manifest, &key).unwrap();
         save("manifest.json", &bytes);
         save("manifest.sig", &sig);
-        assert!(local::load(release.path(), state.path(), key.verifying_key(), "0.1.0").is_err());
+        let reviewer = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (approval, approval_signature) = approve(&bytes, now + 300, &reviewer).unwrap();
+        save("approval.json", &approval);
+        save("approval.sig", &approval_signature);
+        assert!(local::load(
+            release.path(),
+            state.path(),
+            key.verifying_key(),
+            reviewer.verifying_key(),
+            "0.1.0"
+        )
+        .is_err());
         local::initialize(state.path()).unwrap();
         assert!(local::initialize(state.path()).is_err());
-        assert!(local::load(release.path(), state.path(), key.verifying_key(), "0.1.0").is_ok());
+        assert!(local::load(
+            release.path(),
+            state.path(),
+            key.verifying_key(),
+            reviewer.verifying_key(),
+            "0.1.0"
+        )
+        .is_ok());
         save("associations.json", b"tampered");
-        assert!(local::load(release.path(), state.path(), key.verifying_key(), "0.1.0").is_err());
+        assert!(local::load(
+            release.path(),
+            state.path(),
+            key.verifying_key(),
+            reviewer.verifying_key(),
+            "0.1.0"
+        )
+        .is_err());
         save("associations.json", &artifacts["associations.json"]);
         manifest.release_number = 2;
         let (old, sig) = sign(&manifest, &key).unwrap();
         save("manifest.json", &old);
         save("manifest.sig", &sig);
-        assert!(local::load(release.path(), state.path(), key.verifying_key(), "0.1.0").is_err());
+        assert!(local::load(
+            release.path(),
+            state.path(),
+            key.verifying_key(),
+            reviewer.verifying_key(),
+            "0.1.0"
+        )
+        .is_err());
     }
     #[test]
     fn refuses_unknown_redistribution_and_signed_invalid_database() {
@@ -403,6 +526,7 @@ pub mod local {
         release_root: &Path,
         state_root: &Path,
         key: VerifyingKey,
+        reviewer: VerifyingKey,
         scanner_version: &str,
     ) -> Result<MmapSortedIndex, String> {
         let dir = root(release_root)?;
@@ -460,6 +584,17 @@ pub mod local {
             now,
             high,
             scanner_version,
+        )?;
+        let approval = readat(dir.as_raw_fd(), "approval.json", MAX_MANIFEST as u64)?;
+        let approval_signature = readat(dir.as_raw_fd(), "approval.sig", 64)?;
+        let release_key = trusted.values().next().ok_or("Missing release key")?;
+        verify_approval(
+            &bytes,
+            &approval,
+            &approval_signature,
+            &reviewer,
+            release_key,
+            now,
         )?;
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         if manifest.release_number == high && high != 0 && state[8..] != hash {

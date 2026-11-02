@@ -82,6 +82,17 @@ fn signed_public_scanner_rejects_tampered_artifacts() {
     }
     save("manifest.json", &manifest);
     save("manifest.sig", &sig);
+    let reviewer = SigningKey::generate(&mut rand::rngs::OsRng);
+    let (approval, approval_signature) =
+        public_release::approve(&manifest, now + 300, &reviewer).unwrap();
+    save("approval.json", &approval);
+    save("approval.sig", &approval_signature);
+    let approval_public = dir.path().join("approval.key");
+    std::fs::write(
+        &approval_public,
+        hex::encode(reviewer.verifying_key().as_bytes()),
+    )
+    .unwrap();
     public_release::local::initialize(&state).unwrap();
     let public = dir.path().join("public.key");
     std::fs::write(&public, hex::encode(key.verifying_key().as_bytes())).unwrap();
@@ -95,6 +106,8 @@ fn signed_public_scanner_rejects_tampered_artifacts() {
             .arg(&release)
             .arg("--public-key")
             .arg(&public)
+            .arg("--public-approval-key")
+            .arg(&approval_public)
             .arg("--public-state")
             .arg(&state)
             .output()
@@ -103,6 +116,29 @@ fn signed_public_scanner_rejects_tampered_artifacts() {
     let good = run();
     assert_ne!(good.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&good.stdout).contains("SyntheticFixture"));
+    let mut edited: Manifest = serde_json::from_slice(&manifest).unwrap();
+    edited.sources[0].provenance = "locally edited approval claim".into();
+    let (edited_manifest, edited_signature) = public_release::sign(&edited, &key).unwrap();
+    save("manifest.json", &edited_manifest);
+    save("manifest.sig", &edited_signature);
+    assert_eq!(run().status.code(), Some(3));
+    save("manifest.json", &manifest);
+    save("manifest.sig", &sig);
+    std::fs::write(
+        &approval_public,
+        hex::encode(key.verifying_key().as_bytes()),
+    )
+    .unwrap();
+    assert_eq!(run().status.code(), Some(3));
+    std::fs::write(
+        &approval_public,
+        hex::encode(reviewer.verifying_key().as_bytes()),
+    )
+    .unwrap();
+    save("approval.sig", &[0u8; 64]);
+    let missing_approval = run();
+    assert_eq!(missing_approval.status.code(), Some(3));
+    save("approval.sig", &approval_signature);
     save("associations.json", b"tampered");
     let bad = run();
     assert_eq!(bad.status.code(), Some(3));

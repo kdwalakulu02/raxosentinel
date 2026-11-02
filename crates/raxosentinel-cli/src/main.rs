@@ -236,11 +236,14 @@ struct ScanArgs {
     db: Option<PathBuf>,
 
     /// Owner-controlled signed public-release prototype directory.
-    #[arg(long, requires_all = ["public_key", "public_state"], conflicts_with_all = ["db", "db_store", "private_db_root"])]
+    #[arg(long, requires_all = ["public_key", "public_approval_key", "public_state"], conflicts_with_all = ["db", "db_store", "private_db_root"])]
     public_release: Option<PathBuf>,
     /// Explicitly trusted Ed25519 public key for public-release verification.
     #[arg(long, requires = "public_release")]
     public_key: Option<PathBuf>,
+    /// Independently trusted reviewer's Ed25519 public key.
+    #[arg(long, requires = "public_release")]
+    public_approval_key: Option<PathBuf>,
     /// Owner-controlled trusted rollback state directory.
     #[arg(long, requires = "public_release")]
     public_state: Option<PathBuf>,
@@ -308,6 +311,10 @@ fn run_scan(args: ScanArgs) -> i32 {
     // A configured database that fails validation is a hard error: never scan "without" it.
     if let Some(ref release) = args.public_release {
         let key_path = args.public_key.as_ref().expect("clap requires public key");
+        let reviewer_path = args
+            .public_approval_key
+            .as_ref()
+            .expect("clap requires approval key");
         let state = args
             .public_state
             .as_ref()
@@ -319,6 +326,8 @@ fn run_scan(args: ScanArgs) -> i32 {
                     release,
                     state,
                     key,
+                    crypto::load_verifying_key_from_file(reviewer_path)
+                        .map_err(|e| e.to_string())?,
                     env!("CARGO_PKG_VERSION"),
                 )
             }) {
