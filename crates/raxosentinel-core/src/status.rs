@@ -29,10 +29,13 @@ pub enum ScanStatus {
     /// This is an absence of detection, not a guarantee of safety.
     Clean,
     /// One or more threats were identified.
+    #[serde(rename = "DETECTED", alias = "INFECTED")]
     Infected,
     /// The input format or encoding is unsupported, encrypted, or cannot be parsed.
+    #[serde(rename = "UNSCANNED", alias = "UNSUPPORTED")]
     Unsupported,
     /// Scanning could not complete due to an I/O error, resource limit, or corruption.
+    #[serde(rename = "ERROR", alias = "FAILED")]
     Failed,
 }
 
@@ -81,9 +84,37 @@ impl std::fmt::Display for ScanStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScanStatus::Clean => write!(f, "CLEAN (no threats detected)"),
-            ScanStatus::Infected => write!(f, "INFECTED"),
-            ScanStatus::Unsupported => write!(f, "UNSUPPORTED"),
-            ScanStatus::Failed => write!(f, "FAILED"),
+            ScanStatus::Infected => write!(f, "DETECTED"),
+            ScanStatus::Unsupported => write!(f, "UNSCANNED"),
+            ScanStatus::Failed => write!(f, "ERROR"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScanStatus;
+    #[test]
+    fn external_verdicts_are_distinct_and_legacy_values_are_readable() {
+        assert_eq!(
+            serde_json::to_string(&ScanStatus::Clean).unwrap(),
+            "\"CLEAN\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ScanStatus::Infected).unwrap(),
+            "\"DETECTED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ScanStatus::Unsupported).unwrap(),
+            "\"UNSCANNED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ScanStatus::Failed).unwrap(),
+            "\"ERROR\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ScanStatus>("\"INFECTED\"").unwrap(),
+            ScanStatus::Infected
+        );
     }
 }

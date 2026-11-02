@@ -151,6 +151,38 @@ fn test_synthetic_signature_matching() {
 }
 
 #[test]
+fn test_repeated_pattern_matches_have_bounded_reporting() {
+    let db = SignatureDatabase::with_defaults();
+    let data = b"[RAXOSENTINEL-SYNTHETIC-TEST-SIGNATURE]".repeat(10_000);
+    let hits = db.match_bytes(&data);
+    assert_eq!(hits.len(), 33);
+    assert!(hits.iter().any(|hit| hit
+        .matched_by
+        .contains("additional pattern offsets omitted")));
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+    let streamed = db
+        .match_stream(&mut std::io::Cursor::new(data), &mut tracker)
+        .unwrap();
+    assert_eq!(streamed.len(), 33);
+    assert!(streamed.iter().any(|hit| hit
+        .matched_by
+        .contains("additional pattern offsets omitted")));
+}
+
+#[test]
+fn test_stream_matching_rejects_zero_buffer() {
+    let db = SignatureDatabase::with_defaults();
+    let limits = ResourceLimits {
+        buffer_size: 0,
+        ..Default::default()
+    };
+    let mut tracker = ResourceTracker::new(limits);
+    assert!(db
+        .match_stream(&mut std::io::Cursor::new(b"synthetic bytes"), &mut tracker)
+        .is_err());
+}
+
+#[test]
 fn test_eicar_antivirus_test_string_detection() {
     let db = SignatureDatabase::with_defaults();
     let limits = ResourceLimits::default();

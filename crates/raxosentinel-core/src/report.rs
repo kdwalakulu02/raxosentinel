@@ -63,9 +63,28 @@ impl ScanReport {
         scan_duration_ms: u64,
         error: Option<String>,
     ) -> Self {
+        fn collect_detections<'a>(
+            report: &'a ScanReport,
+            found: &mut std::collections::HashSet<(&'a str, Option<&'a str>)>,
+        ) {
+            for threat in &report.threats {
+                found.insert((&threat.name, threat.location.as_deref()));
+            }
+            for child in &report.sub_targets {
+                collect_detections(child, found);
+            }
+        }
+        let mut found = std::collections::HashSet::new();
+        for threat in &threats {
+            found.insert((threat.name.as_str(), threat.location.as_deref()));
+        }
+        for child in &sub_targets {
+            collect_detections(child, &mut found);
+        }
+        let detected = found.len();
         let status_description = match status {
             ScanStatus::Clean => "No known threats detected by active signatures.".to_string(),
-            ScanStatus::Infected => format!("Detected {} threat(s).", threats.len()),
+            ScanStatus::Infected => format!("Detected {} threat(s).", detected),
             ScanStatus::Unsupported => {
                 "Content format is unsupported or could not be inspected.".to_string()
             }

@@ -40,12 +40,18 @@ pub fn hash_reader_bounded<R: Read>(
 ) -> Result<HashResult, ScanError> {
     let mut hasher = Sha256::new();
     let buffer_size = tracker.limits().buffer_size;
+    if buffer_size == 0 || buffer_size > 16 * 1024 * 1024 {
+        return Err(ScanError::Internal("Invalid hashing buffer size".into()));
+    }
+    tracker.check_timeout()?;
     let mut buffer = vec![0u8; buffer_size];
     let mut total_bytes: u64 = 0;
 
     loop {
+        tracker.check_timeout()?;
         let n = reader.read(&mut buffer)?;
         if n == 0 {
+            tracker.check_timeout()?;
             break;
         }
 
@@ -129,6 +135,16 @@ mod tests {
             "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
         );
         assert_eq!(result.bytes_processed, data.len() as u64);
+    }
+
+    #[test]
+    fn invalid_stream_buffer_is_rejected() {
+        let limits = ResourceLimits {
+            buffer_size: 0,
+            ..ResourceLimits::default()
+        };
+        let mut tracker = ResourceTracker::new(limits);
+        assert!(hash_reader_bounded(&mut Cursor::new(b"not empty"), &mut tracker).is_err());
     }
 
     #[test]

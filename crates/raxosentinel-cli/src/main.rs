@@ -290,7 +290,7 @@ fn run_scan(args: ScanArgs) -> i32 {
         limits.max_file_size = max_sz;
     }
     if let Some(to) = args.timeout {
-        limits.max_scan_duration_ms = to * 1000;
+        limits.max_scan_duration_ms = to.saturating_mul(1000);
     }
     if let Some(depth) = args.max_depth {
         limits.max_email_depth = depth;
@@ -596,19 +596,40 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
         )
     };
 
-    let max = tracker.limits().max_file_size;
-    let mut data = Vec::with_capacity(metadata.len().min(max) as usize);
-    let read_res =
-        File::open(path).and_then(|f| f.take(max.saturating_add(1)).read_to_end(&mut data));
-    if let Err(e) = read_res {
-        return fail(
-            tracker,
-            metadata.len(),
-            format!("Failed to read file: {}", e),
-        );
-    }
-    if let Err(e) = tracker.record_bytes_read(data.len()) {
-        return fail(tracker, data.len() as u64, e.to_string());
+    let mut data = Vec::new();
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => return fail(tracker, metadata.len(), format!("Failed to open file: {e}")),
+    };
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if let Err(e) = tracker.check_timeout() {
+            return fail(tracker, data.len() as u64, e.to_string());
+        }
+        let n = match file.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                return fail(
+                    tracker,
+                    data.len() as u64,
+                    format!("Failed to read file: {e}"),
+                )
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if let Err(e) = tracker.record_bytes_read(n) {
+            return fail(tracker, data.len() as u64 + n as u64, e.to_string());
+        }
+        if data.try_reserve(n).is_err() {
+            return fail(
+                tracker,
+                data.len() as u64,
+                "Cannot allocate scan buffer".into(),
+            );
+        }
+        data.extend_from_slice(&chunk[..n]);
     }
 
     let scanner = EmailScanner::new(db);
@@ -991,10 +1012,14 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
             println!("{}", report.safety_disclaimer);
         }
         ScanStatus::Infected => {
-            println!("Overall Status   : [ INFECTED ]");
+            println!("Overall Status   : [ DETECTED ]");
             println!("Summary          : {}", report.status_description);
             println!();
-            println!("Detected Threats ({}):", report.threats.len());
+            if report.threats.is_empty() {
+                println!("Detections are listed in sub-target reports.");
+            } else {
+                println!("Detected Threats ({}):", report.threats.len());
+            }
             for (idx, t) in report.threats.iter().enumerate() {
                 println!(
                     "  [{}] {} | Category: {} | Severity: {} | Type: {}",
@@ -1012,14 +1037,14 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
             }
         }
         ScanStatus::Unsupported => {
-            println!("Overall Status   : [ UNSUPPORTED ]");
+            println!("Overall Status   : [ UNSCANNED ]");
             println!("Summary          : {}", report.status_description);
             if let Some(ref err) = report.error {
                 println!("Details          : {}", err);
             }
         }
         ScanStatus::Failed => {
-            println!("Overall Status   : [ FAILED ]");
+            println!("Overall Status   : [ ERROR ]");
             println!("Summary          : {}", report.status_description);
             if let Some(ref err) = report.error {
                 println!("Error Details    : {}", err);
@@ -1031,29 +1056,25 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
         println!(
             "--------------------------------------------------------------------------------"
         );
-        println!(
-            "Extracted Email Attachments / Parts ({}):",
-            report.sub_targets.len()
-        );
-        for (idx, sub) in report.sub_targets.iter().enumerate() {
-            let name = sub.target.file_name.as_deref().unwrap_or("unnamed");
-            println!(
-                "  [{}] Attachment: {} ({} bytes, Type: {}) -> Status: {}",
-                idx + 1,
-                name,
-                sub.target.file_size_bytes,
-                sub.target.detected_mime,
-                sub.status
-            );
-            if !sub.threats.is_empty() {
-                for t in &sub.threats {
+        println!("Extracted sub-targets ({}):", report.sub_targets.len());
+        fn print_subtargets(subs: &[ScanReport], depth: usize) {
+            let indent = "  ".repeat(depth.min(32));
+            for sub in subs {
+                let name = sub.target.file_name.as_deref().unwrap_or("unnamed");
+                println!(
+                    "{}- {} ({} bytes, Type: {}) -> Status: {}",
+                    indent, name, sub.target.file_size_bytes, sub.target.detected_mime, sub.status
+                );
+                for threat in &sub.threats {
                     println!(
-                        "      - Threat: {} [{}] ({})",
-                        t.name, t.severity, t.category
+                        "{}  Threat: {} [{}] ({})",
+                        indent, threat.name, threat.severity, threat.category
                     );
                 }
+                print_subtargets(&sub.sub_targets, depth + 1);
             }
         }
+        print_subtargets(&report.sub_targets, 1);
     }
 
     println!("================================================================================");
