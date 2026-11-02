@@ -12,9 +12,9 @@
 
 | Implementation Architecture | Storage Size | Build Time | Startup / Map Time | Steady Warm RSS | RSS Delta | 20k Query Batch | Throughput (QPS) | p50 Latency | p95 Latency | p99 Latency | Detection Parity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **In-Memory Hash Index** | 4.20 MiB | 347.5 ms | **102.322 ms** | 49.77 MiB (base 26.9M) | **+22.89 MiB** | 13.33 ms | **1499904 qps** | 859 ns | 1491 ns | 2256 ns | **100%** (10000/20000) |
-| **Memory-Mapped Sorted Binary Index** | 4.20 MiB | 347.5 ms | **21.988 ms** | 45.85 MiB (base 41.6M) | **+4.20 MiB** | 25.49 ms | **784495 qps** | 1154 ns | 2057 ns | 3118 ns | **100%** (10000/20000) |
-| **Mmap Compact Directory Index** | 4.95 MiB | 321.6 ms | **17.584 ms** | 46.60 MiB (base 41.6M) | **+4.95 MiB** | 7.32 ms | **2730922 qps** | 338 ns | 859 ns | 1272 ns | **100%** (10000/20000) |
+| **In-Memory Hash Index** | 4.20 MiB | 65.3 ms | **20.553 ms** | 49.63 MiB (base 26.7M) | **+22.89 MiB** | 1.50 ms | **13345317 qps** | 107 ns | 244 ns | 454 ns | **100%** (10000/20000) |
+| **Memory-Mapped Sorted Binary Index** | 4.20 MiB | 65.3 ms | **2.857 ms** | 45.70 MiB (base 41.5M) | **+4.20 MiB** | 3.81 ms | **5248928 qps** | 189 ns | 301 ns | 352 ns | **100%** (10000/20000) |
+| **Mmap Compact Directory Index** | 4.95 MiB | 58.5 ms | **3.472 ms** | 46.45 MiB (base 41.5M) | **+4.95 MiB** | 1.17 ms | **17088365 qps** | 59 ns | 123 ns | 175 ns | **100%** (10000/20000) |
 
 ## 2. Comparative Analysis: Python Experiment vs Native Rust Implementations
 

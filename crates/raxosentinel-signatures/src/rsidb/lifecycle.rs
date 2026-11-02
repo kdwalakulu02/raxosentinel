@@ -33,8 +33,11 @@
 //! The SHA-256 pin in `install` only protects against corruption when the expected digest
 //! comes from a trusted channel.
 
+use super::crypto;
 use super::error::DatabaseError;
+use super::ingest::BuildManifest;
 use super::mmap_compact_dir::MmapCompactDirIndex;
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
@@ -117,6 +120,126 @@ impl DbStore {
         self.releases().join(release)
     }
 
+    /// Verifies and installs an authenticated or development release into the database store.
+    ///
+    /// For signed releases (`allow_unsigned == false`):
+    /// - Requires `manifest_path`, `signature_path`, and `trusted_pubkey`.
+    /// - Verifies the Ed25519 signature on the release manifest.
+    /// - Verifies that the candidate database SHA-256 matches the signed manifest `db_sha256`.
+    /// - Verifies the candidate database binary format and checksums.
+    ///
+    /// For unsigned releases (`allow_unsigned == true`):
+    /// - Explicitly permits local development testing without Ed25519 signatures.
+    /// - Still validates the candidate database binary structure and optional SHA-256 pin.
+    ///
+    /// Installation is atomic (write-temp -> fsync -> rename) and non-destructive.
+    /// The previously active release is preserved in `previous` for instant rollback.
+    pub fn install_release(
+        &self,
+        candidate_db: &Path,
+        manifest_path: Option<&Path>,
+        signature_path: Option<&Path>,
+        trusted_pubkey: Option<&VerifyingKey>,
+        allow_unsigned: bool,
+    ) -> Result<String, DatabaseError> {
+        let db_bytes = fs::read(candidate_db).map_err(|e| io("read candidate database", e))?;
+        let digest = hex::encode(Sha256::digest(&db_bytes));
+
+        let mut manifest_raw: Option<Vec<u8>> = None;
+        let mut sig_raw: Option<Vec<u8>> = None;
+
+        if !allow_unsigned {
+            let m_path = manifest_path.ok_or_else(|| {
+                DatabaseError::Policy(
+                    "release manifest (.manifest.json) required for signed release installation"
+                        .into(),
+                )
+            })?;
+            let s_path = signature_path.ok_or_else(|| {
+                DatabaseError::Policy(
+                    "release signature (.sig) required for signed release installation".into(),
+                )
+            })?;
+            let pubkey = trusted_pubkey.ok_or_else(|| {
+                DatabaseError::Policy(
+                    "trusted public key required for signed release verification".into(),
+                )
+            })?;
+
+            let m_bytes = fs::read(m_path).map_err(|e| io("read release manifest", e))?;
+            let sig = crypto::load_signature_from_file(s_path)?;
+
+            let _manifest = crypto::verify_release_package(&m_bytes, &sig, pubkey, &db_bytes)?;
+            manifest_raw = Some(m_bytes);
+            sig_raw = Some(fs::read(s_path).map_err(|e| io("read signature file", e))?);
+        } else {
+            // Unsigned development mode: optionally read and cross-check manifest if provided
+            if let Some(m_path) = manifest_path {
+                if let Ok(m_bytes) = fs::read(m_path) {
+                    if let Ok(m) = serde_json::from_slice::<BuildManifest>(&m_bytes) {
+                        if !digest.eq_ignore_ascii_case(&m.db_sha256) {
+                            return Err(DatabaseError::Policy(format!(
+                                "candidate database sha256 {} does not match manifest {}",
+                                digest, m.db_sha256
+                            )));
+                        }
+                        manifest_raw = Some(m_bytes);
+                    }
+                }
+            }
+        }
+
+        // Validate RSIDB binary format
+        MmapCompactDirIndex::from_bytes(db_bytes.clone())?;
+
+        fs::create_dir_all(self.releases()).map_err(|e| io("create store", e))?;
+        let release = format!("{}.rsidb", digest);
+        let dest = self.release_path(&release);
+        if let Ok(meta) = fs::symlink_metadata(&dest) {
+            if meta.file_type().is_symlink() {
+                return Err(DatabaseError::Policy(format!(
+                    "release destination cannot be a symlink: {}",
+                    dest.display()
+                )));
+            }
+        }
+        if !dest.exists() {
+            let tmp = self.releases().join(format!(".{}.tmp", digest));
+            {
+                let mut f = fs::File::create(&tmp).map_err(|e| io("create release", e))?;
+                f.write_all(&db_bytes).map_err(|e| io("write release", e))?;
+                f.sync_all().map_err(|e| io("sync release", e))?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444));
+            }
+            fs::rename(&tmp, &dest).map_err(|e| io("rename release", e))?;
+        }
+
+        // Store manifest and signature in releases/ alongside database for auditability
+        if let Some(m_bytes) = manifest_raw {
+            let m_dest = self.releases().join(format!("{}.manifest.json", digest));
+            let _ = fs::write(m_dest, m_bytes);
+        }
+        if let Some(s_bytes) = sig_raw {
+            let s_dest = self.releases().join(format!("{}.sig", digest));
+            let _ = fs::write(s_dest, s_bytes);
+        }
+
+        // Re-verify what is actually on disk before activation.
+        MmapCompactDirIndex::from_file(&dest)?;
+
+        if let Some(cur) = self.current_release() {
+            if cur != release {
+                self.write_pointer("previous", &cur)?;
+            }
+        }
+        self.write_pointer("current", &release)?;
+        Ok(release)
+    }
+
     /// Verifies `candidate` (structure, checksum and optional trusted SHA-256 pin), copies
     /// it into the store, re-verifies the stored copy and atomically activates it.
     /// The previously active release becomes `previous` (last known good).
@@ -135,43 +258,7 @@ impl DbStore {
                 )));
             }
         }
-        MmapCompactDirIndex::from_bytes(bytes.clone())?;
-
-        fs::create_dir_all(self.releases()).map_err(|e| io("create store", e))?;
-        let release = format!("{}.rsidb", digest);
-        let dest = self.release_path(&release);
-        if let Ok(meta) = fs::symlink_metadata(&dest) {
-            if meta.file_type().is_symlink() {
-                return Err(DatabaseError::Policy(format!(
-                    "release destination cannot be a symlink: {}",
-                    dest.display()
-                )));
-            }
-        }
-        if !dest.exists() {
-            let tmp = self.releases().join(format!(".{}.tmp", digest));
-            {
-                let mut f = fs::File::create(&tmp).map_err(|e| io("create release", e))?;
-                f.write_all(&bytes).map_err(|e| io("write release", e))?;
-                f.sync_all().map_err(|e| io("sync release", e))?;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444));
-            }
-            fs::rename(&tmp, &dest).map_err(|e| io("rename release", e))?;
-        }
-        // Re-verify what is actually on disk before activation.
-        MmapCompactDirIndex::from_file(&dest)?;
-
-        if let Some(cur) = self.current_release() {
-            if cur != release {
-                self.write_pointer("previous", &cur)?;
-            }
-        }
-        self.write_pointer("current", &release)?;
-        Ok(release)
+        self.install_release(candidate, None, None, None, true)
     }
 
     /// Swaps `current` and `previous`. Fails if no valid previous release exists.

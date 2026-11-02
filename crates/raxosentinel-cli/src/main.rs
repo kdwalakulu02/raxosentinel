@@ -22,6 +22,7 @@ use raxosentinel_core::{
 };
 use raxosentinel_email::EmailScanner;
 use raxosentinel_filetypes::{detect_file_type, FileCategory};
+use raxosentinel_signatures::rsidb::crypto;
 use raxosentinel_signatures::rsidb::ingest::{BuildProfile, IngestPipeline, SourceManifest};
 use raxosentinel_signatures::rsidb::lifecycle::DbStore;
 use raxosentinel_signatures::rsidb::{MmapCompactDirIndex, RsidbIndex};
@@ -64,6 +65,22 @@ enum Commands {
 enum DbCommand {
     /// Fully validate an RSIDB file and print its statistics
     Verify { path: PathBuf },
+    /// Generate an offline Ed25519 keypair for release signing
+    Keygen {
+        #[arg(long)]
+        out_public: PathBuf,
+        #[arg(long)]
+        out_private: PathBuf,
+    },
+    /// Cryptographically sign a release manifest with an Ed25519 private key
+    Sign {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        out_sig: PathBuf,
+    },
     /// Build a deterministic RSIDB + manifest from approved source manifests
     Build {
         /// Source manifest JSON (repeatable)
@@ -81,15 +98,36 @@ enum DbCommand {
         /// public | internal
         #[arg(long, default_value = "public")]
         profile: String,
+        /// Explicitly authorized source identifier (repeatable; prevents self-approval)
+        #[arg(long = "allow-source")]
+        allowed_sources: Vec<String>,
+        /// Permit all sources (development testing mode only)
+        #[arg(long)]
+        allow_all_sources_dev: bool,
+        /// Revoke an indicator hash (repeatable hex hash)
+        #[arg(long = "revoke")]
+        revocations: Vec<String>,
     },
     /// Verify and atomically activate a database in a store directory
     Install {
         #[arg(long)]
         store: PathBuf,
         path: PathBuf,
+        /// Path to release manifest (.manifest.json)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Path to release signature (.sig)
+        #[arg(long)]
+        sig: Option<PathBuf>,
+        /// Path to trusted Ed25519 public key (.pub)
+        #[arg(long)]
+        pubkey: Option<PathBuf>,
         /// Expected SHA-256 of the candidate, obtained from a trusted channel
         #[arg(long)]
         sha256: Option<String>,
+        /// Explicitly permit installation of an unsigned database (development mode)
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Re-activate the previous (last known-good) database
     Rollback {
@@ -466,6 +504,58 @@ fn run_db(cmd: DbCommand) -> i32 {
                 }
             }
         }
+        DbCommand::Keygen {
+            out_public,
+            out_private,
+        } => {
+            let (sk, vk) = crypto::generate_keypair();
+            if let Err(e) = crypto::save_signing_key_to_file(&sk, &out_private) {
+                eprintln!("Failed to save private key: {}", e);
+                return 3;
+            }
+            if let Err(e) = crypto::save_verifying_key_to_file(&vk, &out_public) {
+                eprintln!("Failed to save public key: {}", e);
+                return 3;
+            }
+            println!("Generated Ed25519 keypair for release signing:");
+            println!("  Public key : {}", out_public.display());
+            println!(
+                "  Private key: {} (KEEP SECRET, NEVER COMMIT TO GIT)",
+                out_private.display()
+            );
+            0
+        }
+        DbCommand::Sign {
+            manifest,
+            key,
+            out_sig,
+        } => {
+            let sk = match crypto::load_signing_key_from_file(&key) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Failed to load signing key '{}': {}", key.display(), e);
+                    return 3;
+                }
+            };
+            let m_bytes = match std::fs::read(&manifest) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Failed to read manifest '{}': {}", manifest.display(), e);
+                    return 3;
+                }
+            };
+            let sig = crypto::sign_bytes(&m_bytes, &sk);
+            if let Err(e) = crypto::save_signature_to_file(&sig, &out_sig) {
+                eprintln!("Failed to save signature '{}': {}", out_sig.display(), e);
+                return 3;
+            }
+            println!(
+                "Signed manifest {} -> {}",
+                manifest.display(),
+                out_sig.display()
+            );
+            0
+        }
         DbCommand::Build {
             sources,
             out,
@@ -473,6 +563,9 @@ fn run_db(cmd: DbCommand) -> i32 {
             db_version,
             built_at,
             profile,
+            allowed_sources,
+            allow_all_sources_dev,
+            revocations,
         } => {
             let profile = match profile.as_str() {
                 "public" => BuildProfile::Public,
@@ -483,6 +576,21 @@ fn run_db(cmd: DbCommand) -> i32 {
                 }
             };
             let mut pipeline = IngestPipeline::new(profile);
+            if allow_all_sources_dev {
+                eprintln!("[WARN] Permitting all sources in development testing mode");
+                pipeline.authorize_all_for_testing();
+            } else {
+                for s in &allowed_sources {
+                    pipeline.authorize_source(s);
+                }
+            }
+            for r in &revocations {
+                if let Err(e) = pipeline.revoke_hash(r) {
+                    eprintln!("Invalid revocation hash '{}': {}", r, e);
+                    return 2;
+                }
+            }
+
             for src in &sources {
                 let res = (|| -> Result<(), String> {
                     let text = std::fs::read_to_string(src).map_err(|e| e.to_string())?;
@@ -522,29 +630,61 @@ fn run_db(cmd: DbCommand) -> i32 {
                 return 3;
             }
             println!(
-                "built {} sha256={} accepted={} rejected={} duplicates={}",
+                "built {} sha256={} accepted={} rejected={} duplicates={} genuine={} synthetic={}",
                 out.display(),
                 manifest.db_sha256,
                 manifest.total_accepted,
                 manifest.total_rejected,
-                manifest.total_duplicates
+                manifest.total_duplicates,
+                manifest.genuine_records,
+                manifest.synthetic_records,
             );
             0
         }
         DbCommand::Install {
             store,
             path,
-            sha256,
-        } => match DbStore::new(store).install(&path, sha256.as_deref()) {
-            Ok(r) => {
-                println!("activated {}", r);
-                0
+            manifest,
+            sig,
+            pubkey,
+            sha256: _,
+            allow_unsigned,
+        } => {
+            let pubkey_obj = if let Some(pk_path) = &pubkey {
+                match crypto::load_verifying_key_from_file(pk_path) {
+                    Ok(k) => Some(k),
+                    Err(e) => {
+                        eprintln!("Failed to load public key '{}': {}", pk_path.display(), e);
+                        return 3;
+                    }
+                }
+            } else {
+                None
+            };
+
+            if allow_unsigned {
+                eprintln!(
+                    "[WARN] Installing database without Ed25519 signature verification (--allow-unsigned specified)"
+                );
             }
-            Err(e) => {
-                eprintln!("Install rejected: {}", e);
-                3
+
+            match DbStore::new(store).install_release(
+                &path,
+                manifest.as_deref(),
+                sig.as_deref(),
+                pubkey_obj.as_ref(),
+                allow_unsigned,
+            ) {
+                Ok(r) => {
+                    println!("activated {}", r);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Install rejected: {}", e);
+                    3
+                }
             }
-        },
+        }
         DbCommand::Rollback { store } => match DbStore::new(store).rollback() {
             Ok(r) => {
                 println!("rolled back to {}", r);

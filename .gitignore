@@ -4,3 +4,10 @@
 *.bak
 .DS_Store
 raw referefce/
+
+# Cryptographic private keys (strictly forbidden from Git commits)
+*.key
+*.priv
+*.private
+*.signing_key
+*.sec

@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+pub mod crypto;
 pub mod error;
 pub mod format;
 pub mod importer;

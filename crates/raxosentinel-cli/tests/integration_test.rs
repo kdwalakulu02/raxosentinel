@@ -19,8 +19,9 @@
 use raxosentinel_core::{ResourceLimits, ResourceTracker, ScanStatus, ThreatCategory};
 use raxosentinel_email::EmailScanner;
 use raxosentinel_filetypes::{detect_file_type, detect_type, FileCategory};
+use raxosentinel_signatures::rsidb::crypto;
 use raxosentinel_signatures::rsidb::ingest::{
-    BuildProfile, IndicatorFormat, IngestPipeline, Redistribution, SourceManifest,
+    BuildProfile, IndicatorFormat, IngestPipeline, Redistribution, SourceKind, SourceManifest,
 };
 use raxosentinel_signatures::rsidb::lifecycle::DbStore;
 use raxosentinel_signatures::rsidb::{
@@ -216,6 +217,7 @@ fn create_test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
 #[test]
 fn test_e2e_scenario_1_and_2_ingest_pipeline_and_verification() {
     let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+    pipeline.authorize_source("approved-harmless-feed");
     let manifest = SourceManifest {
         id: "approved-harmless-feed".into(),
         name: "Harmless Threat Intelligence Feed".into(),
@@ -226,6 +228,7 @@ fn test_e2e_scenario_1_and_2_ingest_pipeline_and_verification() {
         redistribution: Redistribution::Allowed,
         attribution: None,
         approved: true,
+        kind: SourceKind::SyntheticTest,
         format: IndicatorFormat::HashSizeName,
         path: "feed.hdb".into(),
         sha256: None,
@@ -472,6 +475,7 @@ fn test_e2e_scenario_10_reject_manifest_directory_traversal() {
             redistribution: Redistribution::Allowed,
             attribution: None,
             approved: true,
+            kind: SourceKind::SyntheticTest,
             format: IndicatorFormat::HashSizeName,
             path: bad_path.into(),
             sha256: None,
@@ -577,4 +581,320 @@ fn test_e2e_scenario_12_backward_compatibility_clean_and_defaults() {
         .scan_object(EICAR_BYTES, "eicar.com", None, &mut tracker2, 0)
         .expect("scan eicar with defaults");
     assert_eq!(report_eicar.status, ScanStatus::Infected);
+}
+
+fn make_test_tar_archive(name: &str, content: &[u8]) -> Vec<u8> {
+    let mut tar = vec![0u8; 512];
+    let name_bytes = name.as_bytes();
+    tar[..name_bytes.len()].copy_from_slice(name_bytes);
+    tar[100..108].copy_from_slice(b"0000644\0");
+    tar[108..116].copy_from_slice(b"0000000\0");
+    tar[116..124].copy_from_slice(b"0000000\0");
+    let size_str = format!("{:011o}\0", content.len());
+    tar[124..136].copy_from_slice(size_str.as_bytes());
+    tar[136..148].copy_from_slice(b"00000000000\0");
+    tar[156] = b'0';
+    tar[257..263].copy_from_slice(b"ustar\0");
+    tar[263..265].copy_from_slice(b"00");
+    tar[148..156].copy_from_slice(b"        ");
+    let chksum: u32 = tar.iter().map(|&b| b as u32).sum();
+    let chksum_str = format!("{:06o}\0 ", chksum);
+    tar[148..156].copy_from_slice(chksum_str.as_bytes());
+
+    tar.extend_from_slice(content);
+    let pad = (512 - (content.len() % 512)) % 512;
+    tar.extend(vec![0u8; pad]);
+    tar.extend(vec![0u8; 1024]);
+    tar
+}
+
+#[test]
+fn test_e2e_scenario_13_signed_release_verification_and_tamper_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = DbStore::new(dir.path().join("store"));
+
+    // 1. Generate release signing keypair
+    let (signing_key, verifying_key) = crypto::generate_keypair();
+    let pubkey_file = dir.path().join("trusted.pub");
+    crypto::save_verifying_key_to_file(&verifying_key, &pubkey_file).unwrap();
+
+    // 2. Build release with genuine indicators
+    let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+    pipeline.authorize_source("source-genuine");
+    let manifest_src = SourceManifest {
+        id: "source-genuine".into(),
+        name: "Genuine Feed".into(),
+        origin: "https://example.com/feed".into(),
+        version: "2026.11.02".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "CC0-1.0".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true,
+        kind: SourceKind::Genuine,
+        format: IndicatorFormat::HashSizeName,
+        path: "feed.hdb".into(),
+        sha256: None,
+    };
+    let feed_content = format!("{}:68:Genuine.Threat.HashMatch\n", EICAR_SHA256_HEX);
+    pipeline
+        .add_source(manifest_src, feed_content.as_bytes())
+        .unwrap();
+
+    let (db_bytes, build_manifest) = pipeline
+        .build("2026.11.02.1", "2026-11-02T00:00:00Z")
+        .unwrap();
+    assert_eq!(build_manifest.genuine_records, 1);
+    assert_eq!(build_manifest.synthetic_records, 0);
+
+    let db_path = dir.path().join("release.rsidb");
+    let manifest_path = dir.path().join("release.manifest.json");
+    let sig_path = dir.path().join("release.sig");
+
+    std::fs::write(&db_path, &db_bytes).unwrap();
+    let manifest_json = serde_json::to_string_pretty(&build_manifest).unwrap();
+    std::fs::write(&manifest_path, &manifest_json).unwrap();
+
+    // Sign manifest bytes
+    let sig = crypto::sign_bytes(manifest_json.as_bytes(), &signing_key);
+    crypto::save_signature_to_file(&sig, &sig_path).unwrap();
+
+    // 3. Install valid signed release
+    let activated = store
+        .install_release(
+            &db_path,
+            Some(&manifest_path),
+            Some(&sig_path),
+            Some(&verifying_key),
+            false,
+        )
+        .expect("valid signed release installs");
+    assert_eq!(store.current_release().unwrap(), activated);
+
+    // 4. Tampered database content is rejected
+    let tampered_db_path = dir.path().join("tampered.rsidb");
+    let mut tampered_bytes = db_bytes.clone();
+    let len = tampered_bytes.len();
+    tampered_bytes[len - 5] ^= 0x55;
+    std::fs::write(&tampered_db_path, &tampered_bytes).unwrap();
+
+    let res_tampered_db = store.install_release(
+        &tampered_db_path,
+        Some(&manifest_path),
+        Some(&sig_path),
+        Some(&verifying_key),
+        false,
+    );
+    assert!(
+        res_tampered_db.is_err(),
+        "Tampered database must be rejected"
+    );
+
+    // 5. Tampered manifest is rejected
+    let tampered_manifest_path = dir.path().join("tampered.manifest.json");
+    let tampered_manifest_json = manifest_json.replace("source-genuine", "tampered-source");
+    assert_ne!(manifest_json, tampered_manifest_json);
+    std::fs::write(&tampered_manifest_path, &tampered_manifest_json).unwrap();
+
+    let res_tampered_manifest = store.install_release(
+        &db_path,
+        Some(&tampered_manifest_path),
+        Some(&sig_path),
+        Some(&verifying_key),
+        false,
+    );
+    assert!(
+        res_tampered_manifest.is_err(),
+        "Tampered manifest must fail signature verification"
+    );
+}
+
+#[test]
+fn test_e2e_scenario_14_missing_or_incorrect_signing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = DbStore::new(dir.path().join("store"));
+
+    let (sk1, _vk1) = crypto::generate_keypair();
+    let (_sk2, vk2) = crypto::generate_keypair();
+
+    let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+    pipeline.authorize_all_for_testing();
+    let manifest_src = SourceManifest {
+        id: "source-test".into(),
+        name: "Test Feed".into(),
+        origin: "test".into(),
+        version: "1.0".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "CC0-1.0".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true,
+        kind: SourceKind::SyntheticTest,
+        format: IndicatorFormat::HashSizeName,
+        path: "f.hdb".into(),
+        sha256: None,
+    };
+    let content = format!("{}:68:Synthetic.Test.Sig\n", EICAR_MD5_HEX);
+    pipeline
+        .add_source(manifest_src, content.as_bytes())
+        .unwrap();
+
+    let (db_bytes, build_manifest) = pipeline.build("1.0", "2026-11-02T00:00:00Z").unwrap();
+    let db_path = dir.path().join("db.rsidb");
+    let manifest_path = dir.path().join("db.manifest.json");
+    let sig_path = dir.path().join("db.sig");
+
+    std::fs::write(&db_path, &db_bytes).unwrap();
+    let manifest_json = serde_json::to_string(&build_manifest).unwrap();
+    std::fs::write(&manifest_path, &manifest_json).unwrap();
+
+    // Sign with SK1
+    let sig = crypto::sign_bytes(manifest_json.as_bytes(), &sk1);
+    crypto::save_signature_to_file(&sig, &sig_path).unwrap();
+
+    // 1. Install with wrong public key (VK2) fails signature verification
+    let res_wrong_key = store.install_release(
+        &db_path,
+        Some(&manifest_path),
+        Some(&sig_path),
+        Some(&vk2),
+        false,
+    );
+    assert!(
+        res_wrong_key.is_err(),
+        "Wrong public key must fail signature verification"
+    );
+
+    // 2. Missing signature when unsigned not allowed fails
+    let res_missing_sig =
+        store.install_release(&db_path, Some(&manifest_path), None, Some(&vk2), false);
+    assert!(
+        res_missing_sig.is_err(),
+        "Missing signature must be rejected"
+    );
+
+    // 3. Explicit --allow-unsigned allows installation without signatures
+    let res_dev_mode = store.install_release(&db_path, Some(&manifest_path), None, None, true);
+    assert!(
+        res_dev_mode.is_ok(),
+        "allow_unsigned=true must succeed in development workflow"
+    );
+}
+
+#[test]
+fn test_e2e_scenario_15_tar_archive_produces_unsupported_verdict() {
+    let tar_bytes =
+        make_test_tar_archive("embedded_payload.bin", b"Malware payload bytes inside tar");
+    let db = SignatureDatabase::new();
+    let scanner = EmailScanner::new(&db);
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+    // 1. Direct TAR scan returns Unsupported
+    let report = scanner
+        .scan_object(
+            &tar_bytes,
+            "payload.tar",
+            Some("application/x-tar"),
+            &mut tracker,
+            0,
+        )
+        .expect("scan tar");
+    assert_eq!(report.status, ScanStatus::Unsupported);
+    assert!(report
+        .error
+        .as_ref()
+        .unwrap()
+        .contains("TAR container cannot be extracted"));
+
+    // 2. Truncated TAR scan returns Unsupported
+    let trunc_tar = &tar_bytes[..200];
+    let report_trunc = scanner
+        .scan_object(
+            trunc_tar,
+            "damaged.tar",
+            Some("application/x-tar"),
+            &mut tracker,
+            0,
+        )
+        .expect("scan truncated tar");
+    assert_eq!(report_trunc.status, ScanStatus::Unsupported);
+}
+
+#[test]
+fn test_e2e_scenario_16_malformed_records_and_accurate_signature_counts() {
+    let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+    pipeline.authorize_source("mixed-feed");
+
+    let source = SourceManifest {
+        id: "mixed-feed".into(),
+        name: "Mixed Feed".into(),
+        origin: "test".into(),
+        version: "1.0".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "CC0-1.0".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true,
+        kind: SourceKind::Genuine,
+        format: IndicatorFormat::HashSizeName,
+        path: "mixed.hdb".into(),
+        sha256: None,
+    };
+
+    let sha1_hex = "0123456789abcdef0123456789abcdef01234567";
+    let content = format!(
+        "# Feed with mixed valid and malformed records\n\
+         {}:68:Threat.Eicar.MD5\n\
+         {}:100:Threat.SHA1\n\
+         {}:68:Threat.Eicar.SHA256\n\
+         not_a_hex:10:BadHex\n\
+         {}:0:ZeroSize\n\
+         invalid_line_without_colons\n",
+        EICAR_MD5_HEX, sha1_hex, EICAR_SHA256_HEX, EICAR_MD5_HEX
+    );
+
+    let report = pipeline.add_source(source, content.as_bytes()).unwrap();
+    assert_eq!(report.accepted, 3);
+    assert_eq!(report.rejected, 3);
+    assert_eq!(report.ignored_lines, 1);
+
+    let (_, manifest) = pipeline
+        .build("2026.11.02.1", "2026-11-02T00:00:00Z")
+        .unwrap();
+    assert_eq!(manifest.records_md5, 1);
+    assert_eq!(manifest.records_sha1, 1);
+    assert_eq!(manifest.records_sha256, 1);
+    assert_eq!(manifest.genuine_records, 3);
+    assert_eq!(manifest.synthetic_records, 0);
+    assert_eq!(manifest.total_accepted, 3);
+    assert_eq!(manifest.total_rejected, 3);
+}
+
+#[test]
+fn test_e2e_scenario_17_unauthorized_source_self_approval_blocked() {
+    let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+    let rogue = SourceManifest {
+        id: "rogue-source".into(),
+        name: "Rogue Self-Approved Feed".into(),
+        origin: "https://evil.example.com".into(),
+        version: "1.0".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "GPL-2.0-or-later".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true, // attempts self-approval
+        kind: SourceKind::Genuine,
+        format: IndicatorFormat::HashSizeName,
+        path: "rogue.hdb".into(),
+        sha256: None,
+    };
+
+    let err = pipeline.add_source(rogue, b"").unwrap_err();
+    match err {
+        DatabaseError::Policy(msg) => {
+            assert!(msg.contains("not authorized by operator policy"));
+            assert!(msg.contains("manifest self-approval is rejected"));
+        }
+        other => panic!("Expected policy refusal, got {:?}", other),
+    }
 }

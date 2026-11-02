@@ -37,3 +37,5 @@ memmap2 = "0.9"
 sha1 = "0.10"
 md-5 = "0.10"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
+rand = "0.8"

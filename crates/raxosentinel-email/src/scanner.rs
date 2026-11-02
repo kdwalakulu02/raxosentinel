@@ -20,7 +20,7 @@ use mail_parser::{Message, MessageParser, MessagePart};
 use raxosentinel_core::{
     hash_bytes, ResourceTracker, ScanError, ScanReport, ScanStatus, TargetMetadata, Threat,
 };
-use raxosentinel_filetypes::{check_extension_mismatch, detect_type};
+use raxosentinel_filetypes::{check_extension_mismatch, detect_type, is_tar_header};
 use raxosentinel_signatures::SignatureDatabase;
 use std::path::Path;
 
@@ -562,7 +562,7 @@ impl<'a> EmailScanner<'a> {
 
         let mut sub_reports = Vec::new();
         let mut container_issue: Option<(ScanStatus, String)> = None;
-        match classify_container(data) {
+        match classify_container(data, filename, declared_mime) {
             ContainerKind::Zip => {
                 let (subs, issue) = self.scan_zip(data, filename, tracker, depth + 1)?;
                 sub_reports = subs;
@@ -777,10 +777,13 @@ enum ContainerKind {
     Unsupported(&'static str),
 }
 
-/// Content-based container classification (never trusts filenames).
-fn classify_container(data: &[u8]) -> ContainerKind {
+/// Content-based container classification, with fallback to declared metadata
+/// for truncated or incomplete containers that cannot be safely inspected.
+fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) -> ContainerKind {
     if data.starts_with(b"PK\x03\x04") || data.starts_with(b"PK\x05\x06") {
         ContainerKind::Zip
+    } else if is_tar_header(data) || is_tar_claim(data, filename, declared_mime) {
+        ContainerKind::Unsupported("TAR")
     } else if data.starts_with(b"Rar!\x1a\x07") {
         ContainerKind::Unsupported("RAR")
     } else if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
@@ -796,6 +799,17 @@ fn classify_container(data: &[u8]) -> ContainerKind {
     } else {
         ContainerKind::None
     }
+}
+
+fn is_tar_claim(data: &[u8], filename: &str, declared_mime: Option<&str>) -> bool {
+    let lower_name = filename.to_ascii_lowercase();
+    let is_tar_named = lower_name.ends_with(".tar");
+    let is_tar_mime = declared_mime.is_some_and(|m| {
+        m.eq_ignore_ascii_case("application/x-tar")
+            || m.eq_ignore_ascii_case("application/tar")
+            || m.eq_ignore_ascii_case("application/x-gtar")
+    });
+    (is_tar_named || is_tar_mime) && !data.is_empty()
 }
 
 /// Applies verdict precedence Infected > Failed > Unsupported > Clean.
@@ -1490,5 +1504,144 @@ Hello world=ZZ invalid escape\r\n\
             .as_ref()
             .unwrap()
             .contains("invalid hex sequence following '='"));
+    }
+
+    fn make_test_tar(name: &str, content: &[u8]) -> Vec<u8> {
+        let mut tar = vec![0u8; 512];
+        let name_bytes = name.as_bytes();
+        tar[..name_bytes.len()].copy_from_slice(name_bytes);
+        tar[100..108].copy_from_slice(b"0000644\0");
+        tar[108..116].copy_from_slice(b"0000000\0");
+        tar[116..124].copy_from_slice(b"0000000\0");
+        let size_str = format!("{:011o}\0", content.len());
+        tar[124..136].copy_from_slice(size_str.as_bytes());
+        tar[136..148].copy_from_slice(b"00000000000\0");
+        tar[156] = b'0';
+        tar[257..263].copy_from_slice(b"ustar\0");
+        tar[263..265].copy_from_slice(b"00");
+        tar[148..156].copy_from_slice(b"        ");
+        let chksum: u32 = tar.iter().map(|&b| b as u32).sum();
+        let chksum_str = format!("{:06o}\0 ", chksum);
+        tar[148..156].copy_from_slice(chksum_str.as_bytes());
+
+        tar.extend_from_slice(content);
+        let pad = (512 - (content.len() % 512)) % 512;
+        tar.extend(vec![0u8; pad]);
+        tar.extend(vec![0u8; 1024]);
+        tar
+    }
+
+    #[test]
+    fn test_tar_archive_produces_unsupported_verdict_never_clean() {
+        let tar_data = make_test_tar("clean_document.txt", b"Benign text content inside TAR.");
+        let db = SignatureDatabase::new();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_object(
+                &tar_data,
+                "archive.tar",
+                Some("application/x-tar"),
+                &mut tracker,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("TAR container cannot be extracted"));
+    }
+
+    #[test]
+    fn test_tar_archive_with_hash_only_malware_returns_unsupported_never_clean() {
+        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let tar_data = make_test_tar("eicar.txt", eicar);
+
+        let db = SignatureDatabase::new();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_object(
+                &tar_data,
+                "eicar_payload.tar",
+                Some("application/x-tar"),
+                &mut tracker,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("TAR container cannot be extracted"));
+    }
+
+    #[test]
+    fn test_truncated_tar_produces_unsupported() {
+        let truncated_tar = b"ustar archive truncated before header complete";
+        let db = SignatureDatabase::new();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_object(
+                truncated_tar,
+                "damaged.tar",
+                Some("application/x-tar"),
+                &mut tracker,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report.error.as_ref().unwrap().contains("TAR"));
+    }
+
+    #[test]
+    fn test_nested_tar_inside_zip_produces_unsupported() {
+        use std::io::Write;
+        let tar_data = make_test_tar("inner.txt", b"Safe inner text");
+
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip_writer = zip::ZipWriter::new(&mut zip_buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip_writer
+                .start_file("nested_archive.tar", options)
+                .unwrap();
+            zip_writer.write_all(&tar_data).unwrap();
+            zip_writer.finish().unwrap();
+        }
+        let zip_bytes = zip_buf.into_inner();
+
+        let db = SignatureDatabase::new();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_object(
+                &zip_bytes,
+                "outer.zip",
+                Some("application/zip"),
+                &mut tracker,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
     }
 }

@@ -69,6 +69,20 @@ pub enum IndicatorFormat {
     Csv,
 }
 
+/// Category of indicator source: genuine operational threat intelligence vs synthetic/harmless test fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// Genuine operational threat intelligence (real-world observed malware hashes).
+    Genuine,
+    /// Synthetic or harmless test fixtures (EICAR, ClamAV test files, unit test vectors).
+    SyntheticTest,
+}
+
+fn default_source_kind() -> SourceKind {
+    SourceKind::SyntheticTest
+}
+
 /// Operator-supplied description of an approved local indicator source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceManifest {
@@ -89,6 +103,9 @@ pub struct SourceManifest {
     pub attribution: Option<String>,
     /// Must be explicitly `true`; unapproved sources are refused.
     pub approved: bool,
+    /// Kind of intelligence: genuine threat data vs synthetic test fixtures.
+    #[serde(default = "default_source_kind")]
+    pub kind: SourceKind,
     pub format: IndicatorFormat,
     /// Indicator file path, relative to the source manifest file.
     pub path: String,
@@ -225,6 +242,8 @@ pub struct BuildManifest {
     pub records_md5: usize,
     pub records_sha1: usize,
     pub records_sha256: usize,
+    pub genuine_records: usize,
+    pub synthetic_records: usize,
     pub unique_names: usize,
     pub total_accepted: usize,
     pub total_rejected: usize,
@@ -236,6 +255,9 @@ pub struct BuildManifest {
 pub struct IngestPipeline {
     profile: BuildProfile,
     limits: IngestLimits,
+    authorized_sources: BTreeSet<String>,
+    authorize_all_dev: bool,
+    revocations: BTreeSet<Vec<u8>>,
     /// Key: (alg, digest, size, name) -> contributing source ids.
     records: BTreeMap<(HashAlgorithm, Vec<u8>, u64, String), BTreeSet<String>>,
     sources: Vec<SourceAttribution>,
@@ -250,13 +272,61 @@ impl IngestPipeline {
         Self {
             profile,
             limits,
+            authorized_sources: BTreeSet::new(),
+            authorize_all_dev: false,
+            revocations: BTreeSet::new(),
             records: BTreeMap::new(),
             sources: Vec::new(),
         }
     }
 
-    /// Ingests one approved source. Policy violations (unapproved, licence not suitable
-    /// for the build profile, pin mismatch, duplicate source id) refuse the whole source.
+    /// Authorizes a source ID in the operator policy (prevents source self-approval).
+    pub fn authorize_source(&mut self, source_id: impl Into<String>) -> &mut Self {
+        self.authorized_sources.insert(source_id.into());
+        self
+    }
+
+    /// Authorizes multiple source IDs.
+    pub fn with_authorized_sources(
+        mut self,
+        ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        for id in ids {
+            self.authorized_sources.insert(id.into());
+        }
+        self
+    }
+
+    /// Development / testing mode: permits all sources without explicit whitelist.
+    pub fn authorize_all_for_testing(&mut self) -> &mut Self {
+        self.authorize_all_dev = true;
+        self
+    }
+
+    /// Revokes an indicator hash (MD5, SHA1, or SHA256 hex string).
+    pub fn revoke_hash(&mut self, hex_hash: &str) -> Result<(), DatabaseError> {
+        let clean = hex_hash.trim();
+        let digest = hex::decode(clean).map_err(|e| {
+            DatabaseError::Policy(format!("invalid revocation hex hash '{}': {}", clean, e))
+        })?;
+        self.revocations.insert(digest);
+        Ok(())
+    }
+
+    /// Revokes multiple indicator hashes.
+    pub fn revoke_hashes<'a>(
+        &mut self,
+        hex_hashes: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), DatabaseError> {
+        for h in hex_hashes {
+            self.revoke_hash(h)?;
+        }
+        Ok(())
+    }
+
+    /// Ingests one approved source. Policy violations (unapproved by manifest, unauthorized
+    /// by operator trust policy, licence not suitable for the build profile, pin mismatch,
+    /// duplicate source id) refuse the whole source.
     pub fn add_source(
         &mut self,
         manifest: SourceManifest,
@@ -264,7 +334,13 @@ impl IngestPipeline {
     ) -> Result<SourceReport, DatabaseError> {
         if !manifest.approved {
             return Err(DatabaseError::Policy(format!(
-                "source '{}' is not approved",
+                "source '{}' is not approved in its manifest",
+                manifest.id
+            )));
+        }
+        if !self.authorize_all_dev && !self.authorized_sources.contains(&manifest.id) {
+            return Err(DatabaseError::Policy(format!(
+                "source '{}' is not authorized by operator policy (manifest self-approval is rejected)",
                 manifest.id
             )));
         }
@@ -338,6 +414,17 @@ impl IngestPipeline {
             }
             match self.parse_record(line, sep) {
                 Ok((alg, digest, size, name)) => {
+                    if self.revocations.contains(&digest) {
+                        report.reject(
+                            line_no,
+                            "revoked",
+                            format!(
+                                "indicator hash {} is revoked by policy",
+                                hex::encode(&digest)
+                            ),
+                        );
+                        continue;
+                    }
                     let ids = self.records.entry((alg, digest, size, name)).or_default();
                     if ids.insert(manifest.id.clone()) && ids.len() == 1 {
                         report.accepted += 1;
@@ -362,8 +449,6 @@ impl IngestPipeline {
         line: &str,
         sep: char,
     ) -> Result<(HashAlgorithm, Vec<u8>, u64, String), (&'static str, String)> {
-        // splitn(3): the name may contain the separator only for CSV-free formats; we
-        // keep it simple and require exactly three fields.
         let parts: Vec<&str> = line.split(sep).collect();
         if parts.len() != 3 {
             return Err((
@@ -420,7 +505,16 @@ impl IngestPipeline {
         let mut entries = Vec::with_capacity(self.records.len());
         let mut counts = [0usize; 3];
         let mut names = BTreeSet::new();
-        for (alg, digest, size, name) in self.records.keys() {
+        let mut genuine_records = 0usize;
+        let mut synthetic_records = 0usize;
+
+        let source_kinds: BTreeMap<String, SourceKind> = self
+            .sources
+            .iter()
+            .map(|s| (s.source.id.clone(), s.source.kind))
+            .collect();
+
+        for ((alg, digest, size, name), source_ids) in &self.records {
             counts[alg.index()] += 1;
             names.insert(name.as_str());
             entries.push(SignatureEntry::new(
@@ -429,6 +523,15 @@ impl IngestPipeline {
                 digest.clone(),
                 name.clone(),
             ));
+
+            let has_genuine = source_ids
+                .iter()
+                .any(|id| source_kinds.get(id).copied() == Some(SourceKind::Genuine));
+            if has_genuine {
+                genuine_records += 1;
+            } else {
+                synthetic_records += 1;
+            }
         }
 
         let source_ids: Vec<String> = self
@@ -460,6 +563,8 @@ impl IngestPipeline {
             records_md5: counts[0],
             records_sha1: counts[1],
             records_sha256: counts[2],
+            genuine_records,
+            synthetic_records,
             unique_names: names.len(),
             total_accepted: total(|r| r.accepted),
             total_rejected: total(|r| r.rejected),
@@ -474,7 +579,6 @@ impl IngestPipeline {
 mod tests {
     use super::*;
     use crate::rsidb::{MmapCompactDirIndex, RsidbIndex};
-
     fn src(id: &str, redistribution: Redistribution, format: IndicatorFormat) -> SourceManifest {
         SourceManifest {
             id: id.into(),
@@ -486,6 +590,7 @@ mod tests {
             redistribution,
             attribution: None,
             approved: true,
+            kind: SourceKind::SyntheticTest,
             format,
             path: "x".into(),
             sha256: None,
@@ -504,6 +609,7 @@ mod tests {
             s = EICAR_SHA256
         );
         let mut p = IngestPipeline::new(BuildProfile::Public);
+        p.authorize_all_for_testing();
         let r = p
             .add_source(
                 src("a", Redistribution::Allowed, IndicatorFormat::HashSizeName),
@@ -531,6 +637,8 @@ mod tests {
         assert_eq!(manifest, manifest2);
         assert_eq!(manifest.records_md5, 2);
         assert_eq!(manifest.records_sha256, 1);
+        assert_eq!(manifest.synthetic_records, 3);
+        assert_eq!(manifest.genuine_records, 0);
         assert_eq!(manifest.total_rejected, 5);
 
         let idx = MmapCompactDirIndex::from_bytes(bytes).unwrap();
@@ -542,6 +650,7 @@ mod tests {
     #[test]
     fn policy_refuses_unapproved_and_non_redistributable_sources() {
         let mut p = IngestPipeline::new(BuildProfile::Public);
+        p.authorize_all_for_testing();
         let mut s = src("x", Redistribution::Allowed, IndicatorFormat::Csv);
         s.approved = false;
         assert!(matches!(
@@ -562,11 +671,79 @@ mod tests {
         assert!(p.add_source(pinned, b"data").is_err());
         // Internal builds accept internal-only sources.
         let mut i = IngestPipeline::new(BuildProfile::Internal);
+        i.authorize_all_for_testing();
         assert!(i
             .add_source(
                 src("y", Redistribution::InternalOnly, IndicatorFormat::Csv),
                 b""
             )
             .is_ok());
+    }
+
+    #[test]
+    fn test_self_approval_vulnerability_blocked() {
+        let mut p = IngestPipeline::new(BuildProfile::Public);
+        // Manifest claims approved = true, but operator has NOT authorized "untrusted-rogue-source"
+        let s = src(
+            "untrusted-rogue-source",
+            Redistribution::Allowed,
+            IndicatorFormat::Csv,
+        );
+        let err = p.add_source(s, b"").unwrap_err();
+        match err {
+            DatabaseError::Policy(msg) => {
+                assert!(msg.contains("not authorized by operator policy"));
+                assert!(msg.contains("manifest self-approval is rejected"));
+            }
+            other => panic!("Expected policy error, got: {:?}", other),
+        }
+
+        // Once operator authorizes the source, it succeeds
+        p.authorize_source("untrusted-rogue-source");
+        assert!(p
+            .add_source(
+                src(
+                    "untrusted-rogue-source",
+                    Redistribution::Allowed,
+                    IndicatorFormat::Csv
+                ),
+                b""
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn test_revocation_and_genuine_breakdown() {
+        let mut p = IngestPipeline::new(BuildProfile::Public);
+        p.authorize_source("feed-genuine");
+        p.authorize_source("feed-synthetic");
+
+        // Revoke the EICAR MD5 hash
+        p.revoke_hash(EICAR_MD5).unwrap();
+
+        let mut genuine_src = src(
+            "feed-genuine",
+            Redistribution::Allowed,
+            IndicatorFormat::HashSizeName,
+        );
+        genuine_src.kind = SourceKind::Genuine;
+
+        // SHA256 of real threat indicator
+        let sha256_threat = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let genuine_content = format!(
+            "{}:1000:Win32.Trojan.GenuineThreat\n{}:68:Revoked.Eicar\n",
+            sha256_threat, EICAR_MD5
+        );
+        let report = p
+            .add_source(genuine_src, genuine_content.as_bytes())
+            .unwrap();
+
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.rejections_by_reason.get("revoked"), Some(&1));
+
+        let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
+        assert_eq!(manifest.genuine_records, 1);
+        assert_eq!(manifest.synthetic_records, 0);
     }
 }

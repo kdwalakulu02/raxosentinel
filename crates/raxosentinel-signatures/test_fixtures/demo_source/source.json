@@ -8,6 +8,7 @@
   "redistribution": "allowed",
   "attribution": null,
   "approved": true,
+  "kind": "synthetic_test",
   "format": "hash_size_name",
   "path": "indicators.hdb",
   "sha256": null

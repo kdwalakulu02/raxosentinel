@@ -19,5 +19,5 @@
 pub mod detect;
 pub mod types;
 
-pub use detect::{check_extension_mismatch, detect_file_type, detect_type};
+pub use detect::{check_extension_mismatch, detect_file_type, detect_type, is_tar_header};
 pub use types::{FileCategory, FileType};

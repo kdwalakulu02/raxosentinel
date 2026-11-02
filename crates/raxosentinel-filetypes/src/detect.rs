@@ -277,8 +277,8 @@ pub fn detect_type(header: &[u8]) -> FileType {
         );
     }
 
-    // TAR header has "ustar" at offset 257
-    if header.len() >= 262 && &header[257..262] == b"ustar" {
+    // TAR header (ustar, GNU or V7 format)
+    if is_tar_header(header) {
         return FileType::new(
             "application/x-tar",
             FileCategory::Archive,
@@ -503,6 +503,55 @@ fn is_deceptive_inner_extension(ext: &str) -> bool {
         ext,
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "jpg" | "jpeg" | "png" | "txt"
     )
+}
+
+/// Determines if the byte slice begins with a valid TAR archive header
+/// (POSIX ustar, GNU tar, or V7 tar format).
+pub fn is_tar_header(header: &[u8]) -> bool {
+    // 1. POSIX ustar / GNU tar magic check at offset 257..262
+    if header.len() >= 262 && &header[257..262] == b"ustar" {
+        return true;
+    }
+
+    // 2. V7 Tar header checksum validation on 512-byte header block
+    if header.len() >= 512 {
+        if header[0] == 0 {
+            return false;
+        }
+        let chk_bytes = &header[148..156];
+        let mut chk_val: u32 = 0;
+        let mut has_digit = false;
+        for &b in chk_bytes {
+            if (b'0'..=b'7').contains(&b) {
+                has_digit = true;
+                chk_val = (chk_val << 3) + (b - b'0') as u32;
+            } else if b == 0 || b == b' ' {
+                if has_digit {
+                    break;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        if has_digit {
+            let mut unsigned_sum: u32 = 0;
+            let mut signed_sum: i32 = 0;
+            for (i, &b) in header[..512].iter().enumerate() {
+                let v = if (148..156).contains(&i) { 0x20u8 } else { b };
+                unsigned_sum += v as u32;
+                signed_sum += (v as i8) as i32;
+            }
+            if unsigned_sum == chk_val || signed_sum == chk_val as i32 {
+                let mode_has_octal = header[100..108].iter().any(|&b| (b'0'..=b'7').contains(&b));
+                let size_has_octal = header[124..136].iter().any(|&b| (b'0'..=b'7').contains(&b));
+                if mode_has_octal || size_has_octal {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn check_zip_for_openxml(header: &[u8]) -> bool {
