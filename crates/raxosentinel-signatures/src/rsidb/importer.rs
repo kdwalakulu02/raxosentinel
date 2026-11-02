@@ -210,6 +210,26 @@ impl RsidbCompiler {
     pub fn compile(&self, mut entries: Vec<SignatureEntry>) -> Result<Vec<u8>, DatabaseError> {
         // Deterministic sorting of all records
         entries.sort();
+        entries.dedup();
+
+        for e in &entries {
+            if e.digest.len() != e.alg.digest_len() {
+                return Err(DatabaseError::InvalidLayout(format!(
+                    "digest length {} does not match {:?}",
+                    e.digest.len(),
+                    e.alg
+                )));
+            }
+            if e.name.is_empty() || e.name.len() > super::layout::MAX_NAME_LEN {
+                return Err(DatabaseError::InvalidLayout(format!(
+                    "detection name length {} out of range",
+                    e.name.len()
+                )));
+            }
+        }
+        if entries.len() > u32::MAX as usize {
+            return Err(DatabaseError::InvalidLayout("too many records".into()));
+        }
 
         // Separate records by algorithm
         let mut md5_entries = Vec::new();

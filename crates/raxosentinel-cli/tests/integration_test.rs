@@ -16,11 +16,19 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use raxosentinel_core::{ResourceLimits, ResourceTracker, ThreatCategory};
+use raxosentinel_core::{ResourceLimits, ResourceTracker, ScanStatus, ThreatCategory};
 use raxosentinel_email::EmailScanner;
 use raxosentinel_filetypes::{detect_file_type, detect_type, FileCategory};
+use raxosentinel_signatures::rsidb::ingest::{
+    BuildProfile, IndicatorFormat, IngestPipeline, Redistribution, SourceManifest,
+};
+use raxosentinel_signatures::rsidb::lifecycle::DbStore;
+use raxosentinel_signatures::rsidb::{
+    DatabaseError, HashAlgorithm, MmapCompactDirIndex, RsidbCompiler, RsidbIndex, SignatureEntry,
+};
 use raxosentinel_signatures::SignatureDatabase;
 use std::io::Write;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -166,4 +174,407 @@ fn test_file_size_enforcement_aborts_early() {
     // Attempting to check a 5 KiB file
     let check_result = tracker.check_file_size(5120);
     assert!(check_result.is_err());
+}
+
+const EICAR_BYTES: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+const EICAR_MD5_HEX: &str = "44d88612fea8a8f36de82e1278abb02f";
+const EICAR_SHA256_HEX: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
+
+fn make_eicar_test_rsidb() -> Vec<u8> {
+    let md5 = hex::decode(EICAR_MD5_HEX).unwrap();
+    let sha256 = hex::decode(EICAR_SHA256_HEX).unwrap();
+    let entries = vec![
+        SignatureEntry::new(HashAlgorithm::Md5, 68, md5, "EICAR-RSIDB-MD5-Match"),
+        SignatureEntry::new(
+            HashAlgorithm::Sha256,
+            68,
+            sha256,
+            "EICAR-RSIDB-SHA256-Match",
+        ),
+    ];
+    RsidbCompiler::new()
+        .with_provenance("RaxoSentinel E2E Test Suite")
+        .compile(entries)
+        .expect("compile RSIDB")
+}
+
+fn create_test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[test]
+fn test_e2e_scenario_1_and_2_ingest_pipeline_and_verification() {
+    let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+    let manifest = SourceManifest {
+        id: "approved-harmless-feed".into(),
+        name: "Harmless Threat Intelligence Feed".into(),
+        origin: "https://example.com/indicators".into(),
+        version: "2026.11.02".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "GPL-2.0-or-later".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true,
+        format: IndicatorFormat::HashSizeName,
+        path: "feed.hdb".into(),
+        sha256: None,
+    };
+
+    let content = format!(
+        "# Valid indicators\n{}:68:EICAR-RSIDB-MD5-Match\n{}:68:EICAR-RSIDB-SHA256-Match\n",
+        EICAR_MD5_HEX, EICAR_SHA256_HEX
+    );
+
+    let report = pipeline
+        .add_source(manifest, content.as_bytes())
+        .expect("ingest source");
+    assert_eq!(report.accepted, 2);
+    assert_eq!(report.rejected, 0);
+
+    let (bytes, build_manifest) = pipeline
+        .build("2026.11.02.1", "2026-11-02T00:00:00Z")
+        .expect("build RSIDB");
+    assert_eq!(build_manifest.records_md5, 1);
+    assert_eq!(build_manifest.records_sha256, 1);
+    assert_eq!(build_manifest.total_accepted, 2);
+
+    let index = MmapCompactDirIndex::from_bytes(bytes).expect("verify database");
+    assert_eq!(index.record_count(HashAlgorithm::Md5), 1);
+    assert_eq!(index.record_count(HashAlgorithm::Sha256), 1);
+    assert_eq!(index.name_count(), 2);
+}
+
+#[test]
+fn test_e2e_scenario_3_and_4_rsidb_detects_eicar_in_raw_file() {
+    let rsidb_bytes = make_eicar_test_rsidb();
+    let index = MmapCompactDirIndex::from_bytes(rsidb_bytes).expect("load RSIDB");
+
+    // Empty database without builtin rules: detection must come from RSIDB!
+    let mut db = SignatureDatabase::new();
+    db.attach_rsidb(Arc::new(index));
+
+    let scanner = EmailScanner::new(&db);
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+    let mut temp = NamedTempFile::new().unwrap();
+    temp.write_all(EICAR_BYTES).unwrap();
+    temp.flush().unwrap();
+
+    let report = scanner
+        .scan_file(temp.path(), &mut tracker)
+        .expect("scan file");
+    assert_eq!(report.status, ScanStatus::Infected);
+    assert!(!report.threats.is_empty());
+    assert!(report
+        .threats
+        .iter()
+        .any(|t| t.matched_by.contains("rsidb")));
+}
+
+#[test]
+fn test_e2e_scenario_5_rsidb_detects_eicar_in_base64_mime_attachment() {
+    let rsidb_bytes = make_eicar_test_rsidb();
+    let index = MmapCompactDirIndex::from_bytes(rsidb_bytes).expect("load RSIDB");
+
+    let mut db = SignatureDatabase::new();
+    db.attach_rsidb(Arc::new(index));
+    let scanner = EmailScanner::new(&db);
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+    let b64_eicar = "WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=";
+    let email = format!(
+        "From: test@example.com\r\n\
+         To: recipient@example.com\r\n\
+         Subject: Test with EICAR attachment\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"BOUNDARY-12345\"\r\n\
+         \r\n\
+         --BOUNDARY-12345\r\n\
+         Content-Type: text/plain\r\n\
+         \r\n\
+         Please inspect the attached payload.\r\n\
+         --BOUNDARY-12345\r\n\
+         Content-Type: application/octet-stream; name=\"payload.com\"\r\n\
+         Content-Disposition: attachment; filename=\"payload.com\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {}\r\n\
+         --BOUNDARY-12345--\r\n",
+        b64_eicar
+    );
+
+    let report = scanner
+        .scan_bytes(email.as_bytes(), Some("email_eicar.eml"), &mut tracker)
+        .expect("scan email");
+    assert_eq!(report.status, ScanStatus::Infected);
+    assert_eq!(report.sub_targets.len(), 1);
+    assert_eq!(report.sub_targets[0].status, ScanStatus::Infected);
+    assert!(report.threats.iter().any(|t| t.name.contains("EICAR-RSIDB")
+        && t.location.as_deref().unwrap_or("").contains("payload.com")));
+}
+
+#[test]
+fn test_e2e_scenario_6_rsidb_detects_eicar_inside_zip_attachment() {
+    let rsidb_bytes = make_eicar_test_rsidb();
+    let index = MmapCompactDirIndex::from_bytes(rsidb_bytes).expect("load RSIDB");
+
+    let mut db = SignatureDatabase::new();
+    db.attach_rsidb(Arc::new(index));
+    let scanner = EmailScanner::new(&db);
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+    let zip_bytes = create_test_zip(&[("harmless_eicar.txt", EICAR_BYTES)]);
+
+    let report = scanner
+        .scan_object(&zip_bytes, "archive.zip", None, &mut tracker, 0)
+        .expect("scan zip");
+    assert_eq!(report.status, ScanStatus::Infected);
+    assert_eq!(report.sub_targets.len(), 1);
+    assert_eq!(report.sub_targets[0].status, ScanStatus::Infected);
+    assert!(report
+        .threats
+        .iter()
+        .any(|t| t.name.contains("EICAR-RSIDB")));
+}
+
+#[test]
+fn test_e2e_scenario_7_corrupt_database_rejection_no_silent_fallback() {
+    let rsidb_bytes = make_eicar_test_rsidb();
+
+    // 1. Truncated database rejected
+    let truncated = &rsidb_bytes[..40];
+    assert!(matches!(
+        MmapCompactDirIndex::from_bytes(truncated.to_vec()),
+        Err(DatabaseError::TruncatedHeader(..))
+    ));
+
+    // 2. Corrupted checksum rejected
+    let mut corrupt = rsidb_bytes.clone();
+    let n = corrupt.len();
+    corrupt[n - 1] ^= 0xff;
+    assert!(matches!(
+        MmapCompactDirIndex::from_bytes(corrupt),
+        Err(DatabaseError::CorruptedChecksum(..))
+    ));
+
+    // 3. Invalid magic rejected
+    let mut bad_magic = rsidb_bytes;
+    bad_magic[0..8].copy_from_slice(b"BADMAGIC");
+    assert!(matches!(
+        MmapCompactDirIndex::from_bytes(bad_magic),
+        Err(DatabaseError::InvalidMagic(..))
+    ));
+}
+
+#[test]
+fn test_e2e_scenario_8_unsupported_or_encrypted_archive_verdict() {
+    let db = SignatureDatabase::new();
+    let scanner = EmailScanner::new(&db);
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+    // 1. Encrypted ZIP member (bit 0 of general purpose flag set to 1 in local & central headers)
+    let mut zip_bytes = create_test_zip(&[("secret.txt", b"secret data")]);
+    let len = zip_bytes.len();
+    for i in 0..len.saturating_sub(10) {
+        if &zip_bytes[i..i + 4] == b"PK\x03\x04" {
+            zip_bytes[i + 6] |= 0x01;
+        } else if &zip_bytes[i..i + 4] == b"PK\x01\x02" {
+            zip_bytes[i + 8] |= 0x01;
+        }
+    }
+    let report = scanner
+        .scan_object(&zip_bytes, "protected.zip", None, &mut tracker, 0)
+        .expect("scan encrypted zip");
+    assert_eq!(report.status, ScanStatus::Unsupported);
+    assert!(
+        report
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Encrypted ZIP member")
+            || report.status_description.contains("unsupported")
+    );
+
+    // 2. Unsupported archive container (RAR signature)
+    let rar_header = b"Rar!\x1a\x07\x00\xcf\x90\x73";
+    let report_rar = scanner
+        .scan_object(rar_header, "sample.rar", None, &mut tracker, 0)
+        .expect("scan rar container");
+    assert_eq!(report_rar.status, ScanStatus::Unsupported);
+}
+
+#[test]
+fn test_e2e_scenario_9_enforce_zip_limits() {
+    let db = SignatureDatabase::new();
+    let scanner = EmailScanner::new(&db);
+
+    // 1. Enforce max entries limit (35 entries > default 30)
+    let entries: Vec<(String, Vec<u8>)> = (0..35)
+        .map(|i| (format!("file_{}.txt", i), b"content".to_vec()))
+        .collect();
+    let entry_refs: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let zip_many = create_test_zip(&entry_refs);
+
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+    let report = scanner
+        .scan_object(&zip_many, "bomb.zip", None, &mut tracker, 0)
+        .expect("scan entry count bomb");
+    assert_eq!(report.status, ScanStatus::Failed);
+    assert!(report.error.as_deref().unwrap_or("").contains("limit 30"));
+
+    // 2. Enforce attachment size limit on single extracted member
+    let tight_limits = ResourceLimits {
+        max_email_attachment_size: 100, // 100 bytes max
+        ..Default::default()
+    };
+    let mut tight_tracker = ResourceTracker::new(tight_limits);
+    let large_member = vec![b'A'; 200];
+    let zip_large = create_test_zip(&[("large.txt", &large_member)]);
+    let report_large = scanner
+        .scan_object(&zip_large, "large.zip", None, &mut tight_tracker, 0)
+        .expect("scan oversized member");
+    assert_eq!(report_large.status, ScanStatus::Failed);
+}
+
+#[test]
+fn test_e2e_scenario_10_reject_manifest_directory_traversal() {
+    let base = std::path::Path::new("/workspace/project/sources");
+
+    let test_cases = [
+        "../../etc/passwd",
+        "/etc/shadow",
+        "nested/../../escape",
+        "../sibling/file.hdb",
+    ];
+
+    for bad_path in test_cases {
+        let manifest = SourceManifest {
+            id: "traversal-test".into(),
+            name: "Traversal Test".into(),
+            origin: "test".into(),
+            version: "1.0".into(),
+            acquired_at: "2026-11-02T00:00:00Z".into(),
+            license: "GPL-2.0-or-later".into(),
+            redistribution: Redistribution::Allowed,
+            attribution: None,
+            approved: true,
+            format: IndicatorFormat::HashSizeName,
+            path: bad_path.into(),
+            sha256: None,
+        };
+
+        let res = manifest.resolve_path(base);
+        assert!(
+            res.is_err(),
+            "Path '{}' should have been rejected as directory traversal",
+            bad_path
+        );
+        match res {
+            Err(DatabaseError::Policy(msg)) => {
+                assert!(
+                    msg.contains("traversal") || msg.contains("relative") || msg.contains("escape")
+                );
+            }
+            other => panic!("Unexpected error type for '{}': {:?}", bad_path, other),
+        }
+    }
+}
+
+#[test]
+fn test_e2e_scenario_11_dbstore_install_rollback_and_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = DbStore::new(dir.path().join("store"));
+
+    let db_v1 = make_eicar_test_rsidb();
+    let db_v2 = {
+        let md5 = hex::decode("0123456789abcdef0123456789abcdef").unwrap();
+        let entries = vec![SignatureEntry::new(
+            HashAlgorithm::Md5,
+            10,
+            md5,
+            "Custom-Test-Signature-V2",
+        )];
+        RsidbCompiler::new().compile(entries).unwrap()
+    };
+
+    let p1 = dir.path().join("v1.rsidb");
+    let p2 = dir.path().join("v2.rsidb");
+    std::fs::write(&p1, &db_v1).unwrap();
+    std::fs::write(&p2, &db_v2).unwrap();
+
+    // 1. Install V1
+    let r1 = store.install(&p1, None).expect("install v1");
+    assert_eq!(store.current_release().unwrap(), r1);
+
+    // 2. Install V2
+    let r2 = store.install(&p2, None).expect("install v2");
+    assert_eq!(store.current_release().unwrap(), r2);
+    assert_eq!(store.previous_release().unwrap(), r1);
+
+    // 3. Rollback to V1
+    let rolled = store.rollback().expect("rollback to v1");
+    assert_eq!(rolled, r1);
+    assert_eq!(store.current_release().unwrap(), r1);
+    assert_eq!(store.previous_release().unwrap(), r2);
+
+    // Roll back to V2 again
+    store.rollback().expect("rollback to v2");
+
+    // 4. Corrupt active release on disk -> open_active() falls back to previous (V1)
+    let active_path = store.release_path(&r2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&active_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let mut corrupt = std::fs::read(&active_path).unwrap();
+    let len = corrupt.len();
+    corrupt[len - 1] ^= 0xff;
+    std::fs::write(&active_path, corrupt).unwrap();
+
+    let active = store.open_active().expect("open active with fallback");
+    assert!(active.fell_back);
+    assert_eq!(active.release, r1);
+}
+
+#[test]
+fn test_e2e_scenario_12_backward_compatibility_clean_and_defaults() {
+    let mut db_with_rsidb = SignatureDatabase::with_defaults();
+    let rsidb_bytes = make_eicar_test_rsidb();
+    let index = MmapCompactDirIndex::from_bytes(rsidb_bytes).expect("load RSIDB");
+    db_with_rsidb.attach_rsidb(Arc::new(index));
+
+    let scanner_with_rsidb = EmailScanner::new(&db_with_rsidb);
+    let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+    // 1. Clean file reports Clean
+    let clean_data = b"Hello, world! This is a completely benign text file.";
+    let report_clean = scanner_with_rsidb
+        .scan_object(clean_data, "clean.txt", None, &mut tracker, 0)
+        .expect("scan clean");
+    assert_eq!(report_clean.status, ScanStatus::Clean);
+    assert!(report_clean.threats.is_empty());
+
+    // 2. Default scanner without RSIDB detects built-in EICAR
+    let db_default = SignatureDatabase::with_defaults();
+    let scanner_default = EmailScanner::new(&db_default);
+    let mut tracker2 = ResourceTracker::new(ResourceLimits::default());
+    let report_eicar = scanner_default
+        .scan_object(EICAR_BYTES, "eicar.com", None, &mut tracker2, 0)
+        .expect("scan eicar with defaults");
+    assert_eq!(report_eicar.status, ScanStatus::Infected);
 }

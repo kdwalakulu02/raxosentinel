@@ -682,6 +682,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "criterion",
+ "hex",
  "raxosentinel-core",
  "raxosentinel-email",
  "raxosentinel-filetypes",
@@ -692,6 +693,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
@@ -719,6 +721,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "zip",
 ]
 
 [[package]]

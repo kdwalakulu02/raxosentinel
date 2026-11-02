@@ -60,6 +60,12 @@ pub enum DatabaseError {
     #[error("Unsupported hash length {0} in import source line {1}")]
     UnsupportedHashLength(usize, usize),
 
+    #[error("Policy violation: {0}")]
+    Policy(String),
+
+    #[error("Invalid database layout: {0}")]
+    InvalidLayout(String),
+
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
 }

@@ -18,15 +18,19 @@
 
 use clap::{Args, Parser, Subcommand};
 use raxosentinel_core::{
-    hash_file_bounded, MemoryUsage, ResourceLimits, ResourceTracker, ScanReport, ScanStatus,
-    TargetMetadata, Threat,
+    MemoryUsage, ResourceLimits, ResourceTracker, ScanReport, ScanStatus, TargetMetadata,
 };
 use raxosentinel_email::EmailScanner;
-use raxosentinel_filetypes::{check_extension_mismatch, detect_file_type, FileCategory};
+use raxosentinel_filetypes::{detect_file_type, FileCategory};
+use raxosentinel_signatures::rsidb::ingest::{BuildProfile, IngestPipeline, SourceManifest};
+use raxosentinel_signatures::rsidb::lifecycle::DbStore;
+use raxosentinel_signatures::rsidb::{MmapCompactDirIndex, RsidbIndex};
 use raxosentinel_signatures::{load_rules_from_file, SignatureDatabase};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,6 +55,47 @@ struct Cli {
 enum Commands {
     /// Scan a target file or email message
     Scan(ScanArgs),
+    /// RSIDB database management (verify, build, install, rollback)
+    #[command(subcommand)]
+    Db(DbCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCommand {
+    /// Fully validate an RSIDB file and print its statistics
+    Verify { path: PathBuf },
+    /// Build a deterministic RSIDB + manifest from approved source manifests
+    Build {
+        /// Source manifest JSON (repeatable)
+        #[arg(long = "source", required = true)]
+        sources: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        manifest_out: PathBuf,
+        #[arg(long)]
+        db_version: String,
+        /// RFC 3339 build timestamp (explicit, for reproducible builds)
+        #[arg(long)]
+        built_at: String,
+        /// public | internal
+        #[arg(long, default_value = "public")]
+        profile: String,
+    },
+    /// Verify and atomically activate a database in a store directory
+    Install {
+        #[arg(long)]
+        store: PathBuf,
+        path: PathBuf,
+        /// Expected SHA-256 of the candidate, obtained from a trusted channel
+        #[arg(long)]
+        sha256: Option<String>,
+    },
+    /// Re-activate the previous (last known-good) database
+    Rollback {
+        #[arg(long)]
+        store: PathBuf,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -82,6 +127,14 @@ struct ScanArgs {
     /// Display resident memory usage statistics
     #[arg(long)]
     memory: bool,
+
+    /// RSIDB database file (validated before scanning). Env: RAXOSENTINEL_DB
+    #[arg(long, env = "RAXOSENTINEL_DB", conflicts_with = "db_store")]
+    db: Option<PathBuf>,
+
+    /// RSIDB store directory managed by `db install` (uses current, falls back to previous)
+    #[arg(long, env = "RAXOSENTINEL_DB_STORE")]
+    db_store: Option<PathBuf>,
 }
 
 fn main() {
@@ -103,6 +156,7 @@ fn main() {
             let exit_code = run_scan(args);
             process::exit(exit_code);
         }
+        Commands::Db(cmd) => process::exit(run_db(cmd)),
     }
 }
 
@@ -127,6 +181,38 @@ fn run_scan(args: ScanArgs) -> i32 {
                 e
             );
             return 3;
+        }
+    }
+
+    // A configured database that fails validation is a hard error: never scan "without" it.
+    if let Some(ref p) = args.db {
+        match MmapCompactDirIndex::from_file(p) {
+            Ok(index) => db.attach_rsidb(Arc::new(index)),
+            Err(e) => {
+                eprintln!("Error: RSIDB database '{}' rejected: {}", p.display(), e);
+                return 3;
+            }
+        }
+    } else if let Some(ref store) = args.db_store {
+        match DbStore::new(store).open_active() {
+            Ok(active) => {
+                if active.fell_back {
+                    eprintln!(
+                        "Warning: using last known-good database {} ({})",
+                        active.release,
+                        active.fallback_reason.unwrap_or_default()
+                    );
+                }
+                db.attach_rsidb(Arc::new(active.index));
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error: no valid RSIDB database in store '{}': {}",
+                    store.display(),
+                    e
+                );
+                return 3;
+            }
         }
     }
 
@@ -306,118 +392,170 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
         }
     }
 
-    // General file scan (streaming hash + extension analysis + pattern matching)
-    let hash_result = match hash_file_bounded(path, tracker) {
-        Ok(hr) => hr,
-        Err(e) => {
-            let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
-            return ScanReport::new(
-                TargetMetadata {
-                    path: Some(path.display().to_string()),
-                    file_name: path.file_name().map(|n| n.to_string_lossy().to_string()),
-                    file_size_bytes: metadata.len(),
-                    sha256: String::new(),
-                    detected_mime: file_type.mime_type,
-                    declared_mime: None,
-                },
-                ScanStatus::Failed,
-                Vec::new(),
-                Vec::new(),
-                duration_ms,
-                Some(format!("Hashing failed: {}", e)),
-            );
-        }
-    };
-
+    // General file scan: bounded read (TOCTOU-safe cap), then full object inspection
+    // (builtin hashes, RSIDB, patterns, ZIP extraction, unsupported-container detection).
     let filename_str = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    let fail = |tracker: &ResourceTracker, size: u64, msg: String| {
+        ScanReport::new(
+            TargetMetadata {
+                path: Some(path.display().to_string()),
+                file_name: Some(filename_str.clone()),
+                file_size_bytes: size,
+                sha256: String::new(),
+                detected_mime: file_type.mime_type.clone(),
+                declared_mime: None,
+            },
+            ScanStatus::Failed,
+            Vec::new(),
+            Vec::new(),
+            tracker.elapsed_millis().saturating_sub(start_ms),
+            Some(msg),
+        )
+    };
 
-    let mut threats: Vec<Threat> = Vec::new();
-
-    // 1. Check extension mismatch (e.g. PDF/JPG claiming extension but PE executable content)
-    if let Some(mismatch) = check_extension_mismatch(&filename_str, &file_type) {
-        threats.push(mismatch);
+    let max = tracker.limits().max_file_size;
+    let mut data = Vec::with_capacity(metadata.len().min(max) as usize);
+    let read_res =
+        File::open(path).and_then(|f| f.take(max.saturating_add(1)).read_to_end(&mut data));
+    if let Err(e) = read_res {
+        return fail(
+            tracker,
+            metadata.len(),
+            format!("Failed to read file: {}", e),
+        );
+    }
+    if let Err(e) = tracker.record_bytes_read(data.len()) {
+        return fail(tracker, data.len() as u64, e.to_string());
     }
 
-    // 2. Check exact SHA-256 hash match
-    if let Some(hash_threat) = db.match_hash(&hash_result.sha256_hex) {
-        threats.push(hash_threat);
+    let scanner = EmailScanner::new(db);
+    match scanner.scan_object(&data, &filename_str, None, tracker, 0) {
+        Ok(mut report) => {
+            report.target.path = Some(path.display().to_string());
+            report.scan_duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
+            report
+        }
+        Err(e) => fail(tracker, data.len() as u64, format!("Scan failed: {}", e)),
     }
+}
 
-    // 3. Scan byte patterns across file stream
-    tracker.reset_bytes_read();
-    match File::open(path) {
-        Ok(file) => {
-            let mut reader = std::io::BufReader::with_capacity(tracker.limits().buffer_size, file);
-            match db.match_stream(&mut reader, tracker) {
-                Ok(mut pattern_threats) => threats.append(&mut pattern_threats),
-                Err(e) => {
-                    let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
-                    return ScanReport::new(
-                        TargetMetadata {
-                            path: Some(path.display().to_string()),
-                            file_name: Some(filename_str),
-                            file_size_bytes: hash_result.bytes_processed,
-                            sha256: hash_result.sha256_hex,
-                            detected_mime: file_type.mime_type,
-                            declared_mime: None,
-                        },
-                        ScanStatus::Failed,
-                        threats,
-                        Vec::new(),
-                        duration_ms,
-                        Some(format!("Pattern scanning failed: {}", e)),
+fn run_db(cmd: DbCommand) -> i32 {
+    match cmd {
+        DbCommand::Verify { path } => {
+            let t = std::time::Instant::now();
+            match MmapCompactDirIndex::from_file(&path) {
+                Ok(idx) => {
+                    println!(
+                        "OK {} md5={} sha1={} sha256={} names={} verify_ms={:.2}\nprovenance: {}",
+                        path.display(),
+                        idx.record_count(raxosentinel_signatures::rsidb::HashAlgorithm::Md5),
+                        idx.record_count(raxosentinel_signatures::rsidb::HashAlgorithm::Sha1),
+                        idx.record_count(raxosentinel_signatures::rsidb::HashAlgorithm::Sha256),
+                        idx.name_count(),
+                        t.elapsed().as_secs_f64() * 1000.0,
+                        idx.provenance()
                     );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("INVALID {}: {}", path.display(), e);
+                    3
                 }
             }
         }
-        Err(e) => {
-            let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
-            return ScanReport::new(
-                TargetMetadata {
-                    path: Some(path.display().to_string()),
-                    file_name: Some(filename_str),
-                    file_size_bytes: hash_result.bytes_processed,
-                    sha256: hash_result.sha256_hex,
-                    detected_mime: file_type.mime_type,
-                    declared_mime: None,
-                },
-                ScanStatus::Failed,
-                threats,
-                Vec::new(),
-                duration_ms,
-                Some(format!("Failed to reopen file for stream scan: {}", e)),
+        DbCommand::Build {
+            sources,
+            out,
+            manifest_out,
+            db_version,
+            built_at,
+            profile,
+        } => {
+            let profile = match profile.as_str() {
+                "public" => BuildProfile::Public,
+                "internal" => BuildProfile::Internal,
+                other => {
+                    eprintln!("Unknown profile '{}'", other);
+                    return 2;
+                }
+            };
+            let mut pipeline = IngestPipeline::new(profile);
+            for src in &sources {
+                let res = (|| -> Result<(), String> {
+                    let text = std::fs::read_to_string(src).map_err(|e| e.to_string())?;
+                    let manifest: SourceManifest =
+                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    let base = src.parent().unwrap_or(Path::new("."));
+                    let path = manifest
+                        .resolve_path(base)
+                        .map_err(|e| format!("path traversal or access error: {}", e))?;
+                    let content = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let r = pipeline
+                        .add_source(manifest, &content)
+                        .map_err(|e| e.to_string())?;
+                    eprintln!(
+                        "source {}: accepted={} rejected={} duplicates={} ignored={}",
+                        r.source_id, r.accepted, r.rejected, r.duplicates, r.ignored_lines
+                    );
+                    Ok(())
+                })();
+                if let Err(e) = res {
+                    eprintln!("Error ingesting source '{}': {}", src.display(), e);
+                    return 3;
+                }
+            }
+            let (bytes, manifest) = match pipeline.build(&db_version, &built_at) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Build failed: {}", e);
+                    return 3;
+                }
+            };
+            let json = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+            if let Err(e) =
+                std::fs::write(&out, &bytes).and_then(|_| std::fs::write(&manifest_out, json))
+            {
+                eprintln!("Write failed: {}", e);
+                return 3;
+            }
+            println!(
+                "built {} sha256={} accepted={} rejected={} duplicates={}",
+                out.display(),
+                manifest.db_sha256,
+                manifest.total_accepted,
+                manifest.total_rejected,
+                manifest.total_duplicates
             );
+            0
         }
-    }
-
-    let threats = SignatureDatabase::deduplicate_threats(threats);
-
-    let status = if !threats.is_empty() {
-        ScanStatus::Infected
-    } else {
-        ScanStatus::Clean
-    };
-
-    let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
-
-    ScanReport::new(
-        TargetMetadata {
-            path: Some(path.display().to_string()),
-            file_name: Some(filename_str),
-            file_size_bytes: hash_result.bytes_processed,
-            sha256: hash_result.sha256_hex,
-            detected_mime: file_type.mime_type,
-            declared_mime: None,
+        DbCommand::Install {
+            store,
+            path,
+            sha256,
+        } => match DbStore::new(store).install(&path, sha256.as_deref()) {
+            Ok(r) => {
+                println!("activated {}", r);
+                0
+            }
+            Err(e) => {
+                eprintln!("Install rejected: {}", e);
+                3
+            }
         },
-        status,
-        threats,
-        Vec::new(),
-        duration_ms,
-        None,
-    )
+        DbCommand::Rollback { store } => match DbStore::new(store).rollback() {
+            Ok(r) => {
+                println!("rolled back to {}", r);
+                0
+            }
+            Err(e) => {
+                eprintln!("Rollback failed: {}", e);
+                3
+            }
+        },
+    }
 }
 
 fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {

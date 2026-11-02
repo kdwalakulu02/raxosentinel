@@ -65,10 +65,26 @@ impl<'a> EmailScanner<'a> {
         }
 
         tracker.check_file_size(metadata.len())?;
-        let bytes = std::fs::read(path).map_err(|e| ScanError::IoWithPath {
+        use std::io::Read;
+        let max_sz = tracker.limits().max_file_size;
+        let mut file = std::fs::File::open(path).map_err(|e| ScanError::IoWithPath {
             path: path.to_path_buf(),
             source: e,
         })?;
+        let mut bytes = Vec::with_capacity(metadata.len().min(max_sz) as usize);
+        file.by_ref()
+            .take(max_sz.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|e| ScanError::IoWithPath {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+        if bytes.len() as u64 > max_sz {
+            return Err(ScanError::FileSizeLimitExceeded {
+                limit: max_sz,
+                actual: bytes.len() as u64,
+            });
+        }
 
         tracker.record_bytes_read(bytes.len())?;
         self.scan_internal(&bytes, path.to_str(), tracker, 0)
@@ -96,8 +112,28 @@ impl<'a> EmailScanner<'a> {
         let parsed = match parser.parse(raw_bytes) {
             Some(msg) => msg,
             None => {
-                // If it's completely unparseable as MIME
+                // If it's unparseable as MIME, check raw threat signatures first (Infected > Unsupported)
+                let mut unparsed_threats: Vec<Threat> = Vec::new();
+                if let Some(hash_threat) = self.db.match_hash(&sha256) {
+                    unparsed_threats.push(hash_threat.with_location("email_root"));
+                }
+                for t in self.db.match_rsidb(raw_bytes) {
+                    unparsed_threats.push(t.with_location("email_root"));
+                }
+                for t in self.db.match_bytes(raw_bytes) {
+                    unparsed_threats.push(t.with_location("email_root"));
+                }
+
                 let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
+                let (status, details) = if !unparsed_threats.is_empty() {
+                    (ScanStatus::Infected, None)
+                } else {
+                    (
+                        ScanStatus::Unsupported,
+                        Some("Malformed or corrupted MIME message format".to_string()),
+                    )
+                };
+
                 return Ok(ScanReport::new(
                     TargetMetadata {
                         path: path_hint.map(|s| s.to_string()),
@@ -109,11 +145,11 @@ impl<'a> EmailScanner<'a> {
                         detected_mime: detected_type.mime_type,
                         declared_mime: Some("message/rfc822".to_string()),
                     },
-                    ScanStatus::Unsupported,
-                    Vec::new(),
+                    status,
+                    unparsed_threats,
                     Vec::new(),
                     duration_ms,
-                    Some("Malformed or corrupted MIME message format".to_string()),
+                    details,
                 ));
             }
         };
@@ -128,9 +164,12 @@ impl<'a> EmailScanner<'a> {
         let mut threats: Vec<Threat> = Vec::new();
         let mut sub_reports: Vec<ScanReport> = Vec::new();
 
-        // 1. Check raw email hash
+        // 1. Check raw email hash (builtin rules and RSIDB)
         if let Some(hash_threat) = self.db.match_hash(&sha256) {
             threats.push(hash_threat.with_location("email_root"));
+        }
+        for t in self.db.match_rsidb(raw_bytes) {
+            threats.push(t.with_location("email_root"));
         }
 
         // 2. Scan email bodies (text and html)
@@ -223,6 +262,9 @@ impl<'a> EmailScanner<'a> {
             for (idx, text) in msg.text_bodies().enumerate() {
                 tracker.check_timeout()?;
                 let body_bytes = text.as_bytes();
+                for t in self.db.match_rsidb(body_bytes) {
+                    threats.push(t.with_location(format!("body:text/plain:part_{}", idx)));
+                }
                 let body_threats = self.db.match_bytes(body_bytes);
                 for t in body_threats {
                     threats.push(t.with_location(format!("body:text/plain:part_{}", idx)));
@@ -237,6 +279,9 @@ impl<'a> EmailScanner<'a> {
             for (idx, html) in msg.html_bodies().enumerate() {
                 tracker.check_timeout()?;
                 let body_bytes = html.as_bytes();
+                for t in self.db.match_rsidb(body_bytes) {
+                    threats.push(t.with_location(format!("body:text/html:part_{}", idx)));
+                }
                 let body_threats = self.db.match_bytes(body_bytes);
                 for t in body_threats {
                     threats.push(t.with_location(format!("body:text/html:part_{}", idx)));
@@ -454,41 +499,92 @@ impl<'a> EmailScanner<'a> {
             return self.scan_internal(data, Some(filename), tracker, depth + 1);
         }
 
-        let mut part_threats: Vec<Threat> = Vec::new();
+        // Full object inspection (builtin hashes, RSIDB, patterns, containers).
+        let report = self.scan_object(data, filename, declared_mime, tracker, depth)?;
 
-        // 1. Extension mismatch / disguised executable analysis
+        // Validate encoding integrity: an encoding issue prevents a Clean verdict.
+        if report.status == ScanStatus::Clean {
+            if let Some(issue) = validate_attachment_encoding(part, raw_bytes, data).err() {
+                let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
+                return Ok(ScanReport::new(
+                    report.target,
+                    ScanStatus::Unsupported,
+                    report.threats,
+                    report.sub_targets,
+                    duration_ms,
+                    Some(issue),
+                ));
+            }
+        }
+        let _ = sha256;
+        Ok(report)
+    }
+
+    /// Scans one complete, already-extracted object (raw file, decoded attachment or
+    /// archive member): extension mismatch, builtin SHA-256 rules, RSIDB exact-hash
+    /// lookups, byte patterns, and bounded recursion into supported containers.
+    ///
+    /// Verdict precedence: Infected > Failed > Unsupported > Clean. Archives that cannot
+    /// be fully inspected (encrypted, unsupported format/method, limits) are never Clean.
+    pub fn scan_object(
+        &self,
+        data: &[u8],
+        filename: &str,
+        declared_mime: Option<&str>,
+        tracker: &mut ResourceTracker,
+        depth: usize,
+    ) -> Result<ScanReport, ScanError> {
+        let start_ms = tracker.elapsed_millis();
+        tracker.check_depth(depth)?;
+
+        let sha256 = hash_bytes(data);
+        let detected_type = detect_type(data);
+
+        if depth > 0 && detected_type.mime_type == "message/rfc822" {
+            return self.scan_internal(data, Some(filename), tracker, depth + 1);
+        }
+
+        let location = format!("attachment:{}", filename);
+        let mut threats: Vec<Threat> = Vec::new();
         if let Some(mismatch) = check_extension_mismatch(filename, &detected_type) {
-            part_threats.push(mismatch);
+            threats.push(mismatch);
+        }
+        if let Some(t) = self.db.match_hash(&sha256) {
+            threats.push(t.with_location(location.clone()));
+        }
+        for t in self.db.match_rsidb(data) {
+            threats.push(t.with_location(location.clone()));
+        }
+        for t in self.db.match_bytes(data) {
+            threats.push(t.with_location(location.clone()));
+        }
+        tracker.check_timeout()?;
+
+        let mut sub_reports = Vec::new();
+        let mut container_issue: Option<(ScanStatus, String)> = None;
+        match classify_container(data) {
+            ContainerKind::Zip => {
+                let (subs, issue) = self.scan_zip(data, filename, tracker, depth + 1)?;
+                sub_reports = subs;
+                container_issue = issue;
+            }
+            ContainerKind::Unsupported(kind) => {
+                container_issue = Some((
+                    ScanStatus::Unsupported,
+                    format!(
+                        "{} container cannot be extracted; contents not inspected",
+                        kind
+                    ),
+                ));
+            }
+            ContainerKind::None => {}
         }
 
-        // 2. Exact hash signature match
-        if let Some(hash_threat) = self.db.match_hash(&sha256) {
-            part_threats.push(hash_threat.with_location(format!("attachment:{}", filename)));
+        for sr in &sub_reports {
+            threats.extend(sr.threats.iter().cloned());
         }
-
-        // 3. Byte pattern signature match
-        let pattern_threats = self.db.match_bytes(data);
-        for t in pattern_threats {
-            part_threats.push(t.with_location(format!("attachment:{}", filename)));
-        }
-
-        // Deduplicate threats on the same attachment (e.g. hash + pattern match)
-        let part_threats = SignatureDatabase::deduplicate_threats(part_threats);
-
-        // Validate encoding integrity
-        let encoding_issue = validate_attachment_encoding(part, raw_bytes, data).err();
-
-        // Status precedence for single attachment:
-        // Threats take precedence over encoding issues (an infected file is always reported Infected).
-        // If no threat is found, an encoding issue prevents a Clean verdict -> Unsupported.
-        let (status, details) = if !part_threats.is_empty() {
-            (ScanStatus::Infected, None)
-        } else if let Some(issue) = encoding_issue {
-            (ScanStatus::Unsupported, Some(issue))
-        } else {
-            (ScanStatus::Clean, None)
-        };
-
+        let threats = SignatureDatabase::deduplicate_threats(threats);
+        let (status, details) = combine_verdict(&threats, container_issue, &sub_reports);
         let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
 
         Ok(ScanReport::new(
@@ -501,12 +597,232 @@ impl<'a> EmailScanner<'a> {
                 declared_mime: declared_mime.map(|s| s.to_string()),
             },
             status,
-            part_threats,
-            Vec::new(),
+            threats,
+            sub_reports,
             duration_ms,
             details,
         ))
     }
+
+    /// Extracts and scans ZIP members in memory under the shared resource budget.
+    /// Never writes to disk; member names are used only as display labels.
+    #[allow(clippy::type_complexity)]
+    fn scan_zip(
+        &self,
+        data: &[u8],
+        parent: &str,
+        tracker: &mut ResourceTracker,
+        depth: usize,
+    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
+        use std::io::Read;
+        let mut subs = Vec::new();
+
+        if let Err(e) = tracker.check_depth(depth) {
+            if matches!(e, ScanError::Timeout { .. }) {
+                return Err(e);
+            }
+            return Ok((
+                subs,
+                Some((ScanStatus::Failed, format!("ZIP not inspected: {}", e))),
+            ));
+        }
+
+        let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(data)) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok((
+                    subs,
+                    Some((
+                        ScanStatus::Unsupported,
+                        format!("Malformed ZIP container: {}", e),
+                    )),
+                ))
+            }
+        };
+
+        let max_entries = tracker.limits().max_email_attachments;
+        if archive.len() > max_entries {
+            return Ok((
+                subs,
+                Some((
+                    ScanStatus::Failed,
+                    format!("ZIP has {} entries (limit {})", archive.len(), max_entries),
+                )),
+            ));
+        }
+
+        let cap = tracker.limits().max_email_attachment_size;
+        let mut issue: Option<(ScanStatus, String)> = None;
+        let raise = |issue: &mut Option<(ScanStatus, String)>, st: ScanStatus, msg: String| {
+            let replace = match issue {
+                None => true,
+                Some((cur, _)) => *cur == ScanStatus::Unsupported && st == ScanStatus::Failed,
+            };
+            if replace {
+                *issue = Some((st, msg));
+            }
+        };
+
+        for i in 0..archive.len() {
+            tracker.check_timeout()?;
+            let mut file = match archive.by_index(i) {
+                Ok(f) => f,
+                Err(zip::result::ZipError::UnsupportedArchive(m)) => {
+                    raise(
+                        &mut issue,
+                        ScanStatus::Unsupported,
+                        format!("ZIP member {} not inspectable: {}", i, m),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    raise(
+                        &mut issue,
+                        ScanStatus::Failed,
+                        format!("ZIP member {} unreadable: {}", i, e),
+                    );
+                    continue;
+                }
+            };
+            if file.is_dir() {
+                continue;
+            }
+            let name: String = file.name().chars().take(256).collect();
+            let label = format!("{}/{}", parent, name);
+            if file.encrypted() {
+                raise(
+                    &mut issue,
+                    ScanStatus::Unsupported,
+                    format!("Encrypted ZIP member: {}", label),
+                );
+                continue;
+            }
+
+            let declared = file.size();
+            if let Err(e) = tracker.register_attachment(declared) {
+                match e {
+                    ScanError::Timeout { .. } => return Err(e),
+                    ScanError::AttachmentLimitExceeded { .. }
+                    | ScanError::ExtractedSizeLimitExceeded { .. } => {
+                        raise(
+                            &mut issue,
+                            ScanStatus::Failed,
+                            format!("ZIP extraction budget exhausted: {}", e),
+                        );
+                        break;
+                    }
+                    _ => {
+                        raise(
+                            &mut issue,
+                            ScanStatus::Failed,
+                            format!("ZIP member {} rejected: {}", label, e),
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Never trust declared sizes: hard cap actual decompressed output.
+            let mut buf = Vec::with_capacity(declared.min(cap).min(1 << 20) as usize);
+            if let Err(e) = (&mut file)
+                .take(cap.saturating_add(1))
+                .read_to_end(&mut buf)
+            {
+                raise(
+                    &mut issue,
+                    ScanStatus::Failed,
+                    format!("ZIP member {} extraction failed: {}", label, e),
+                );
+                continue;
+            }
+            if buf.len() as u64 > cap {
+                raise(
+                    &mut issue,
+                    ScanStatus::Failed,
+                    format!("ZIP member {} exceeds size limit", label),
+                );
+                continue;
+            }
+            if buf.len() as u64 > declared {
+                if let Err(e) =
+                    tracker.record_extracted_bytes((buf.len() as u64 - declared) as usize)
+                {
+                    raise(
+                        &mut issue,
+                        ScanStatus::Failed,
+                        format!("ZIP extraction budget exhausted: {}", e),
+                    );
+                    break;
+                }
+            }
+            drop(file);
+
+            match self.scan_object(&buf, &label, None, tracker, depth) {
+                Ok(r) => subs.push(r),
+                Err(e @ ScanError::Timeout { .. }) => return Err(e),
+                Err(e) => raise(
+                    &mut issue,
+                    ScanStatus::Failed,
+                    format!("ZIP member {} scan failed: {}", label, e),
+                ),
+            }
+        }
+        Ok((subs, issue))
+    }
+}
+
+enum ContainerKind {
+    None,
+    Zip,
+    Unsupported(&'static str),
+}
+
+/// Content-based container classification (never trusts filenames).
+fn classify_container(data: &[u8]) -> ContainerKind {
+    if data.starts_with(b"PK\x03\x04") || data.starts_with(b"PK\x05\x06") {
+        ContainerKind::Zip
+    } else if data.starts_with(b"Rar!\x1a\x07") {
+        ContainerKind::Unsupported("RAR")
+    } else if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
+        ContainerKind::Unsupported("7-Zip")
+    } else if data.starts_with(&[0x1f, 0x8b]) {
+        ContainerKind::Unsupported("GZIP")
+    } else if data.starts_with(b"BZh") && data.len() > 3 && data[3].is_ascii_digit() {
+        ContainerKind::Unsupported("BZIP2")
+    } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        ContainerKind::Unsupported("XZ")
+    } else if data.starts_with(b"MSCF") {
+        ContainerKind::Unsupported("CAB")
+    } else {
+        ContainerKind::None
+    }
+}
+
+/// Applies verdict precedence Infected > Failed > Unsupported > Clean.
+fn combine_verdict(
+    threats: &[Threat],
+    container_issue: Option<(ScanStatus, String)>,
+    subs: &[ScanReport],
+) -> (ScanStatus, Option<String>) {
+    if !threats.is_empty() || subs.iter().any(|r| r.status == ScanStatus::Infected) {
+        return (ScanStatus::Infected, None);
+    }
+    for st in [ScanStatus::Failed, ScanStatus::Unsupported] {
+        if let Some((s, m)) = &container_issue {
+            if *s == st {
+                return (st, Some(m.clone()));
+            }
+        }
+        if let Some(r) = subs.iter().find(|r| r.status == st) {
+            return (
+                st,
+                r.error
+                    .clone()
+                    .or_else(|| Some(r.status_description.clone())),
+            );
+        }
+    }
+    (ScanStatus::Clean, None)
 }
 
 /// Helper checking if a byte slice contains a specific subslice.

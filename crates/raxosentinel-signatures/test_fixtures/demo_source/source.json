@@ -1,0 +1,14 @@
+{
+  "id": "raxo-harmless-demo-feed",
+  "name": "RaxoSentinel Harmless Test Indicator Feed",
+  "origin": "RaxoSentinel internal harmless fixtures",
+  "version": "2026.11.02",
+  "acquired_at": "2026-11-02T00:00:00Z",
+  "license": "GPL-2.0-or-later",
+  "redistribution": "allowed",
+  "attribution": null,
+  "approved": true,
+  "format": "hash_size_name",
+  "path": "indicators.hdb",
+  "sha256": null
+}

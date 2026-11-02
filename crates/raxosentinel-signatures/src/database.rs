@@ -18,10 +18,12 @@
 
 use crate::builtin::{default_hash_rules, default_pattern_rules};
 use crate::models::{HashRule, PatternRule};
+use crate::rsidb::RsidbIndex;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use raxosentinel_core::{ResourceTracker, ScanError, Threat};
+use raxosentinel_core::{ResourceTracker, ScanError, Severity, Threat, ThreatCategory};
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
 
 /// Compiled signature matching engine containing hash tables and pattern automata.
 pub struct SignatureDatabase {
@@ -29,6 +31,8 @@ pub struct SignatureDatabase {
     pattern_rules: Vec<PatternRule>,
     automaton: Option<AhoCorasick>,
     max_pattern_len: usize,
+    /// Optional validated native RSIDB hash index (MD5/SHA-1/SHA-256 + size).
+    rsidb: Option<Arc<dyn RsidbIndex>>,
 }
 
 impl Default for SignatureDatabase {
@@ -45,7 +49,49 @@ impl SignatureDatabase {
             pattern_rules: Vec::new(),
             automaton: None,
             max_pattern_len: 0,
+            rsidb: None,
         }
+    }
+
+    /// Attaches a validated RSIDB index. Callers must only pass indexes produced by
+    /// `MmapCompactDirIndex`/`MmapSortedIndex::from_file`, which fully validate on load.
+    pub fn attach_rsidb(&mut self, index: Arc<dyn RsidbIndex>) {
+        self.rsidb = Some(index);
+    }
+
+    /// Returns the attached RSIDB index, if any.
+    pub fn rsidb(&self) -> Option<&Arc<dyn RsidbIndex>> {
+        self.rsidb.as_ref()
+    }
+
+    /// Looks up a complete in-memory object in the attached RSIDB (exact hash + size).
+    pub fn match_rsidb(&self, data: &[u8]) -> Vec<Threat> {
+        let Some(index) = &self.rsidb else {
+            return Vec::new();
+        };
+        let mut names = index.scan_raw_bytes(data);
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .map(|name| {
+                let category = if name.contains("Test") || name.contains("EICAR") {
+                    ThreatCategory::TestSignature
+                } else {
+                    ThreatCategory::Other("rsidb-hash".to_string())
+                };
+                let mut t = Threat::new(
+                    &name,
+                    category,
+                    Severity::High,
+                    "Exact hash+size match in RSIDB signature database",
+                    format!("rsidb:size={}", data.len()),
+                );
+                // Exact cryptographic hash matches are deterministic regardless of category.
+                t.detection_type = raxosentinel_core::DetectionType::Deterministic;
+                t
+            })
+            .collect()
     }
 
     /// Creates a database loaded with standard built-in rules (EICAR, test rules, heuristics).
