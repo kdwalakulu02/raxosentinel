@@ -24,6 +24,23 @@ fn scanner_requires_private_evidence_and_never_scans_after_failure() {
             .output()
             .unwrap()
     };
+    let listing = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .args(["db", "sources", "--root"])
+        .arg(root.path())
+        .args(["--generation", "synthetic"])
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("malwarebazaar"));
+    let digest = hex::encode(Sha256::digest(content));
+    let indicator = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .args(["db", "indicator", "--root"])
+        .arg(root.path())
+        .args(["--generation", "synthetic", &digest])
+        .output()
+        .unwrap();
+    assert!(indicator.status.success());
+    assert!(String::from_utf8_lossy(&indicator.stdout).contains("SyntheticFixture"));
     let good = run();
     assert_ne!(
         good.status.code(),
@@ -33,6 +50,13 @@ fn scanner_requires_private_evidence_and_never_scans_after_failure() {
     );
     assert!(String::from_utf8_lossy(&good.stdout).contains("MalwareBazaar.SyntheticFixture"));
     std::fs::remove_file(root.path().join("synthetic/database.rsidb.evidence")).unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .args(["db", "sources", "--root"])
+        .arg(root.path())
+        .args(["--generation", "synthetic"])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
     let bad = run();
     assert_eq!(bad.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("private database rejected"));

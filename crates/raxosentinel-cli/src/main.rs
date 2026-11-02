@@ -65,6 +65,21 @@ enum Commands {
 enum DbCommand {
     /// Fully validate an RSIDB file and print its statistics
     Verify { path: PathBuf },
+    /// List the evidence-validated source for a private generation.
+    Sources {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        generation: String,
+    },
+    /// Inspect a SHA-256 claim in a private generation.
+    Indicator {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        generation: String,
+        sha256: String,
+    },
     /// Generate an offline Ed25519 keypair for release signing
     Keygen {
         #[arg(long)]
@@ -521,6 +536,54 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
 
 fn run_db(cmd: DbCommand) -> i32 {
     match cmd {
+        DbCommand::Sources { root, generation } => {
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::inspect(
+                &root,
+                &generation,
+            ) {
+                Ok((source, _)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&source).expect("source serialization")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private database rejected: {e}");
+                    3
+                }
+            }
+        }
+        DbCommand::Indicator {
+            root,
+            generation,
+            sha256,
+        } => {
+            if sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+                eprintln!("Error: SHA-256 must be 64 hexadecimal digits");
+                return 2;
+            }
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::inspect(
+                &root,
+                &generation,
+            ) {
+                Ok((_, claims)) => {
+                    let found: Vec<_> = claims
+                        .into_iter()
+                        .filter(|claim| claim.sha256.eq_ignore_ascii_case(&sha256))
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&found).expect("claim serialization")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private database rejected: {e}");
+                    3
+                }
+            }
+        }
         DbCommand::Verify { path } => {
             let t = std::time::Instant::now();
             match MmapCompactDirIndex::from_file(&path) {

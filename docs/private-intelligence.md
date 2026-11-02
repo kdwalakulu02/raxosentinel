@@ -11,3 +11,12 @@ Scan with `cargo run --release -p raxosentinel-cli --bin raxosentinel -- scan FI
 The scanner reports `.staging-*` leftovers, which are never loaded as generations or automatically removed. A crash can leave an ambiguous staging directory; investigate its owner, contents and active processes before manually removing it. Do not delete unknown files. The importer cleans up the staging files it created on ordinary pre-publication failures. Synthetic fixtures in tests are not genuine intelligence. Never publish raw responses or private databases.
 
 For repeated warm-cache measurements of a generation: `cargo run --release -p raxosentinel-cli --bin private_generation_benchmark -- /home/USER/raxosentinel-private GENERATION 21`. To migrate a preserved Phase 2D.1 pair, pass its database path as the optional final argument; the tool verifies the old pair and uses the original evidence and acquisition timestamp. Migration reads a trusted owner-controlled source, and keeps the original pair. It does not authenticate the source beyond the original local integrity linkage.
+
+Read-only source inspection of a Phase 2D.2 generation is available with:
+
+```
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db sources --root /home/USER/raxosentinel-private --generation GENERATION
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db indicator --root /home/USER/raxosentinel-private --generation GENERATION SHA256_HEX
+```
+
+Both commands validate the database and evidence before returning source information. They infer the one supported source from the fixed MalwareBazaar manifest; provenance status means local consistency only and is not a provider signature. This is read-only single-source inspection, not a multi-source registry, source approval mechanism, source refresh, or source-removal implementation. Missing or corrupt evidence is an error.
