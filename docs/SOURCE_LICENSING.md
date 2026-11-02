@@ -1,5 +1,8 @@
 # RaxoSentinel Source Licensing & Intellectual Property Matrix
 
+**Document Version**: 1.1.0 (Phase 2C Emergency Integrity Correction)  
+**Status**: APPROVED POLICY & AUDIT RECORD  
+
 This document establishes the official intellectual property policy and licensing matrix for the RaxoSentinel project. It defines the provenance, distribution rights, and attribution requirements across all components of the repository and database release artifacts.
 
 ---
@@ -12,8 +15,8 @@ This document establishes the official intellectual property policy and licensin
 | **ClamAV Unit Test Fixtures** | Upstream ClamAV (`unit_tests/input/*`) | Cisco Systems, Inc. / Tomasz Kojm & ClamAV Team | **GPL-2.0** | **Yes** (in test directories only) | **No** (never shipped in operational public intelligence feeds) | Retain upstream `COPYING` (GPL-2.0) and `README`. Strictly do **not** label as public domain |
 | **EICAR Test String** | EICAR Standard File | European Institute for Computer Antivirus Research | Public Anti-Virus Standard | **Yes** (harmless test vectors) | **Yes** (classified as `synthetic_test` in test builds) | Standard EICAR naming preserved |
 | **Original Raxo Detection Rules** | Raxo internal heuristics and signature engineering | RaxoSentinel Authors | **GPL-2.0-or-later** | **Yes** | **Yes** | Authored by RaxoSentinel; full redistribution permitted |
-| **Third-Party Threat Intel: Abuse.ch (MalwareBazaar / URLhaus)** | Abuse.ch / Bern University of Applied Sciences (BFH) | Abuse.ch Contributors | **CC0 1.0 Universal** (Public Domain Dedication) | **Yes** (metadata and indicators only; no live malware samples) | **Yes** | Attribution required: *"Data provided by abuse.ch MalwareBazaar (https://bazaar.abuse.ch/)"* |
-| **Third-Party Threat Intel: Cisco Talos Production CVD** | Cisco Systems / Cisco Talos (`daily.cvd`, `main.cvd`) | Cisco Systems, Inc. | **Proprietary / Cisco ToS** | **No** (never committed or mirrored) | **STRICTLY PROHIBITED** | Redistribution without commercial license triggers immediate IP violation |
+| **Third-Party Threat Intel: Abuse.ch (MalwareBazaar / URLhaus)** | Abuse.ch / BFH / Spamhaus | Abuse.ch Contributors | **UNVERIFIED** (Requires individual `Auth-Key`; commercial terms unconfirmed) | **No** (unverified indicators removed) | **No** (redistribution permission unverified; 0 records distributed) | Automated keyless access returns `Unauthorized`. Rights documented as UNVERIFIED |
+| **Third-Party Threat Intel: Cisco Talos Production CVD** | Cisco Systems / Cisco Talos (`daily.cvd`, `main.cvd`) | Cisco Systems, Inc. | **UNVERIFIED / RESTRICTED** (Proprietary Cisco ToS) | **No** (never committed or mirrored) | **STRICTLY PROHIBITED** | Redistribution without commercial OEM license violates Cisco terms |
 | **Third-Party Threat Intel: VirusTotal** | Chronicle Security / Google LLC | Google LLC | **Proprietary / Commercial ToS** | **No** | **STRICTLY PROHIBITED** | Section 3 of ToS prohibits using indicators to build or redistribute public scanner databases |
 
 ---
@@ -33,18 +36,21 @@ During Phase 2B development, working notes in `HANDOFF_GEMINI.md` incorrectly re
 
 ## 3. Threat Intelligence Database (RSIDB) Distribution Policy
 
-To maintain unquestionable legal and ethical standing, public RSIDB releases are governed by three mandatory rules:
+To maintain unquestionable legal and ethical standing, public RSIDB releases are governed by four mandatory rules:
 
-1. **Explicit Rights Verification**:
+1. **Explicit Rights & Provenance Verification**:
    - The ingestion pipeline (`rsidb::ingest::IngestPipeline`) strictly verifies that `manifest.redistribution` is either `Allowed` or `AllowedWithAttribution`.
-   - Manifests marked `InternalOnly`, `Prohibited`, or `Unknown` are immediately rejected during public database builds.
-   - Self-approval (`approved: true` in `source.json`) is untrusted unless the operator explicitly passes `--allow-source <ID>` on the CLI.
+   - Third-party sources with unconfirmed redistribution rights are documented as **UNVERIFIED** and excluded from public builds.
+   - Operator authorization (`--allow-source`) alone **cannot** establish genuine intelligence status; explicit authenticity verification (`--verify-genuine-source`) and cryptographic content pinning (`sha256`) are mandatory.
 
 2. **Truthful Coverage Reporting**:
-   - RSIDB manifests explicitly distinguish `genuine_records` from `synthetic_records`.
-   - Synthetic test vectors (EICAR, ClamAV test binaries) cannot be counted toward genuine threat protection.
-   - We report exactly what threat coverage we possess without artificial inflation.
+   - RSIDB manifests strictly separate `genuine_records` from `synthetic_records`.
+   - Synthetic test vectors (EICAR, ClamAV test binaries, simple string preimages) can **never** be counted toward genuine threat protection.
+   - The current verified genuine operational record count is **0**.
 
-3. **No Live Malware**:
+3. **No Replacement Signature Manufacturing**:
+   - If an external feed or API is inaccessible or rights are unresolved, the pipeline reports 0 genuine records. Under no circumstances may artificial or synthetic records be manufactured as replacements.
+
+4. **Zero Live Malware**:
    - The repository and database pipelines process **only cryptographic hashes, file sizes, and threat classification metadata**.
    - No live or weaponized malware samples are downloaded, stored, or distributed.

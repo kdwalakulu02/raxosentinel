@@ -1,0 +1,15 @@
+{
+  "id": "quarantined-synthetic-unverified",
+  "name": "Quarantined Synthetic Test Fixtures (Unverified Claims)",
+  "origin": "Quarantined test preimages (abc, abcd, 123456, 1, 2)",
+  "version": "2026.11.02",
+  "acquired_at": "2026-11-02T08:00:00Z",
+  "license": "GPL-2.0-or-later",
+  "redistribution": "internal_only",
+  "attribution": null,
+  "approved": false,
+  "kind": "synthetic_test",
+  "format": "hash_size_name",
+  "path": "indicators.hdb",
+  "sha256": null
+}

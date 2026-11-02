@@ -28,6 +28,7 @@ use raxosentinel_signatures::rsidb::{
     DatabaseError, HashAlgorithm, MmapCompactDirIndex, RsidbCompiler, RsidbIndex, SignatureEntry,
 };
 use raxosentinel_signatures::SignatureDatabase;
+use sha2::Digest;
 use std::io::Write;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -618,12 +619,12 @@ fn test_e2e_scenario_13_signed_release_verification_and_tamper_rejection() {
     let pubkey_file = dir.path().join("trusted.pub");
     crypto::save_verifying_key_to_file(&verifying_key, &pubkey_file).unwrap();
 
-    // 2. Build release with genuine indicators
+    // 2. Build release with verified test indicators
     let mut pipeline = IngestPipeline::new(BuildProfile::Public);
-    pipeline.authorize_source("source-genuine");
+    pipeline.authorize_source("release-test-source");
     let manifest_src = SourceManifest {
-        id: "source-genuine".into(),
-        name: "Genuine Feed".into(),
+        id: "release-test-source".into(),
+        name: "Release Test Feed".into(),
         origin: "https://example.com/feed".into(),
         version: "2026.11.02".into(),
         acquired_at: "2026-11-02T00:00:00Z".into(),
@@ -631,12 +632,12 @@ fn test_e2e_scenario_13_signed_release_verification_and_tamper_rejection() {
         redistribution: Redistribution::Allowed,
         attribution: None,
         approved: true,
-        kind: SourceKind::Genuine,
+        kind: SourceKind::SyntheticTest,
         format: IndicatorFormat::HashSizeName,
         path: "feed.hdb".into(),
         sha256: None,
     };
-    let feed_content = format!("{}:68:Genuine.Threat.HashMatch\n", EICAR_SHA256_HEX);
+    let feed_content = format!("{}:68:Test.Threat.HashMatch\n", EICAR_SHA256_HEX);
     pipeline
         .add_source(manifest_src, feed_content.as_bytes())
         .unwrap();
@@ -644,8 +645,8 @@ fn test_e2e_scenario_13_signed_release_verification_and_tamper_rejection() {
     let (db_bytes, build_manifest) = pipeline
         .build("2026.11.02.1", "2026-11-02T00:00:00Z")
         .unwrap();
-    assert_eq!(build_manifest.genuine_records, 1);
-    assert_eq!(build_manifest.synthetic_records, 0);
+    assert_eq!(build_manifest.genuine_records, 0);
+    assert_eq!(build_manifest.synthetic_records, 1);
 
     let db_path = dir.path().join("release.rsidb");
     let manifest_path = dir.path().join("release.manifest.json");
@@ -692,7 +693,7 @@ fn test_e2e_scenario_13_signed_release_verification_and_tamper_rejection() {
 
     // 5. Tampered manifest is rejected
     let tampered_manifest_path = dir.path().join("tampered.manifest.json");
-    let tampered_manifest_json = manifest_json.replace("source-genuine", "tampered-source");
+    let tampered_manifest_json = manifest_json.replace("release-test-source", "tampered-source");
     assert_ne!(manifest_json, tampered_manifest_json);
     std::fs::write(&tampered_manifest_path, &tampered_manifest_json).unwrap();
 
@@ -835,7 +836,7 @@ fn test_e2e_scenario_16_malformed_records_and_accurate_signature_counts() {
         redistribution: Redistribution::Allowed,
         attribution: None,
         approved: true,
-        kind: SourceKind::Genuine,
+        kind: SourceKind::SyntheticTest,
         format: IndicatorFormat::HashSizeName,
         path: "mixed.hdb".into(),
         sha256: None,
@@ -864,8 +865,8 @@ fn test_e2e_scenario_16_malformed_records_and_accurate_signature_counts() {
     assert_eq!(manifest.records_md5, 1);
     assert_eq!(manifest.records_sha1, 1);
     assert_eq!(manifest.records_sha256, 1);
-    assert_eq!(manifest.genuine_records, 3);
-    assert_eq!(manifest.synthetic_records, 0);
+    assert_eq!(manifest.genuine_records, 0);
+    assert_eq!(manifest.synthetic_records, 3);
     assert_eq!(manifest.total_accepted, 3);
     assert_eq!(manifest.total_rejected, 3);
 }
@@ -897,4 +898,90 @@ fn test_e2e_scenario_17_unauthorized_source_self_approval_blocked() {
         }
         other => panic!("Expected policy refusal, got {:?}", other),
     }
+}
+
+#[test]
+fn test_e2e_scenario_18_genuine_integrity_guarantees() {
+    let mut pipeline = IngestPipeline::new(BuildProfile::Public);
+
+    // 1. Unverified source declaring genuine is demoted to synthetic
+    pipeline.authorize_source("unverified-feed");
+    let unverified_manifest = SourceManifest {
+        id: "unverified-feed".into(),
+        name: "Unverified Feed".into(),
+        origin: "https://example.com/unverified".into(),
+        version: "1.0".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "CC0-1.0".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true,
+        kind: SourceKind::Genuine, // Falsely declares genuine
+        format: IndicatorFormat::HashSizeName,
+        path: "feed.hdb".into(),
+        sha256: None, // Unpinned
+    };
+    let unverified_content =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1024:Trojan.Generic\n";
+    let report1 = pipeline
+        .add_source(unverified_manifest, unverified_content.as_bytes())
+        .unwrap();
+    assert_eq!(report1.effective_kind, SourceKind::SyntheticTest);
+    assert_eq!(
+        report1.authenticity_status,
+        "unverified_operator_certification_missing"
+    );
+
+    // 2. Verified genuine source with synthetic preimages has preimages rejected
+    pipeline.authorize_source("verified-feed");
+    pipeline.verify_genuine_source("verified-feed");
+
+    let abc_preimage_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let verified_content = format!(
+        "# Pinned verified genuine feed with attempted synthetic inclusion\n\
+         {}:34816:FalselyClaimed.AgentTesla\n\
+         {}:68:FalselyClaimed.Eicar\n\
+         fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210:2048:Real.Operational.Threat\n",
+        abc_preimage_hash, EICAR_SHA256_HEX
+    );
+    let verified_sha256 = hex::encode(sha2::Sha256::digest(verified_content.as_bytes()));
+
+    let verified_manifest = SourceManifest {
+        id: "verified-feed".into(),
+        name: "Verified Operational Feed".into(),
+        origin: "https://example.com/verified".into(),
+        version: "2026.11.02".into(),
+        acquired_at: "2026-11-02T00:00:00Z".into(),
+        license: "CC0-1.0".into(),
+        redistribution: Redistribution::Allowed,
+        attribution: None,
+        approved: true,
+        kind: SourceKind::Genuine,
+        format: IndicatorFormat::HashSizeName,
+        path: "verified.hdb".into(),
+        sha256: Some(verified_sha256),
+    };
+
+    let report2 = pipeline
+        .add_source(verified_manifest, verified_content.as_bytes())
+        .unwrap();
+    assert_eq!(report2.effective_kind, SourceKind::Genuine);
+    assert_eq!(report2.authenticity_status, "verified_genuine_provider");
+    // 2 synthetic preimages rejected, 1 real threat accepted
+    assert_eq!(report2.accepted, 1);
+    assert_eq!(report2.rejected, 2);
+    assert_eq!(
+        report2
+            .rejections_by_reason
+            .get("synthetic_preimage_in_genuine_feed"),
+        Some(&2)
+    );
+
+    // 3. Build verifies strict genuine vs synthetic counts
+    let (_, manifest) = pipeline
+        .build("2026.11.02.1", "2026-11-02T00:00:00Z")
+        .unwrap();
+    assert_eq!(manifest.genuine_records, 1);
+    assert_eq!(manifest.synthetic_records, 1); // 1 from unverified source
+    assert_eq!(manifest.total_accepted, 2);
 }

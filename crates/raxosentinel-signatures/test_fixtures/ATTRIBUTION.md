@@ -23,7 +23,7 @@ This document records the provenance, copyright ownership, and licensing terms f
 | **2. Third-Party Test Fixtures** | ClamAV test files (`clamav.hdb`, `clam.exe`, `other_sigs/*`, `xor_testfile.py`) | Cisco Systems, Inc. / Tomasz Kojm | GPL-2.0 | Retained under upstream GPL-2.0 for testing only. Not for standalone redistribution |
 | **2b. EICAR Test String** | Standard anti-virus test file (68 bytes) | EICAR | Publicly permitted test standard | Universally permitted for AV test suites |
 | **3. Original Raxo Rules** | Raxo-authored email attachment rules, heuristic signatures | RaxoSentinel Authors | GPL-2.0-or-later | Permitted in public RSIDB releases |
-| **4. Third-Party Threat Intel** | Indicator metadata from Abuse.ch (MalwareBazaar, URLhaus) | abuse.ch / BFH | CC0 1.0 Universal | Permitted with attribution in public RSIDB |
+| **4. Third-Party Threat Intel** | External indicator metadata (Abuse.ch, etc.) | Respective upstream providers | **UNVERIFIED** (Requires auth; terms unconfirmed) | **No** (0 records distributed; rights unverified) |
 | **4b. Third-Party Proprietary Intel** | Cisco Talos CVD (`daily.cvd`, `main.cvd`), VirusTotal | Cisco Talos / Chronicle | Proprietary ToS | **PROHIBITED** from public RSIDB |
 
 ---
@@ -60,3 +60,8 @@ This document records the provenance, copyright ownership, and licensing terms f
    - **Origin**: RaxoSentinel internal synthetic fixture containing EICAR and ClamAV test hashes.
    - **License**: GPL-2.0-or-later.
    - **Redistribution**: Allowed for integration testing. Marked `synthetic_test` so build manifests report 0 genuine records.
+
+7. [`quarantined_synthetic_fixtures/`](file:///workspace/projects/011-raxosentinelcore/Phase01/crates/raxosentinel-signatures/test_fixtures/quarantined_synthetic_fixtures)
+   - **Kind**: `synthetic_test` (Quarantined)
+   - **Origin**: Phase 2C emergency integrity audit identified that eight alleged MalwareBazaar indicators were actually synthetic preimages of simple strings (`abc`, `abcd`, `123456`, `1`, `2`) with fabricated sizes or unverified claims.
+   - **Status**: Strictly quarantined as synthetic test fixtures; `approved: false`, `redistribution: internal_only`. Excluded from public builds.

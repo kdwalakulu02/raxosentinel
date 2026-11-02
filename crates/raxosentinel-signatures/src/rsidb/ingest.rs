@@ -70,17 +70,51 @@ pub enum IndicatorFormat {
 }
 
 /// Category of indicator source: genuine operational threat intelligence vs synthetic/harmless test fixtures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     /// Genuine operational threat intelligence (real-world observed malware hashes).
     Genuine,
     /// Synthetic or harmless test fixtures (EICAR, ClamAV test files, unit test vectors).
+    #[default]
     SyntheticTest,
 }
 
 fn default_source_kind() -> SourceKind {
     SourceKind::SyntheticTest
+}
+
+/// Returns true if the digest corresponds to a known synthetic test string, test fixture, or standard preimage.
+/// Known synthetic digests can NEVER be classified as genuine operational threat records.
+pub fn is_known_synthetic_digest(digest: &[u8]) -> bool {
+    const KNOWN_SYNTHETIC_HEX: &[&str] = &[
+        // Standard EICAR Antivirus Test File
+        "44d88612fea8a8f36de82e1278abb02f",         // EICAR MD5
+        "131f95c51cc819465fa1797f6ccacf9d494aaaff", // EICAR SHA1
+        "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", // EICAR SHA256
+        // ClamAV official test executable (clam.exe)
+        "71e7b604d18aefd839e51a39c88df8383bb4c071dc31f87f00a2b5df580d4495",
+        // Empty string digests
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        // Common synthetic test preimages audited in Phase 2C
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", // sha256("abc")
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff213f0ffced94b21490a0", // sha256("abcd")
+        "5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5", // sha256("123456")
+        "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b", // sha256("1")
+        "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35", // sha256("2")
+        "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce", // sha256("3")
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", // sha256("test")
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", // sha256("hello")
+        "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918", // sha256("admin")
+        "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8", // sha256("password")
+    ];
+
+    let hex_repr = hex::encode(digest);
+    KNOWN_SYNTHETIC_HEX
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(&hex_repr))
 }
 
 /// Operator-supplied description of an approved local indicator source.
@@ -201,6 +235,10 @@ pub struct SourceReport {
     pub rejected: usize,
     pub duplicates: usize,
     pub ignored_lines: usize,
+    #[serde(default = "default_source_kind")]
+    pub effective_kind: SourceKind,
+    #[serde(default)]
+    pub authenticity_status: String,
     pub rejections_by_reason: BTreeMap<String, usize>,
     pub rejection_samples: Vec<Rejection>,
 }
@@ -257,6 +295,7 @@ pub struct IngestPipeline {
     limits: IngestLimits,
     authorized_sources: BTreeSet<String>,
     authorize_all_dev: bool,
+    verified_genuine_sources: BTreeSet<String>,
     revocations: BTreeSet<Vec<u8>>,
     /// Key: (alg, digest, size, name) -> contributing source ids.
     records: BTreeMap<(HashAlgorithm, Vec<u8>, u64, String), BTreeSet<String>>,
@@ -274,6 +313,7 @@ impl IngestPipeline {
             limits,
             authorized_sources: BTreeSet::new(),
             authorize_all_dev: false,
+            verified_genuine_sources: BTreeSet::new(),
             revocations: BTreeSet::new(),
             records: BTreeMap::new(),
             sources: Vec::new(),
@@ -283,6 +323,24 @@ impl IngestPipeline {
     /// Authorizes a source ID in the operator policy (prevents source self-approval).
     pub fn authorize_source(&mut self, source_id: impl Into<String>) -> &mut Self {
         self.authorized_sources.insert(source_id.into());
+        self
+    }
+
+    /// Explicitly certifies an authorized source ID as an authentic, verified genuine threat intelligence provider.
+    /// Without explicit operator verification, sources claiming to be genuine are demoted to SyntheticTest.
+    pub fn verify_genuine_source(&mut self, source_id: impl Into<String>) -> &mut Self {
+        self.verified_genuine_sources.insert(source_id.into());
+        self
+    }
+
+    /// Explicitly certifies multiple source IDs as authentic, verified genuine threat providers.
+    pub fn with_verified_genuine_sources(
+        mut self,
+        ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        for id in ids {
+            self.verified_genuine_sources.insert(id.into());
+        }
         self
     }
 
@@ -383,9 +441,45 @@ impl IngestPipeline {
             DatabaseError::Policy(format!("source '{}' is not UTF-8: {}", manifest.id, e))
         })?;
 
+        let (effective_kind, authenticity_status) = if manifest.kind == SourceKind::Genuine {
+            if !self.verified_genuine_sources.contains(&manifest.id) {
+                (
+                    SourceKind::SyntheticTest,
+                    "unverified_operator_certification_missing".to_string(),
+                )
+            } else if manifest.sha256.is_none() {
+                (
+                    SourceKind::SyntheticTest,
+                    "unverified_sha256_pin_missing".to_string(),
+                )
+            } else if manifest.origin.trim().is_empty()
+                || manifest.version.trim().is_empty()
+                || manifest.acquired_at.trim().is_empty()
+            {
+                (
+                    SourceKind::SyntheticTest,
+                    "unverified_provenance_metadata_incomplete".to_string(),
+                )
+            } else if !manifest.redistribution.public_ok() {
+                (
+                    SourceKind::SyntheticTest,
+                    "unverified_redistribution_unauthorized".to_string(),
+                )
+            } else {
+                (SourceKind::Genuine, "verified_genuine_provider".to_string())
+            }
+        } else {
+            (
+                SourceKind::SyntheticTest,
+                "synthetic_test_source".to_string(),
+            )
+        };
+
         let mut report = SourceReport {
             source_id: manifest.id.clone(),
             input_sha256,
+            effective_kind,
+            authenticity_status,
             ..Default::default()
         };
         let sep = match manifest.format {
@@ -420,6 +514,17 @@ impl IngestPipeline {
                             "revoked",
                             format!(
                                 "indicator hash {} is revoked by policy",
+                                hex::encode(&digest)
+                            ),
+                        );
+                        continue;
+                    }
+                    if effective_kind == SourceKind::Genuine && is_known_synthetic_digest(&digest) {
+                        report.reject(
+                            line_no,
+                            "synthetic_preimage_in_genuine_feed",
+                            format!(
+                                "indicator hash {} matches known synthetic test string; prohibited in genuine threat feed",
                                 hex::encode(&digest)
                             ),
                         );
@@ -508,10 +613,10 @@ impl IngestPipeline {
         let mut genuine_records = 0usize;
         let mut synthetic_records = 0usize;
 
-        let source_kinds: BTreeMap<String, SourceKind> = self
+        let effective_kinds: BTreeMap<String, SourceKind> = self
             .sources
             .iter()
-            .map(|s| (s.source.id.clone(), s.source.kind))
+            .map(|s| (s.source.id.clone(), s.report.effective_kind))
             .collect();
 
         for ((alg, digest, size, name), source_ids) in &self.records {
@@ -526,8 +631,8 @@ impl IngestPipeline {
 
             let has_genuine = source_ids
                 .iter()
-                .any(|id| source_kinds.get(id).copied() == Some(SourceKind::Genuine));
-            if has_genuine {
+                .any(|id| effective_kinds.get(id).copied() == Some(SourceKind::Genuine));
+            if has_genuine && !is_known_synthetic_digest(digest) {
                 genuine_records += 1;
             } else {
                 synthetic_records += 1;
@@ -716,10 +821,16 @@ mod tests {
     fn test_revocation_and_genuine_breakdown() {
         let mut p = IngestPipeline::new(BuildProfile::Public);
         p.authorize_source("feed-genuine");
-        p.authorize_source("feed-synthetic");
+        p.verify_genuine_source("feed-genuine");
 
         // Revoke the EICAR MD5 hash
         p.revoke_hash(EICAR_MD5).unwrap();
+
+        let sha256_threat = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let genuine_content = format!(
+            "{}:1000:Win32.Trojan.GenuineThreat\n{}:68:Revoked.Eicar\n",
+            sha256_threat, EICAR_MD5
+        );
 
         let mut genuine_src = src(
             "feed-genuine",
@@ -727,13 +838,10 @@ mod tests {
             IndicatorFormat::HashSizeName,
         );
         genuine_src.kind = SourceKind::Genuine;
+        genuine_src.sha256 = Some(hex::encode(sha2::Sha256::digest(
+            genuine_content.as_bytes(),
+        )));
 
-        // SHA256 of real threat indicator
-        let sha256_threat = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let genuine_content = format!(
-            "{}:1000:Win32.Trojan.GenuineThreat\n{}:68:Revoked.Eicar\n",
-            sha256_threat, EICAR_MD5
-        );
         let report = p
             .add_source(genuine_src, genuine_content.as_bytes())
             .unwrap();
@@ -745,5 +853,104 @@ mod tests {
         let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
         assert_eq!(manifest.genuine_records, 1);
         assert_eq!(manifest.synthetic_records, 0);
+    }
+
+    #[test]
+    fn test_unverified_source_cannot_claim_genuine_status() {
+        let mut p = IngestPipeline::new(BuildProfile::Public);
+        // Operator authorizes source to ingest, but does NOT certify authenticity
+        p.authorize_source("unverified-claims-feed");
+
+        let content =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1000:SomeThreat\n";
+        let mut s = src(
+            "unverified-claims-feed",
+            Redistribution::Allowed,
+            IndicatorFormat::HashSizeName,
+        );
+        s.kind = SourceKind::Genuine;
+        s.sha256 = Some(hex::encode(sha2::Sha256::digest(content.as_bytes())));
+
+        let report = p.add_source(s, content.as_bytes()).unwrap();
+        assert_eq!(report.effective_kind, SourceKind::SyntheticTest);
+        assert_eq!(
+            report.authenticity_status,
+            "unverified_operator_certification_missing"
+        );
+        assert_eq!(report.accepted, 1);
+
+        let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
+        // Crucial: Must be 0 genuine records!
+        assert_eq!(manifest.genuine_records, 0);
+        assert_eq!(manifest.synthetic_records, 1);
+    }
+
+    #[test]
+    fn test_synthetic_preimages_rejected_from_genuine_records() {
+        let mut p = IngestPipeline::new(BuildProfile::Public);
+        p.authorize_source("certified-feed");
+        p.verify_genuine_source("certified-feed");
+
+        // Input contains:
+        // 1. sha256("abc") -> known synthetic preimage
+        // 2. sha256("1") -> known synthetic preimage
+        // 3. EICAR SHA256 -> known synthetic test vector
+        // 4. real threat hash -> valid non-synthetic
+        let real_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let abc_hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let one_hash = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b";
+
+        let content = format!(
+            "{}:1000:Real.Threat\n{}:34816:FalselyClaimed.AgentTesla\n{}:409600:FalselyClaimed.GuLoader\n{}:68:Eicar\n",
+            real_hash, abc_hash, one_hash, EICAR_SHA256
+        );
+
+        let mut s = src(
+            "certified-feed",
+            Redistribution::Allowed,
+            IndicatorFormat::HashSizeName,
+        );
+        s.kind = SourceKind::Genuine;
+        s.sha256 = Some(hex::encode(sha2::Sha256::digest(content.as_bytes())));
+
+        let report = p.add_source(s, content.as_bytes()).unwrap();
+        // 1 accepted real record, 3 synthetic preimages rejected
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.rejected, 3);
+        assert_eq!(
+            report
+                .rejections_by_reason
+                .get("synthetic_preimage_in_genuine_feed"),
+            Some(&3)
+        );
+
+        let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
+        assert_eq!(manifest.genuine_records, 1);
+        assert_eq!(manifest.synthetic_records, 0);
+    }
+
+    #[test]
+    fn test_unpinned_source_cannot_claim_genuine_status() {
+        let mut p = IngestPipeline::new(BuildProfile::Public);
+        p.authorize_source("unpinned-feed");
+        p.verify_genuine_source("unpinned-feed");
+
+        let content =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:1000:Threat\n";
+        let mut s = src(
+            "unpinned-feed",
+            Redistribution::Allowed,
+            IndicatorFormat::HashSizeName,
+        );
+        s.kind = SourceKind::Genuine;
+        s.sha256 = None; // Unpinned!
+
+        let report = p.add_source(s, content.as_bytes()).unwrap();
+        assert_eq!(report.effective_kind, SourceKind::SyntheticTest);
+        assert_eq!(report.authenticity_status, "unverified_sha256_pin_missing");
+
+        let (_, manifest) = p.build("2026.11.02.1", "2026-11-02T00:00:00Z").unwrap();
+        assert_eq!(manifest.genuine_records, 0);
+        assert_eq!(manifest.synthetic_records, 1);
     }
 }

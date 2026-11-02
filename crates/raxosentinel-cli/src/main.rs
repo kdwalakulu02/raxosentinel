@@ -98,9 +98,12 @@ enum DbCommand {
         /// public | internal
         #[arg(long, default_value = "public")]
         profile: String,
-        /// Explicitly authorized source identifier (repeatable; prevents self-approval)
+        /// Explicitly authorized source identifier (repeatable; authorizes ingestion)
         #[arg(long = "allow-source")]
         allowed_sources: Vec<String>,
+        /// Explicitly certified genuine intelligence provider (repeatable; certifies authenticity)
+        #[arg(long = "verify-genuine-source")]
+        verified_genuine_sources: Vec<String>,
         /// Permit all sources (development testing mode only)
         #[arg(long)]
         allow_all_sources_dev: bool,
@@ -564,6 +567,7 @@ fn run_db(cmd: DbCommand) -> i32 {
             built_at,
             profile,
             allowed_sources,
+            verified_genuine_sources,
             allow_all_sources_dev,
             revocations,
         } => {
@@ -583,6 +587,9 @@ fn run_db(cmd: DbCommand) -> i32 {
                 for s in &allowed_sources {
                     pipeline.authorize_source(s);
                 }
+            }
+            for s in &verified_genuine_sources {
+                pipeline.verify_genuine_source(s);
             }
             for r in &revocations {
                 if let Err(e) = pipeline.revoke_hash(r) {
@@ -605,8 +612,14 @@ fn run_db(cmd: DbCommand) -> i32 {
                         .add_source(manifest, &content)
                         .map_err(|e| e.to_string())?;
                     eprintln!(
-                        "source {}: accepted={} rejected={} duplicates={} ignored={}",
-                        r.source_id, r.accepted, r.rejected, r.duplicates, r.ignored_lines
+                        "source {}: accepted={} rejected={} duplicates={} ignored={} [effective_kind={:?}, status={}]",
+                        r.source_id,
+                        r.accepted,
+                        r.rejected,
+                        r.duplicates,
+                        r.ignored_lines,
+                        r.effective_kind,
+                        r.authenticity_status
                     );
                     Ok(())
                 })();
