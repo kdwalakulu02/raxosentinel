@@ -49,6 +49,51 @@ fn scanner_requires_private_evidence_and_never_scans_after_failure() {
         String::from_utf8_lossy(&good.stderr)
     );
     assert!(String::from_utf8_lossy(&good.stdout).contains("MalwareBazaar.SyntheticFixture"));
+    private_store::publish(root.path(), "replacement", response.as_bytes(), 2).unwrap();
+    let refresh = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .args(["db", "refresh-private-source", "--root"])
+        .arg(root.path())
+        .args([
+            "--input",
+            "synthetic",
+            "--replacement",
+            "replacement",
+            "--output",
+            "history",
+            "--source",
+            "malwarebazaar",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        refresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    let history = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .args(["db", "sources", "--root"])
+        .arg(root.path())
+        .args(["--generation", "history"])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(
+        parsed["sources"][0]["acquisitions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let comparison = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .args(["db", "compare-private", "--root"])
+        .arg(root.path())
+        .args(["--before", "synthetic", "--after", "history"])
+        .output()
+        .unwrap();
+    assert!(comparison.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&comparison.stdout).unwrap();
+    assert_eq!(parsed["acquisitions_added"].as_array().unwrap().len(), 1);
     std::fs::remove_file(root.path().join("synthetic/database.rsidb.evidence")).unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
         .args(["db", "sources", "--root"])

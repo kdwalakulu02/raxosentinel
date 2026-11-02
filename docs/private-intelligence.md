@@ -12,14 +12,14 @@ The scanner reports `.staging-*` leftovers, which are never loaded as generation
 
 For repeated warm-cache measurements of a generation: `cargo run --release -p raxosentinel-cli --bin private_generation_benchmark -- /home/USER/raxosentinel-private GENERATION 21`. To migrate a preserved Phase 2D.1 pair, pass its database path as the optional final argument; the tool verifies the old pair and uses the original evidence and acquisition timestamp. Migration reads a trusted owner-controlled source, and keeps the original pair. It does not authenticate the source beyond the original local integrity linkage.
 
-Read-only source inspection of a Phase 2D.2 generation is available with:
+Read-only source inspection of legacy, multi-source, and history generations is available with:
 
 ```
 cargo run --release -p raxosentinel-cli --bin raxosentinel -- db sources --root /home/USER/raxosentinel-private --generation GENERATION
 cargo run --release -p raxosentinel-cli --bin raxosentinel -- db indicator --root /home/USER/raxosentinel-private --generation GENERATION SHA256_HEX
 ```
 
-Both commands validate the database and evidence before returning source information. They infer the one supported source from the fixed MalwareBazaar manifest; provenance status means local consistency only and is not a provider signature. These inspection commands currently accept only the earlier single-source generation format. Missing or corrupt evidence is an error.
+Both commands validate the database and evidence before returning source information. Supported source identities come from fixed adapters; provenance status means local consistency only and is not a provider signature. Missing or corrupt evidence is an error.
 
 
 The multi-source core stores a versioned registry and source associations next to the scanner database; strict loading re-derives them from each source's evidence. Conflicting sizes quarantine the hash from scanning. Published generations are immutable. To migrate a verified single-source generation or merge generations whose source IDs do not overlap:
@@ -29,4 +29,14 @@ cargo run --release -p raxosentinel-cli --bin raxosentinel -- db merge-private -
 cargo run --release -p raxosentinel-cli --bin raxosentinel -- db remove-private-source --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION --source malwarebazaar
 ```
 
-The production adapter currently supports MalwareBazaar only. Synthetic adapters are compiled only into unit tests and are labelled synthetic; no other provider is authenticated or supported. Merging duplicate source IDs is rejected. The Rust `private_store::multi::inspect` API validates and returns the registry and associations. Local evidence consistency is not a provider signature.
+The production adapter currently supports MalwareBazaar only. Synthetic adapters are compiled only into unit tests and are labelled synthetic; no other provider is authenticated or supported. Merging duplicate source IDs is rejected. The Rust `private_store::multi::history::inspect` API validates and returns acquisition history and associations. Local evidence consistency is not a provider signature.
+
+
+For a limited recent-results source, refresh is additive: absence from the newer response does not withdraw a prior observation. Both original responses remain in the new generation, with acquisition IDs, timestamps, digests and per-acquisition statistics. Conflicting sizes are quarantined. The input and replacement generations are never mutated.
+
+```
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db refresh-private-source --root /home/USER/raxosentinel-private --input OLD --replacement NEW_ACQUISITION --output REFRESHED --source malwarebazaar
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db compare-private --root /home/USER/raxosentinel-private --before OLD --after REFRESHED
+```
+
+Acquisition timestamps and local evidence digests are not provider-issued attestations. History generations support inspection, refresh and source removal; the older multi-source merge command currently accepts only v1 inputs. Do not interpret a recent 100-record response as an authoritative full snapshot.

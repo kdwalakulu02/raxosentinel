@@ -65,6 +65,11 @@ enum Commands {
 enum DbCommand {
     /// Fully validate an RSIDB file and print its statistics
     Verify { path: PathBuf },
+    /// Initialize trusted local sequence state for the public release prototype.
+    InitPublicState {
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Merge verified private generations into a new generation.
     MergePrivate {
         #[arg(long)]
@@ -84,6 +89,28 @@ enum DbCommand {
         output: String,
         #[arg(long)]
         source: String,
+    },
+    /// Refresh one source using another verified private generation.
+    RefreshPrivateSource {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        replacement: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        source: String,
+    },
+    /// Compare two verified private generations.
+    ComparePrivate {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        before: String,
+        #[arg(long)]
+        after: String,
     },
     /// List the evidence-validated source for a private generation.
     Sources {
@@ -208,6 +235,16 @@ struct ScanArgs {
     #[arg(long, env = "RAXOSENTINEL_DB", conflicts_with_all = ["db_store", "private_db_root"]) ]
     db: Option<PathBuf>,
 
+    /// Owner-controlled signed public-release prototype directory.
+    #[arg(long, requires_all = ["public_key", "public_state"], conflicts_with_all = ["db", "db_store", "private_db_root"])]
+    public_release: Option<PathBuf>,
+    /// Explicitly trusted Ed25519 public key for public-release verification.
+    #[arg(long, requires = "public_release")]
+    public_key: Option<PathBuf>,
+    /// Owner-controlled trusted rollback state directory.
+    #[arg(long, requires = "public_release")]
+    public_state: Option<PathBuf>,
+
     /// Owner-controlled private storage root (requires --private-generation).
     #[arg(long, requires = "private_generation", conflicts_with_all = ["db", "db_store"])]
     private_db_root: Option<PathBuf>,
@@ -269,7 +306,29 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     // A configured database that fails validation is a hard error: never scan "without" it.
-    if let Some(ref root) = args.private_db_root {
+    if let Some(ref release) = args.public_release {
+        let key_path = args.public_key.as_ref().expect("clap requires public key");
+        let state = args
+            .public_state
+            .as_ref()
+            .expect("clap requires public state");
+        match crypto::load_verifying_key_from_file(key_path)
+            .map_err(|e| e.to_string())
+            .and_then(|key| {
+                raxosentinel_signatures::rsidb::public_release::local::load(
+                    release,
+                    state,
+                    key,
+                    env!("CARGO_PKG_VERSION"),
+                )
+            }) {
+            Ok(index) => db.attach_rsidb(Arc::new(index)),
+            Err(e) => {
+                eprintln!("Error: signed public release rejected: {e}");
+                return 3;
+            }
+        }
+    } else if let Some(ref root) = args.private_db_root {
         match raxosentinel_signatures::rsidb::malwarebazaar::private_store::incomplete(root) {
             Ok(entries) if !entries.is_empty() => eprintln!(
                 "Warning: incomplete private staging entries require inspection: {}",
@@ -556,6 +615,10 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
 
 fn run_db(cmd: DbCommand) -> i32 {
     match cmd {
+        DbCommand::InitPublicState { root } => match raxosentinel_signatures::rsidb::public_release::local::initialize(&root) {
+            Ok(()) => { println!("Public release prototype state initialized"); 0 },
+            Err(e) => { eprintln!("Error: cannot initialize public release state: {e}"); 3 }
+        },
         DbCommand::MergePrivate {
             root,
             input,
@@ -594,15 +657,25 @@ fn run_db(cmd: DbCommand) -> i32 {
                 }
             }
         }
+        DbCommand::RefreshPrivateSource { root, input, replacement, output, source } => {
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::refresh_source(&root, &input, &replacement, &output, &source) {
+                Ok(()) => { println!("Private generation published"); 0 },
+                Err(e) => { eprintln!("Error: private source refresh failed: {e}"); 3 }
+            }
+        }
+        DbCommand::ComparePrivate { root, before, after } => match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::history::compare(&root, &before, &after) {
+            Ok(report) => { println!("{}", serde_json::to_string_pretty(&report).expect("comparison serialization")); 0 },
+            Err(e) => { eprintln!("Error: private generation comparison failed: {e}"); 3 }
+        },
         DbCommand::Sources { root, generation } => {
-            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::inspect(
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::history::inspect(
                 &root,
                 &generation,
             ) {
-                Ok((source, _)) => {
+                Ok((registry, _)) => {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&source).expect("source serialization")
+                        serde_json::to_string_pretty(&registry).expect("source serialization")
                     );
                     0
                 }
@@ -621,14 +694,19 @@ fn run_db(cmd: DbCommand) -> i32 {
                 eprintln!("Error: SHA-256 must be 64 hexadecimal digits");
                 return 2;
             }
-            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::inspect(
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::history::inspect(
                 &root,
                 &generation,
             ) {
-                Ok((_, claims)) => {
-                    let found: Vec<_> = claims
+                Ok((_, associations)) => {
+                    let found: Vec<_> = associations.indicators
                         .into_iter()
                         .filter(|claim| claim.sha256.eq_ignore_ascii_case(&sha256))
+                        .map(|claim| {
+                            let mut value = serde_json::to_value(&claim).expect("claim serialization");
+                            value["quarantine_reason"] = if claim.quarantined { serde_json::json!("conflicting file sizes") } else { serde_json::Value::Null };
+                            value
+                        })
                         .collect();
                     println!(
                         "{}",
