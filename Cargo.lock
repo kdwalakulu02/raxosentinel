@@ -1327,6 +1327,7 @@ dependencies = [
  "aho-corasick",
  "ed25519-dalek",
  "hex",
+ "libc",
  "mail-parser",
  "md-5",
  "memmap2",
