@@ -65,6 +65,26 @@ enum Commands {
 enum DbCommand {
     /// Fully validate an RSIDB file and print its statistics
     Verify { path: PathBuf },
+    /// Merge verified private generations into a new generation.
+    MergePrivate {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, required = true)]
+        input: Vec<String>,
+        #[arg(long)]
+        output: String,
+    },
+    /// Publish a new private generation without a selected source.
+    RemovePrivateSource {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        source: String,
+    },
     /// List the evidence-validated source for a private generation.
     Sources {
         #[arg(long)]
@@ -536,6 +556,44 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
 
 fn run_db(cmd: DbCommand) -> i32 {
     match cmd {
+        DbCommand::MergePrivate {
+            root,
+            input,
+            output,
+        } => {
+            let inputs: Vec<_> = input.iter().map(String::as_str).collect();
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::merge(
+                &root, &inputs, &output,
+            ) {
+                Ok(()) => {
+                    println!("Private generation published");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private merge failed: {e}");
+                    3
+                }
+            }
+        }
+        DbCommand::RemovePrivateSource {
+            root,
+            input,
+            output,
+            source,
+        } => {
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::remove_source(
+                &root, &input, &output, &source,
+            ) {
+                Ok(()) => {
+                    println!("Private generation published");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private source removal failed: {e}");
+                    3
+                }
+            }
+        }
         DbCommand::Sources { root, generation } => {
             match raxosentinel_signatures::rsidb::malwarebazaar::private_store::inspect(
                 &root,

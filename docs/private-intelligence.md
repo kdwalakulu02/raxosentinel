@@ -19,4 +19,14 @@ cargo run --release -p raxosentinel-cli --bin raxosentinel -- db sources --root 
 cargo run --release -p raxosentinel-cli --bin raxosentinel -- db indicator --root /home/USER/raxosentinel-private --generation GENERATION SHA256_HEX
 ```
 
-Both commands validate the database and evidence before returning source information. They infer the one supported source from the fixed MalwareBazaar manifest; provenance status means local consistency only and is not a provider signature. This is read-only single-source inspection, not a multi-source registry, source approval mechanism, source refresh, or source-removal implementation. Missing or corrupt evidence is an error.
+Both commands validate the database and evidence before returning source information. They infer the one supported source from the fixed MalwareBazaar manifest; provenance status means local consistency only and is not a provider signature. These inspection commands currently accept only the earlier single-source generation format. Missing or corrupt evidence is an error.
+
+
+The multi-source core stores a versioned registry and source associations next to the scanner database; strict loading re-derives them from each source's evidence. Conflicting sizes quarantine the hash from scanning. Published generations are immutable. To migrate a verified single-source generation or merge generations whose source IDs do not overlap:
+
+```
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db merge-private --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db remove-private-source --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION --source malwarebazaar
+```
+
+The production adapter currently supports MalwareBazaar only. Synthetic adapters are compiled only into unit tests and are labelled synthetic; no other provider is authenticated or supported. Merging duplicate source IDs is rejected. The Rust `private_store::multi::inspect` API validates and returns the registry and associations. Local evidence consistency is not a provider signature.
