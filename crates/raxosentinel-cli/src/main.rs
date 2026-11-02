@@ -169,9 +169,17 @@ struct ScanArgs {
     #[arg(long)]
     memory: bool,
 
-    /// RSIDB database file (validated before scanning). Env: RAXOSENTINEL_DB
-    #[arg(long, env = "RAXOSENTINEL_DB", conflicts_with = "db_store")]
+    /// Explicit unverified legacy/test RSIDB file. Env: RAXOSENTINEL_DB
+    #[arg(long, env = "RAXOSENTINEL_DB", conflicts_with_all = ["db_store", "private_db_root"]) ]
     db: Option<PathBuf>,
+
+    /// Owner-controlled private storage root (requires --private-generation).
+    #[arg(long, requires = "private_generation", conflicts_with_all = ["db", "db_store"])]
+    private_db_root: Option<PathBuf>,
+
+    /// Immutable private generation to verify before scanning.
+    #[arg(long, requires = "private_db_root")]
+    private_generation: Option<String>,
 
     /// RSIDB store directory managed by `db install` (uses current, falls back to previous)
     #[arg(long, env = "RAXOSENTINEL_DB_STORE")]
@@ -226,7 +234,34 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     // A configured database that fails validation is a hard error: never scan "without" it.
-    if let Some(ref p) = args.db {
+    if let Some(ref root) = args.private_db_root {
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::incomplete(root) {
+            Ok(entries) if !entries.is_empty() => eprintln!(
+                "Warning: incomplete private staging entries require inspection: {}",
+                entries.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error: private database recovery inspection failed: {e}");
+                return 3;
+            }
+        }
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(
+            root,
+            args.private_generation
+                .as_deref()
+                .expect("clap requires generation"),
+        ) {
+            Ok(index) => db.attach_rsidb(Arc::new(index)),
+            Err(e) => {
+                eprintln!("Error: private database rejected: {e}");
+                return 3;
+            }
+        }
+    } else if let Some(ref p) = args.db {
+        eprintln!(
+            "Warning: loading legacy/test database without acquisition evidence verification"
+        );
         match MmapCompactDirIndex::from_file(p) {
             Ok(index) => db.attach_rsidb(Arc::new(index)),
             Err(e) => {
@@ -235,6 +270,7 @@ fn run_scan(args: ScanArgs) -> i32 {
             }
         }
     } else if let Some(ref store) = args.db_store {
+        eprintln!("Warning: legacy release store does not verify private acquisition evidence");
         match DbStore::new(store).open_active() {
             Ok(active) => {
                 if active.fell_back {
