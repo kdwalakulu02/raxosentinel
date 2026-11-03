@@ -110,8 +110,37 @@ pub fn run(args: &ScanArgs) -> i32 {
     report.status.exit_code()
 }
 
-// Snapshot bytes into a sealed anonymous file before the worker is created.
-pub fn sealed_snapshot(mut source: File, max_size: u64) -> Result<File, String> {
+/// Trait for accounting and reserving snapshot byte budgets before allocation.
+pub trait SnapshotBudget {
+    /// Ensure capacity for `new_total` bytes in the budget.
+    /// Must be called before allocating additional bytes into snapshot storage.
+    fn ensure_capacity(&mut self, new_total: u64) -> Result<(), String>;
+
+    /// Adjust reservation down to actual final total when copying finishes.
+    fn finalize(&mut self, final_total: u64);
+}
+
+/// No-op budget for standalone scans that do not have global coordinator budgets.
+pub struct NoopSnapshotBudget;
+
+impl SnapshotBudget for NoopSnapshotBudget {
+    fn ensure_capacity(&mut self, _new_total: u64) -> Result<(), String> {
+        Ok(())
+    }
+    fn finalize(&mut self, _final_total: u64) {}
+}
+
+/// Snapshot bytes into a sealed anonymous file before the worker is created.
+pub fn sealed_snapshot(source: File, max_size: u64) -> Result<File, String> {
+    sealed_snapshot_with_budget(source, max_size, &mut NoopSnapshotBudget)
+}
+
+/// Snapshot bytes into a sealed anonymous file enforcing both per-file limit and global budget.
+pub fn sealed_snapshot_with_budget<B: SnapshotBudget>(
+    mut source: File,
+    max_size: u64,
+    budget: &mut B,
+) -> Result<File, String> {
     let name = c"raxosentinel-input";
     let fd =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
@@ -131,16 +160,23 @@ pub fn sealed_snapshot(mut source: File, max_size: u64) -> Result<File, String> 
         if n == 0 {
             break;
         }
-        total = total
-            .checked_add(n as u64)
-            .ok_or("Snapshot size overflow")?;
-        if total > max_size {
+        let chunk_len = n as u64;
+        let new_total = total
+            .checked_add(chunk_len)
+            .ok_or_else(|| "Snapshot size overflow".to_string())?;
+        if new_total > max_size {
             return Err("Target exceeds file size limit while snapshotting".into());
         }
+        // Incrementally ensure capacity in global budget before allocating bytes into memfd
+        budget.ensure_capacity(new_total)?;
         snapshot
             .write_all(&buf[..n])
             .map_err(|e| format!("Snapshot write failed: {e}"))?;
+        total = new_total;
     }
+    // Reconcile reservation down to actual size copied if source had fewer bytes than pre-reserved
+    budget.finalize(total);
+
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
         return Err(format!(

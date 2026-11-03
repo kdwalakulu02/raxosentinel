@@ -872,16 +872,86 @@ fn combine_verdict(
     (ScanStatus::Clean, None)
 }
 
-/// Helper checking if a byte slice contains a specific subslice.
-fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
+/// Helper to identify RFC 2046 boundary delimiter lines.
+/// Returns byte offsets in `raw_bytes` where opening delimiter lines (`--<boundary>`)
+/// and closing delimiter lines (`--<boundary>--`) start.
+fn find_boundary_lines(raw_bytes: &[u8], boundary: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut open_lines = Vec::new();
+    let mut close_lines = Vec::new();
+
+    let open_delim = format!("--{}", boundary);
+    let close_delim = format!("--{}--", boundary);
+    let open_bytes = open_delim.as_bytes();
+    let close_bytes = close_delim.as_bytes();
+
+    let mut i = 0;
+    while i < raw_bytes.len() {
+        // RFC 2046 Section 5.1.1: delimiter MUST occur at the beginning of a line
+        let is_line_start = i == 0 || raw_bytes[i - 1] == b'\n' || raw_bytes[i - 1] == b'\r';
+        if is_line_start {
+            // Check closing boundary delimiter first (longer match: "--boundary--")
+            if raw_bytes[i..].starts_with(close_bytes) {
+                let mut after = i + close_bytes.len();
+                // RFC 2046: optional linear whitespace ([ \t]*)
+                while after < raw_bytes.len()
+                    && (raw_bytes[after] == b' ' || raw_bytes[after] == b'\t')
+                {
+                    after += 1;
+                }
+                // Must be followed by CRLF, LF, CR, or EOF
+                if after == raw_bytes.len()
+                    || raw_bytes[after] == b'\n'
+                    || raw_bytes[after] == b'\r'
+                {
+                    close_lines.push(i);
+                    i = after;
+                    continue;
+                }
+            } else if raw_bytes[i..].starts_with(open_bytes) {
+                let mut after = i + open_bytes.len();
+                while after < raw_bytes.len()
+                    && (raw_bytes[after] == b' ' || raw_bytes[after] == b'\t')
+                {
+                    after += 1;
+                }
+                if after == raw_bytes.len()
+                    || raw_bytes[after] == b'\n'
+                    || raw_bytes[after] == b'\r'
+                {
+                    open_lines.push(i);
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        i += 1;
     }
-    haystack.windows(needle.len()).any(|w| w == needle)
+
+    (open_lines, close_lines)
+}
+
+fn is_multipart_part(part: &MessagePart) -> bool {
+    part.content_type()
+        .map(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
+        .unwrap_or(false)
 }
 
 /// Validates RFC 2046 MIME boundary integrity.
 fn validate_mime_boundaries(raw_bytes: &[u8], msg: &Message) -> Result<(), String> {
+    // Collect leaf (non-multipart) part body spans to ensure closing boundaries do not appear inside part contents
+    let leaf_spans: Vec<(usize, usize)> = msg
+        .parts()
+        .filter(|p| !is_multipart_part(p))
+        .map(|p| (p.offset_body() as usize, p.offset_end() as usize))
+        .filter(|(start, end)| start < end)
+        .collect();
+
+    let is_inside_leaf = |pos: usize| -> bool {
+        leaf_spans
+            .iter()
+            .any(|&(start, end)| start <= pos && pos < end)
+    };
+
     // 1. Check root message Content-Type
     if let Some(ct) = msg.content_type() {
         if ct.ctype().eq_ignore_ascii_case("multipart") {
@@ -895,18 +965,70 @@ fn validate_mime_boundaries(raw_bytes: &[u8], msg: &Message) -> Result<(), Strin
                 }
             };
 
-            let open_delim = format!("--{}", boundary);
-            if !bytes_contains(raw_bytes, open_delim.as_bytes()) {
+            let (open_lines, close_lines) = find_boundary_lines(raw_bytes, boundary);
+            if open_lines.is_empty() {
                 return Err(format!(
                     "Malformed multipart MIME: boundary delimiter '--{}' not found in message",
                     boundary
                 ));
             }
-
-            let close_delim = format!("--{}--", boundary);
-            if !bytes_contains(raw_bytes, close_delim.as_bytes()) {
+            if close_lines.is_empty() {
                 return Err(format!(
                     "Incomplete multipart MIME: missing closing boundary delimiter '--{}--'",
+                    boundary
+                ));
+            }
+
+            // Exclude closing delimiter candidates that fall inside ordinary part content
+            let non_leaf_close: Vec<usize> = close_lines
+                .into_iter()
+                .filter(|&pos| !is_inside_leaf(pos))
+                .collect();
+
+            if non_leaf_close.is_empty() {
+                return Err(format!(
+                    "Incomplete multipart MIME: missing closing boundary delimiter '--{}--'",
+                    boundary
+                ));
+            }
+
+            // The closing boundary must occur at or after all child parts belonging to root
+            let max_child_end = msg
+                .parts()
+                .filter(|p| p.offset_header() > 0)
+                .map(|p| p.offset_end() as usize)
+                .max()
+                .unwrap_or(0);
+
+            let valid_close = non_leaf_close.into_iter().find(|&pos| pos >= max_child_end);
+            let valid_close_pos = match valid_close {
+                Some(p) => p,
+                None => {
+                    return Err(format!(
+                        "Incomplete multipart MIME: missing closing boundary delimiter '--{}--'",
+                        boundary
+                    ));
+                }
+            };
+
+            // Opening boundary lines must not appear after the closing delimiter
+            if open_lines
+                .iter()
+                .any(|&open_pos| open_pos > valid_close_pos)
+            {
+                return Err(format!(
+                    "Malformed multipart MIME: opening delimiter '--{}' appears after closing delimiter",
+                    boundary
+                ));
+            }
+
+            // No body part may start after the closing boundary
+            if msg
+                .parts()
+                .any(|p| !is_multipart_part(&p) && (p.offset_header() as usize) > valid_close_pos)
+            {
+                return Err(format!(
+                    "Malformed multipart MIME: part appears after closing delimiter '--{}--'",
                     boundary
                 ));
             }
@@ -915,19 +1037,81 @@ fn validate_mime_boundaries(raw_bytes: &[u8], msg: &Message) -> Result<(), Strin
 
     // 2. Check any parts that declare multipart sub-structures
     for part in msg.parts() {
-        if let Some(ct) = part.content_type() {
-            if ct.ctype().eq_ignore_ascii_case("multipart") {
-                if let Some(b) = ct.attribute("boundary") {
-                    if !b.is_empty() {
-                        let close_delim = format!("--{}--", b);
-                        if !bytes_contains(raw_bytes, close_delim.as_bytes()) {
-                            return Err(format!(
-                                "Incomplete multipart MIME: missing sub-part boundary delimiter '--{}--'",
-                                b
-                            ));
-                        }
-                    }
+        if part.offset_header() > 0 && is_multipart_part(&part) {
+            let ct = part.content_type().unwrap();
+            let b = match ct.attribute("boundary") {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    return Err(
+                        "Malformed multipart MIME: missing required 'boundary' parameter in part Content-Type header"
+                            .to_string(),
+                    );
                 }
+            };
+
+            let (open_lines, close_lines) = find_boundary_lines(raw_bytes, b);
+            if open_lines.is_empty() {
+                return Err(format!(
+                    "Malformed multipart MIME: sub-part boundary delimiter '--{}' not found in message",
+                    b
+                ));
+            }
+            if close_lines.is_empty() {
+                return Err(format!(
+                    "Incomplete multipart MIME: missing sub-part boundary delimiter '--{}--'",
+                    b
+                ));
+            }
+
+            let non_leaf_close: Vec<usize> = close_lines
+                .into_iter()
+                .filter(|&pos| !is_inside_leaf(pos))
+                .collect();
+
+            if non_leaf_close.is_empty() {
+                return Err(format!(
+                    "Incomplete multipart MIME: missing sub-part boundary delimiter '--{}--'",
+                    b
+                ));
+            }
+
+            // For sub-parts, the closing boundary must occur within this container's span and after all its child parts
+            let sub_start = part.offset_body() as usize;
+            let sub_end = part.offset_end() as usize;
+
+            let max_sub_child_end = msg
+                .parts()
+                .filter(|c| {
+                    (c.offset_header() as usize) >= sub_start
+                        && (c.offset_end() as usize) <= sub_end
+                        && (c.offset_header() as usize) != (part.offset_header() as usize)
+                })
+                .map(|c| c.offset_end() as usize)
+                .max()
+                .unwrap_or(sub_start);
+
+            let valid_sub_close = non_leaf_close
+                .into_iter()
+                .find(|&pos| pos >= max_sub_child_end && pos <= sub_end);
+
+            let valid_close_pos = match valid_sub_close {
+                Some(p) => p,
+                None => {
+                    return Err(format!(
+                        "Incomplete multipart MIME: missing sub-part boundary delimiter '--{}--'",
+                        b
+                    ));
+                }
+            };
+
+            if open_lines
+                .iter()
+                .any(|&open_pos| open_pos > valid_close_pos)
+            {
+                return Err(format!(
+                    "Malformed multipart MIME: sub-part opening delimiter '--{}' appears after closing delimiter",
+                    b
+                ));
             }
         }
     }
@@ -1044,6 +1228,7 @@ fn validate_attachment_encoding(
 mod tests {
     use super::*;
     use raxosentinel_core::{ResourceLimits, ThreatCategory};
+    use std::io::Write;
 
     #[test]
     fn test_scan_plain_clean_email() {
@@ -1676,5 +1861,271 @@ Hello world=ZZ invalid escape\r\n\
         assert_eq!(report.status, ScanStatus::Unsupported);
         assert_eq!(report.sub_targets.len(), 1);
         assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
+    }
+
+    fn base64_encode(data: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+            out.push(ALPHABET[(b0 >> 2) as usize] as char);
+            out.push(ALPHABET[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(ALPHABET[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    // ---------------------------------------------------------------------------
+    // Fix 3 Validation Tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_valid_multipart_message() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"VALID_BOUND\"\r\n\r\n\
+--VALID_BOUND\r\n\
+Content-Type: text/plain; charset=\"utf-8\"\r\n\r\n\
+Clean body content.\r\n\
+--VALID_BOUND--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("valid.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert!(report.threats.is_empty());
+    }
+
+    #[test]
+    fn test_missing_closing_boundary() {
+        let raw_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Some body text without closing boundary delimiter.";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(raw_mime, Some("missing_close.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing closing boundary delimiter '--BOUND--'"));
+    }
+
+    #[test]
+    fn test_closing_delimiter_embedded_inside_body() {
+        // Substring inside ordinary body line must not satisfy closing boundary check
+        let raw_mime1 = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Here is some text with --BOUND-- embedded in the middle of a line.\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let mut tracker1 = ResourceTracker::new(ResourceLimits::default());
+
+        let report1 = scanner
+            .scan_bytes(raw_mime1, Some("embedded_in_line.eml"), &mut tracker1)
+            .unwrap();
+
+        assert_eq!(report1.status, ScanStatus::Unsupported);
+        assert!(report1
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing closing boundary delimiter '--BOUND--'"));
+
+        // Boundary delimiter text followed by additional parts without final closing delimiter
+        let raw_mime2 = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+First part.\r\n\
+--BOUND--\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Second part after closing delimiter line.\r\n";
+
+        let mut tracker2 = ResourceTracker::new(ResourceLimits::default());
+        let report2 = scanner
+            .scan_bytes(raw_mime2, Some("embedded_middle.eml"), &mut tracker2)
+            .unwrap();
+
+        assert_eq!(report2.status, ScanStatus::Unsupported);
+    }
+
+    #[test]
+    fn test_nested_multipart_message() {
+        let valid_nested = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n\r\n\
+--OUTER\r\n\
+Content-Type: multipart/alternative; boundary=\"INNER\"\r\n\r\n\
+--INNER\r\n\
+Content-Type: text/plain\r\n\r\n\
+Plain text version.\r\n\
+--INNER\r\n\
+Content-Type: text/html\r\n\r\n\
+<b>HTML version</b>\r\n\
+--INNER--\r\n\
+--OUTER\r\n\
+Content-Type: text/plain; name=\"note.txt\"\r\n\
+Content-Disposition: attachment; filename=\"note.txt\"\r\n\r\n\
+Attachment content.\r\n\
+--OUTER--\r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+
+        let report = scanner
+            .scan_bytes(valid_nested, Some("nested.eml"), &mut tracker)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean);
+
+        // Nested message where inner closing boundary delimiter is missing
+        let missing_inner = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n\r\n\
+--OUTER\r\n\
+Content-Type: multipart/alternative; boundary=\"INNER\"\r\n\r\n\
+--INNER\r\n\
+Content-Type: text/plain\r\n\r\n\
+Plain text version.\r\n\
+--OUTER\r\n\
+Content-Type: text/plain; name=\"note.txt\"\r\n\
+Content-Disposition: attachment; filename=\"note.txt\"\r\n\r\n\
+Attachment content.\r\n\
+--OUTER--\r\n";
+
+        let mut tracker2 = ResourceTracker::new(ResourceLimits::default());
+        let report2 = scanner
+            .scan_bytes(missing_inner, Some("missing_inner.eml"), &mut tracker2)
+            .unwrap();
+        assert_eq!(report2.status, ScanStatus::Unsupported);
+        assert!(report2
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing sub-part boundary delimiter '--INNER--'"));
+    }
+
+    #[test]
+    fn test_truncated_final_attachment() {
+        let truncated = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
+--BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Initial body.\r\n\
+--BOUND\r\n\
+Content-Type: application/octet-stream; name=\"data.bin\"\r\n\
+Content-Disposition: attachment; filename=\"data.bin\"\r\n\r\n\
+Binary data truncated right here";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(truncated, Some("truncated_att.eml"), &mut tracker)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert!(report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing closing boundary delimiter '--BOUND--'"));
+    }
+
+    #[test]
+    fn test_valid_crlf_formatting() {
+        // Test RFC 2046 compliant CRLF formatting with optional linear whitespace before line ends
+        let crlf_mime = b"MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"CRLF_BOUND\"\r\n\r\n\
+--CRLF_BOUND \r\n\
+Content-Type: text/plain\r\n\r\n\
+Clean line 1\r\n\
+Clean line 2\r\n\
+--CRLF_BOUND--  \t  \r\n";
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(crlf_mime, Some("crlf.eml"), &mut tracker)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean);
+    }
+
+    #[test]
+    fn test_zip_attachment_detection_preserved() {
+        let eicar_bytes = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip_writer = zip::ZipWriter::new(&mut zip_buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip_writer.start_file("eicar.com", options).unwrap();
+            zip_writer.write_all(eicar_bytes).unwrap();
+            zip_writer.finish().unwrap();
+        }
+        let zip_bytes = zip_buf.into_inner();
+        let encoded_zip = base64_encode(&zip_bytes);
+
+        let mime = format!(
+            "MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"ZIP_BOUND\"\r\n\r\n\
+--ZIP_BOUND\r\n\
+Content-Type: text/plain\r\n\r\n\
+Please review the attached archive.\r\n\
+--ZIP_BOUND\r\n\
+Content-Type: application/zip; name=\"test.zip\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"test.zip\"\r\n\r\n\
+{}\r\n\
+--ZIP_BOUND--\r\n",
+            encoded_zip
+        );
+
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let limits = ResourceLimits::default();
+        let mut tracker = ResourceTracker::new(limits);
+
+        let report = scanner
+            .scan_bytes(mime.as_bytes(), Some("zip_threat.eml"), &mut tracker)
+            .unwrap();
+
+        assert_eq!(report.status, ScanStatus::Infected);
+        assert!(report.threats.iter().any(|t| t.name.contains("EICAR")));
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Infected);
     }
 }

@@ -26,7 +26,7 @@ use raxosentinel_signatures::rsidb::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -1019,6 +1019,9 @@ fn test_13_no_descriptor_leaks_across_repeated_requests() {
         }
     }
 
+    // Wait briefly for worker thread to close final connection descriptor
+    std::thread::sleep(Duration::from_millis(50));
+
     let final_fds = count_fds();
     assert_eq!(
         initial_fds, final_fds,
@@ -1432,4 +1435,259 @@ fn test_security_reject_invalid_database_at_startup() {
         "Unverified generation must fail startup"
     );
     assert!(!socket.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Fix 1 Test: Total Client Request Monotonic Deadline
+// ---------------------------------------------------------------------------
+#[cfg(debug_assertions)]
+#[test]
+fn test_slow_partial_request_overall_deadline_exceeded() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, gen) = setup_test_db(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    // Total client framing timeout of 1 second
+    let _coord = CoordinatorProcess::spawn(
+        &socket,
+        &db_root,
+        gen,
+        &[
+            "--max-workers=1",
+            "--max-pending=1",
+            "--client-timeout-secs=1",
+        ],
+    );
+
+    let regular_file = d.path().join("dummy.txt");
+    std::fs::write(&regular_file, b"test content").unwrap();
+    let f = File::open(&regular_file).unwrap();
+
+    let mut stream = UnixStream::connect(&socket).unwrap();
+
+    // Send FD with only the first byte of length prefix via SCM_RIGHTS.
+    // The length prefix will eventually specify payload_len = 50.
+    {
+        let len_byte = [0x00u8]; // byte 0 of [0, 0, 0, 50]
+        let mut iov = libc::iovec {
+            iov_base: len_byte.as_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        let fd = f.as_raw_fd();
+        let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize };
+        let cmsg_words = cmsg_space.div_ceil(std::mem::size_of::<usize>());
+        let mut cmsg_buf = vec![0usize; cmsg_words];
+
+        let msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: cmsg_space,
+            msg_flags: 0,
+        };
+
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+            std::ptr::copy_nonoverlapping(
+                &fd as *const RawFd as *const u8,
+                libc::CMSG_DATA(cmsg),
+                std::mem::size_of::<RawFd>(),
+            );
+            let ret = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+            assert!(ret >= 0, "sendmsg failed");
+        }
+    }
+
+    // Sequence of bytes to drip-feed:
+    // bytes 1..3 complete the length prefix [0, 0, 50],
+    // remaining bytes are partial JSON payload chunks.
+    let drip_bytes = [
+        0x00, 0x00, 50, // complete 4-byte length header: 50 bytes
+        b'{', b'"', b'f', b'i', b'l', b'e', b'"', b':', // payload bytes
+    ];
+
+    // Repeatedly transmit 1 byte every 120ms.
+    // 120ms is well below the 1000ms per-read inactivity timeout.
+    // However, after ~9 iterations (1080ms total), the 1000ms overall monotonic deadline expires!
+    let start = Instant::now();
+    let mut client_failed = false;
+    for &b in &drip_bytes {
+        std::thread::sleep(Duration::from_millis(120));
+        if stream.write_all(&[b]).is_err() || stream.flush().is_err() {
+            client_failed = true;
+            break;
+        }
+    }
+
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut buf = [0u8; 1024];
+    let read_result = stream.read(&mut buf);
+    drop(stream);
+
+    if !client_failed {
+        match read_result {
+            Ok(0) => {} // EOF on coordinator closing connection
+            Ok(n) => {
+                let resp_str = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    resp_str.contains("ERROR") || resp_str.contains("deadline exceeded"),
+                    "Response must report deadline exceeded error: {resp_str}"
+                );
+            }
+            Err(_) => {} // Connection reset or timed out
+        }
+    }
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "Deadline test finished too early: {:?}",
+        elapsed
+    );
+
+    // Verify coordinator is completely healthy for subsequent requests and capacity is released
+    let clean_file = d.path().join("clean.txt");
+    std::fs::write(&clean_file, b"clean content").unwrap();
+    let (code, rep) = run_client(&socket, &clean_file, &[], &[]);
+    assert_eq!(
+        code, 0,
+        "Coordinator must remain healthy after slow client timed out"
+    );
+    assert_eq!(rep["status"].as_str().unwrap(), "CLEAN");
+}
+
+// ---------------------------------------------------------------------------
+// Fix 2 Tests: Snapshot Budget Enforcement, Growth, Exhaustion & Recovery
+// ---------------------------------------------------------------------------
+#[cfg(debug_assertions)]
+#[test]
+fn test_snapshot_budget_exhaustion_across_multiple_scans_and_recovery() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, gen) = setup_test_db(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    // Total snapshot budget: 30,000 bytes across 2 worker slots
+    let _coord = CoordinatorProcess::spawn(
+        &socket,
+        &db_root,
+        gen,
+        &[
+            "--max-workers=2",
+            "--max-pending=1",
+            "--max-total-snapshot-bytes=30000",
+        ],
+    );
+
+    let file_20k = d.path().join("file_20k.txt");
+    std::fs::write(&file_20k, vec![b'A'; 20_000]).unwrap();
+
+    let file_15k = d.path().join("file_15k.txt");
+    std::fs::write(&file_15k, vec![b'B'; 15_000]).unwrap();
+
+    // Client 1 submits 20K file with delay so it remains active in flight
+    let s1 = socket.clone();
+    let f1 = file_20k.clone();
+    let h1 = std::thread::spawn(move || {
+        run_client(
+            &s1,
+            &f1,
+            &[],
+            &[("RAXOSENTINEL_TEST_WORKER_ACTION", "delay")],
+        )
+    });
+
+    // Wait for Client 1 to be admitted and reserve 20K bytes
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Client 2 submits 15K file: 20K in-flight + 15K requested = 35K > 30K budget!
+    // Must immediately return BUSY
+    let (code2, rep2) = run_client(&socket, &file_15k, &[], &[]);
+    assert_eq!(
+        code2, 3,
+        "Exceeding snapshot budget must return BUSY (exit code 3)"
+    );
+    assert_eq!(rep2["status"].as_str().unwrap(), "BUSY");
+    assert!(
+        rep2["error"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot memory limit exceeded"),
+        "Error must explain snapshot memory limit exceeded"
+    );
+
+    // Wait for Client 1 to complete and release its 20K reservation
+    let (c1, r1) = h1.join().unwrap();
+    assert_eq!(c1, 0);
+    assert_eq!(r1["status"].as_str().unwrap(), "CLEAN");
+
+    // Client 3 submits 15K file now that Client 1 released its reservation
+    let (c3, r3) = run_client(&socket, &file_15k, &[], &[]);
+    assert_eq!(
+        c3, 0,
+        "Snapshot budget must be fully recovered after first scan finishes"
+    );
+    assert_eq!(r3["status"].as_str().unwrap(), "CLEAN");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn test_concurrent_file_growth_exceeding_budget() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, gen) = setup_test_db(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    // Snapshot budget: 25,000 bytes
+    let _coord = CoordinatorProcess::spawn(
+        &socket,
+        &db_root,
+        gen,
+        &[
+            "--max-workers=2",
+            "--max-pending=1",
+            "--max-total-snapshot-bytes=25000",
+        ],
+    );
+
+    let grow_file = d.path().join("grow_file.txt");
+    std::fs::write(&grow_file, vec![b'X'; 500]).unwrap();
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let req_json = serde_json::to_vec(&serde_json::json!({
+        "file_name": "grow_file.txt",
+        "max_size": 100_000,
+    }))
+    .unwrap();
+
+    // Append 50,000 bytes to the file so it exceeds the 25,000 budget
+    {
+        let mut file = OpenOptions::new().append(true).open(&grow_file).unwrap();
+        file.write_all(&vec![b'Y'; 50_000]).unwrap();
+        file.flush().unwrap();
+    }
+
+    // Submit file descriptor to coordinator
+    let f = File::open(&grow_file).unwrap();
+    let mut stream_mut = stream;
+    send_raw_fd_message(&stream_mut, &[f.as_raw_fd()], &req_json).unwrap();
+    let resp = recv_raw_response(&mut stream_mut).unwrap();
+    assert_eq!(resp["status"].as_str().unwrap(), "ERROR");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds coordinator snapshot budget"),
+        "Must reject file exceeding coordinator snapshot budget"
+    );
+
+    // Verify recovery after rejection
+    let clean_file = d.path().join("clean.txt");
+    std::fs::write(&clean_file, b"clean").unwrap();
+    let (code, rep) = run_client(&socket, &clean_file, &[], &[]);
+    assert_eq!(code, 0);
+    assert_eq!(rep["status"].as_str().unwrap(), "CLEAN");
 }

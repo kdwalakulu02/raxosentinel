@@ -18,7 +18,8 @@
 
 use super::print_human_report;
 use super::supervised::{
-    error_report, execute_worker_on_snapshot, sealed_snapshot, SupervisedWorkerConfig,
+    error_report, execute_worker_on_snapshot, sealed_snapshot_with_budget, SnapshotBudget,
+    SupervisedWorkerConfig,
 };
 use clap::Args;
 use raxosentinel_core::{ScanReport, ScanStatus};
@@ -35,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAX_REQUEST_PAYLOAD: usize = 65_536; // 64 KiB
 pub const MAX_RESPONSE_PAYLOAD: usize = 2 * 1024 * 1024; // 2 MiB
@@ -454,8 +455,12 @@ pub fn send_fd_request(
     Ok(())
 }
 
-/// Receive request data and file descriptor over Unix socket via SCM_RIGHTS.
-pub fn recv_fd_request(stream: &mut UnixStream) -> Result<(ScanRequest, RawFd), String> {
+/// Receive request data and file descriptor over Unix socket via SCM_RIGHTS,
+/// enforcing a total monotonic deadline across the entire receive operation.
+pub fn recv_fd_request(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<(ScanRequest, RawFd), String> {
     // Sized for up to 8 FDs to detect extra descriptors
     let cmsg_space =
         unsafe { libc::CMSG_SPACE((8 * std::mem::size_of::<RawFd>()) as u32) as usize };
@@ -478,12 +483,23 @@ pub fn recv_fd_request(stream: &mut UnixStream) -> Result<(ScanRequest, RawFd), 
         msg_flags: 0,
     };
 
+    let remaining = match deadline.checked_duration_since(Instant::now()) {
+        Some(d) if !d.is_zero() => d,
+        _ => return Err("Client request deadline exceeded".into()),
+    };
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|e| format!("Failed to set read timeout: {e}"))?;
+
     let ret = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
     if ret < 0 {
-        return Err(format!(
-            "recvmsg failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock
+            || err.kind() == std::io::ErrorKind::TimedOut
+        {
+            return Err("Client request deadline exceeded".into());
+        }
+        return Err(format!("recvmsg failed: {}", err));
     }
     let bytes_read = ret as usize;
     if bytes_read == 0 {
@@ -535,6 +551,14 @@ pub fn recv_fd_request(stream: &mut UnixStream) -> Result<(ScanRequest, RawFd), 
     // Read remaining bytes if length prefix was incomplete
     let mut total_bytes = initial_buf[..bytes_read].to_vec();
     while total_bytes.len() < 4 {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => {
+                close_all(&[raw_fd]);
+                return Err("Client request deadline exceeded".into());
+            }
+        };
+        let _ = stream.set_read_timeout(Some(remaining));
         let mut chunk = [0u8; 4];
         match stream.read(&mut chunk[..4 - total_bytes.len()]) {
             Ok(0) => {
@@ -542,6 +566,13 @@ pub fn recv_fd_request(stream: &mut UnixStream) -> Result<(ScanRequest, RawFd), 
                 return Err("Connection truncated before request length header".into());
             }
             Ok(n) => total_bytes.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                close_all(&[raw_fd]);
+                return Err("Client request deadline exceeded".into());
+            }
             Err(e) => {
                 close_all(&[raw_fd]);
                 return Err(format!("Read failed: {e}"));
@@ -566,6 +597,14 @@ pub fn recv_fd_request(stream: &mut UnixStream) -> Result<(ScanRequest, RawFd), 
 
     let mut payload = total_bytes[4..].to_vec();
     while payload.len() < payload_len {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => {
+                close_all(&[raw_fd]);
+                return Err("Client request deadline exceeded".into());
+            }
+        };
+        let _ = stream.set_read_timeout(Some(remaining));
         let needed = payload_len - payload.len();
         let mut chunk = vec![0u8; needed.min(4096)];
         match stream.read(&mut chunk) {
@@ -574,6 +613,13 @@ pub fn recv_fd_request(stream: &mut UnixStream) -> Result<(ScanRequest, RawFd), 
                 return Err("Connection truncated before request payload complete".into());
             }
             Ok(n) => payload.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                close_all(&[raw_fd]);
+                return Err("Client request deadline exceeded".into());
+            }
             Err(e) => {
                 close_all(&[raw_fd]);
                 return Err(format!("Read failed: {e}"));
@@ -693,18 +739,47 @@ impl SnapshotReservation {
         })
     }
 
-    pub fn update(&mut self, actual_bytes: u64) {
-        let (lock, cvar) = &*self.state;
-        let mut guard = lock.lock().unwrap();
-        if actual_bytes > self.reserved_bytes {
-            let diff = actual_bytes - self.reserved_bytes;
-            guard.in_flight_snapshot_bytes = guard.in_flight_snapshot_bytes.saturating_add(diff);
-        } else if actual_bytes < self.reserved_bytes {
-            let diff = self.reserved_bytes - actual_bytes;
-            guard.in_flight_snapshot_bytes = guard.in_flight_snapshot_bytes.saturating_sub(diff);
+    #[allow(dead_code)]
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes
+    }
+}
+
+impl SnapshotBudget for SnapshotReservation {
+    fn ensure_capacity(&mut self, new_total: u64) -> Result<(), String> {
+        if new_total > self.reserved_bytes {
+            let extra = new_total - self.reserved_bytes;
+            let (lock, _cvar) = &*self.state;
+            let mut guard = lock.lock().unwrap();
+            let new_in_flight = guard
+                .in_flight_snapshot_bytes
+                .checked_add(extra)
+                .ok_or_else(|| "Snapshot byte counter overflow".to_string())?;
+            if new_in_flight > guard.max_total_snapshot_bytes {
+                return Err(format!(
+                    "Snapshot memory budget exceeded: growing file requires {} bytes, exceeding coordinator budget (current in-flight: {} bytes, limit: {} bytes)",
+                    new_total, guard.in_flight_snapshot_bytes, guard.max_total_snapshot_bytes
+                ));
+            }
+            guard.in_flight_snapshot_bytes = new_in_flight;
+            self.reserved_bytes = new_total;
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self, final_total: u64) {
+        if final_total < self.reserved_bytes {
+            let excess = self.reserved_bytes - final_total;
+            let (lock, cvar) = &*self.state;
+            let mut guard = lock.lock().unwrap();
+            if let Some(rem) = guard.in_flight_snapshot_bytes.checked_sub(excess) {
+                guard.in_flight_snapshot_bytes = rem;
+            } else {
+                guard.in_flight_snapshot_bytes = 0;
+            }
+            self.reserved_bytes = final_total;
             cvar.notify_all();
         }
-        self.reserved_bytes = actual_bytes;
     }
 }
 
@@ -713,9 +788,14 @@ impl Drop for SnapshotReservation {
         if self.reserved_bytes > 0 {
             let (lock, cvar) = &*self.state;
             let mut guard = lock.lock().unwrap();
-            guard.in_flight_snapshot_bytes = guard
+            if let Some(rem) = guard
                 .in_flight_snapshot_bytes
-                .saturating_sub(self.reserved_bytes);
+                .checked_sub(self.reserved_bytes)
+            {
+                guard.in_flight_snapshot_bytes = rem;
+            } else {
+                guard.in_flight_snapshot_bytes = 0;
+            }
             self.reserved_bytes = 0;
             cvar.notify_all();
         }
@@ -762,10 +842,10 @@ fn handle_client_connection(
     client_timeout_secs: u64,
     shared_state: &Arc<(Mutex<CoordinatorState>, Condvar)>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(client_timeout_secs)));
+    let deadline = Instant::now() + Duration::from_secs(client_timeout_secs);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-    let (request, raw_fd) = match recv_fd_request(&mut stream) {
+    let (request, raw_fd) = match recv_fd_request(&mut stream, deadline) {
         Ok(pair) => pair,
         Err(e) => {
             let resp = CoordinatorResponse {
@@ -866,7 +946,7 @@ fn handle_client_connection(
 
     let source = unsafe { File::from_raw_fd(raw_fd) };
 
-    let snapshot = match sealed_snapshot(source, max_size) {
+    let snapshot = match sealed_snapshot_with_budget(source, max_size, &mut reservation) {
         Ok(snap) => snap,
         Err(e) => {
             let target_path = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
@@ -880,10 +960,6 @@ fn handle_client_connection(
             return;
         }
     };
-
-    if let Ok(meta) = snapshot.metadata() {
-        reservation.update(meta.len());
-    }
 
     let target_name = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
     let mut effective_config = worker_config.clone();
@@ -1225,5 +1301,111 @@ pub fn client(args: ClientArgs) -> i32 {
         CoordinatorVerdict::Detected => 1,
         CoordinatorVerdict::Unscanned => 2,
         CoordinatorVerdict::Error | CoordinatorVerdict::Busy => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Seek;
+
+    #[test]
+    fn test_snapshot_reservation_accounting_and_lifecycle() {
+        let state = Arc::new((
+            Mutex::new(CoordinatorState {
+                pending_queue: VecDeque::new(),
+                max_pending: 2,
+                active_workers: 0,
+                max_workers: 2,
+                in_flight_snapshot_bytes: 0,
+                max_total_snapshot_bytes: 10_000,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+
+        // 1. Initial reservation within budget
+        let mut res = SnapshotReservation::new(Arc::clone(&state), 4_000).unwrap();
+        assert_eq!(res.reserved_bytes(), 4_000);
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 4_000);
+
+        // 2. Incremental capacity growth within budget
+        res.ensure_capacity(7_000).unwrap();
+        assert_eq!(res.reserved_bytes(), 7_000);
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 7_000);
+
+        // 3. Growth exceeding budget is rejected and does not mutate reservation
+        let err = res.ensure_capacity(12_000).unwrap_err();
+        assert!(err.contains("Snapshot memory budget exceeded"));
+        assert_eq!(res.reserved_bytes(), 7_000);
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 7_000);
+
+        // 4. Finalize downwards to actual size
+        res.finalize(5_000);
+        assert_eq!(res.reserved_bytes(), 5_000);
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 5_000);
+
+        // 5. Drop releases remaining reservation
+        drop(res);
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 0);
+    }
+
+    #[test]
+    fn test_snapshot_reservation_over_capacity_rejection() {
+        let state = Arc::new((
+            Mutex::new(CoordinatorState {
+                pending_queue: VecDeque::new(),
+                max_pending: 2,
+                active_workers: 0,
+                max_workers: 2,
+                in_flight_snapshot_bytes: 8_000,
+                max_total_snapshot_bytes: 10_000,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+
+        let res = SnapshotReservation::new(Arc::clone(&state), 3_000);
+        match res {
+            Err(ReservationError::OverCapacity(msg)) => {
+                assert!(msg.contains("snapshot memory limit exceeded"));
+            }
+            _ => panic!("Expected OverCapacity error"),
+        }
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 8_000);
+    }
+
+    #[test]
+    fn test_sealed_snapshot_with_budget_enforces_limit_during_copy() {
+        let mut tmp = tempfile::tempfile().unwrap();
+        tmp.write_all(&vec![b'Z'; 150_000]).unwrap();
+        tmp.seek(std::io::SeekFrom::Start(0)).unwrap();
+
+        let state = Arc::new((
+            Mutex::new(CoordinatorState {
+                pending_queue: VecDeque::new(),
+                max_pending: 2,
+                active_workers: 0,
+                max_workers: 2,
+                in_flight_snapshot_bytes: 0,
+                max_total_snapshot_bytes: 100_000,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+
+        // Start reservation at 50_000 bytes (simulating initial stat of 50KB)
+        let mut res = SnapshotReservation::new(Arc::clone(&state), 50_000).unwrap();
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 50_000);
+
+        // Copy 150KB file into sealed snapshot with 100KB budget
+        let result = sealed_snapshot_with_budget(tmp, 200_000, &mut res);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Snapshot memory budget exceeded"));
+
+        // Dropping res restores in_flight_snapshot_bytes to 0
+        drop(res);
+        assert_eq!(state.0.lock().unwrap().in_flight_snapshot_bytes, 0);
     }
 }
