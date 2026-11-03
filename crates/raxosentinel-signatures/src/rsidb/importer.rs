@@ -98,11 +98,13 @@ impl SignatureImporter {
             }
 
             let parts: Vec<&str> = trimmed.split(':').collect();
-            if parts.len() != 3 {
-                stats.record_rejected("Malformed line format: expected 3 colon-separated fields");
+            if parts.len() != 3 && parts.len() != 4 {
+                stats.record_rejected(
+                    "Malformed line format: expected 3 or 4 colon-separated fields",
+                );
                 return Err(DatabaseError::MalformedImportRecord(
                     line_no,
-                    format!("expected 3 fields, got {}: '{}'", parts.len(), trimmed),
+                    format!("expected 3 or 4 fields, got {}: '{}'", parts.len(), trimmed),
                 ));
             }
 
