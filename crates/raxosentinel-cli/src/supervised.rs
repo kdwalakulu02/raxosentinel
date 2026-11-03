@@ -6,11 +6,30 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct SupervisedWorkerConfig {
+    pub worker_memory: u64,
+    pub worker_timeout_ms: u64,
+    pub max_size: Option<u64>,
+    pub timeout: Option<u64>,
+    pub max_depth: Option<usize>,
+    pub rules: Option<PathBuf>,
+    pub private_db_root: Option<PathBuf>,
+    pub private_generation: Option<String>,
+    pub public_release: Option<PathBuf>,
+    pub public_key: Option<PathBuf>,
+    pub public_approval_key: Option<PathBuf>,
+    pub public_state: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    pub test_worker_action: Option<String>,
+}
 
 /// Once trusted database loading is complete, deny new filesystem access during parsing.
 pub fn restrict_worker_filesystem() -> Result<(), String> {
@@ -59,14 +78,11 @@ pub fn restrict_worker_filesystem() -> Result<(), String> {
     Ok(())
 }
 
-fn error_report(args: &ScanArgs, message: String) -> ScanReport {
+pub fn error_report(target: &Path, message: String) -> ScanReport {
     ScanReport::new(
         TargetMetadata {
-            path: Some(args.target.display().to_string()),
-            file_name: args
-                .target
-                .file_name()
-                .map(|v| v.to_string_lossy().into_owned()),
+            path: Some(target.display().to_string()),
+            file_name: target.file_name().map(|v| v.to_string_lossy().into_owned()),
             file_size_bytes: 0,
             sha256: String::new(),
             detected_mime: "application/unknown".into(),
@@ -82,7 +98,7 @@ fn error_report(args: &ScanArgs, message: String) -> ScanReport {
 
 pub fn run(args: &ScanArgs) -> i32 {
     let result = run_inner(args);
-    let report = result.unwrap_or_else(|e| error_report(args, e));
+    let report = result.unwrap_or_else(|e| error_report(&args.target, e));
     if args.json {
         match report.to_json_pretty() {
             Ok(json) => println!("{json}"),
@@ -95,7 +111,7 @@ pub fn run(args: &ScanArgs) -> i32 {
 }
 
 // Snapshot bytes into a sealed anonymous file before the worker is created.
-fn sealed_snapshot(mut source: File, max_size: u64) -> Result<File, String> {
+pub fn sealed_snapshot(mut source: File, max_size: u64) -> Result<File, String> {
     let name = c"raxosentinel-input";
     let fd =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
@@ -171,40 +187,64 @@ fn run_inner(args: &ScanArgs) -> Result<ScanReport, String> {
         return Err("Target exceeds file size limit".into());
     }
     let file = sealed_snapshot(file, args.max_size.unwrap_or(50 * 1024 * 1024))?;
+    let config = SupervisedWorkerConfig {
+        worker_memory: args.worker_memory,
+        worker_timeout_ms: args.worker_timeout_ms,
+        max_size: args.max_size,
+        timeout: args.timeout,
+        max_depth: args.max_depth,
+        rules: args.rules.clone(),
+        private_db_root: args.private_db_root.clone(),
+        private_generation: args.private_generation.clone(),
+        public_release: args.public_release.clone(),
+        public_key: args.public_key.clone(),
+        public_approval_key: args.public_approval_key.clone(),
+        public_state: args.public_state.clone(),
+        #[cfg(debug_assertions)]
+        test_worker_action: None,
+    };
+    execute_worker_on_snapshot(file, &args.target, &config)
+}
+
+pub fn execute_worker_on_snapshot(
+    snapshot: File,
+    target_name: &Path,
+    config: &SupervisedWorkerConfig,
+) -> Result<ScanReport, String> {
     let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command
         .arg("scan")
-        .arg(&args.target)
+        .arg(target_name)
         .arg("--worker-internal")
         .arg("--json");
-    if let Some(v) = args.max_size {
+    if let Some(v) = config.max_size {
         command.arg("--max-size").arg(v.to_string());
     }
-    if let Some(v) = args.timeout {
+    if let Some(v) = config.timeout {
         command.arg("--timeout").arg(v.to_string());
     }
-    if let Some(v) = args.max_depth {
+    if let Some(v) = config.max_depth {
         command.arg("--max-depth").arg(v.to_string());
     }
-    if let Some(v) = &args.rules {
+    if let Some(v) = &config.rules {
         command.arg("--rules").arg(v);
     }
-    if let Some(v) = &args.private_db_root {
+    if let Some(v) = &config.private_db_root {
         command.arg("--private-db-root").arg(v);
     }
-    if let Some(v) = &args.private_generation {
+    if let Some(v) = &config.private_generation {
         command.arg("--private-generation").arg(v);
     }
-    if let Some(v) = &args.public_release {
+    if let Some(v) = &config.public_release {
         command.arg("--public-release").arg(v);
     }
-    if let Some(v) = &args.public_key {
+    if let Some(v) = &config.public_key {
         command.arg("--public-key").arg(v);
     }
-    if let Some(v) = &args.public_approval_key {
+    if let Some(v) = &config.public_approval_key {
         command.arg("--public-approval-key").arg(v);
     }
-    if let Some(v) = &args.public_state {
+    if let Some(v) = &config.public_state {
         command.arg("--public-state").arg(v);
     }
     if command
@@ -217,14 +257,16 @@ fn run_inner(args: &ScanArgs) -> Result<ScanReport, String> {
     }
     command.env_clear();
     #[cfg(debug_assertions)]
-    if let Some(action) = std::env::var_os("RAXOSENTINEL_TEST_WORKER_ACTION") {
+    if let Some(ref action) = config.test_worker_action {
+        command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
+    } else if let Some(action) = std::env::var_os("RAXOSENTINEL_TEST_WORKER_ACTION") {
         command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
     }
     command
-        .stdin(Stdio::from(file))
+        .stdin(Stdio::from(snapshot))
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let limit = args.worker_memory;
+    let limit = config.worker_memory;
     // pre_exec runs in the child immediately before exec; setrlimit is async-signal-safe.
     unsafe {
         command.pre_exec(move || {
@@ -266,7 +308,7 @@ fn run_inner(args: &ScanArgs) -> Result<ScanReport, String> {
         terminate_group(&mut child);
         return Err("Cannot configure worker response pipe".into());
     }
-    let deadline = Duration::from_millis(args.worker_timeout_ms);
+    let deadline = Duration::from_millis(config.worker_timeout_ms);
     let mut bytes = Vec::new();
     let mut eof = false;
     let status = loop {

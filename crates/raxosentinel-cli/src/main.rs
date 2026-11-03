@@ -56,6 +56,10 @@ struct Cli {
 enum Commands {
     /// Scan a target file or email message
     Scan(ScanArgs),
+    /// Run persistent local scanner coordinator service
+    Serve(coordinator::ServeArgs),
+    /// Submit a file to a running scanner service via Unix socket
+    Client(coordinator::ClientArgs),
     /// RSIDB database management (verify, build, install, rollback)
     #[command(subcommand)]
     Db(DbCommand),
@@ -274,6 +278,10 @@ struct ScanArgs {
     /// RSIDB store directory managed by `db install` (uses current, falls back to previous)
     #[arg(long, env = "RAXOSENTINEL_DB_STORE")]
     db_store: Option<PathBuf>,
+
+    /// Connect to a persistent scanner coordinator service over Unix socket
+    #[arg(long, env = "RAXOSENTINEL_SOCKET")]
+    socket: Option<PathBuf>,
 }
 
 fn main() {
@@ -295,11 +303,51 @@ fn main() {
             let exit_code = run_scan(args);
             process::exit(exit_code);
         }
+        Commands::Serve(args) => {
+            #[cfg(target_os = "linux")]
+            process::exit(coordinator::serve(args));
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("Coordinator service requires Linux");
+                process::exit(3);
+            }
+        }
+        Commands::Client(args) => {
+            #[cfg(target_os = "linux")]
+            process::exit(coordinator::client(args));
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("Coordinator client requires Linux");
+                process::exit(3);
+            }
+        }
         Commands::Db(cmd) => process::exit(run_db(cmd)),
     }
 }
 
 fn run_scan(args: ScanArgs) -> i32 {
+    if let Some(ref sock) = args.socket {
+        #[cfg(target_os = "linux")]
+        {
+            let client_args = coordinator::ClientArgs {
+                socket: sock.clone(),
+                target: args.target,
+                json: args.json,
+                max_size: args.max_size,
+                timeout: args.timeout,
+                max_depth: args.max_depth,
+                #[cfg(debug_assertions)]
+                test_worker_action: std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION").ok(),
+            };
+            return coordinator::client(client_args);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("Coordinator client requires Linux");
+            return 3;
+        }
+    }
+
     #[cfg(debug_assertions)]
     if args.worker_internal {
         if let Ok(action) = std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION") {
@@ -585,6 +633,35 @@ mod supervised {
     pub fn run(_: &super::ScanArgs) -> i32 {
         eprintln!("Supervised scanning requires Linux");
         3
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod coordinator;
+#[cfg(not(target_os = "linux"))]
+mod coordinator {
+    use clap::Args;
+    use std::path::PathBuf;
+
+    #[derive(Args, Debug, Clone)]
+    pub struct ServeArgs {
+        #[arg(long)]
+        pub socket: PathBuf,
+    }
+
+    #[derive(Args, Debug, Clone)]
+    pub struct ClientArgs {
+        #[arg(long)]
+        pub socket: PathBuf,
+        pub target: PathBuf,
+        #[arg(long)]
+        pub json: bool,
+        #[arg(long)]
+        pub max_size: Option<u64>,
+        #[arg(long)]
+        pub timeout: Option<u64>,
+        #[arg(long)]
+        pub max_depth: Option<usize>,
     }
 }
 
