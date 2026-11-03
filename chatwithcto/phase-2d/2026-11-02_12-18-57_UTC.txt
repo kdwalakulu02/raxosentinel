@@ -1,0 +1,78 @@
+RaxoSentinel — Phase 2D CTO Handover
+
+1. Executive Summary
+
+Implemented a metadata-only authenticated MalwareBazaar importer that compiles
+and verifies an RSIDB file for private research. Offline tests pass. Live
+acquisition is pending because the API key is absent. Phase 2D should not yet be
+considered fully verified: live API behaviour and some validation and error paths
+have not been exercised, as detailed below.
+
+2. Development Environment
+
+Rust 1.99.1, Cargo, rustfmt, Clippy and rust-analyzer are installed. The committed
+.devcontainer/devcontainer.json uses the official Rust Dev Container Feature and
+a Ubuntu 24.04 base. A new Codespace has not been built to verify it.
+
+3. Implementation
+
+Files changed: .devcontainer/devcontainer.json; Cargo.lock;
+crates/raxosentinel-signatures/Cargo.toml and src/rsidb/{mod.rs,ingest.rs,
+malwarebazaar.rs}; crates/raxosentinel-cli/src/main.rs,
+src/bin/malwarebazaar_import.rs, tests/{integration_test.rs,
+malwarebazaar_import.rs}; docs/{MALWAREBAZAAR.md,SOURCE_LICENSING.md}.
+
+The importer POSTs get_recent/100 to the fixed official HTTPS API, authenticates
+with RAXO_ABUSECH_AUTH_KEY, uses timeouts, disallows redirects, bounds responses,
+and does not request malware binaries. It validates SHA-256 and positive numeric
+file sizes, rejects duplicate hashes and quarantined digests, retains supplied
+metadata, compiles with the existing RSIDB compiler, and validates the result.
+Output is created exclusively with private permissions. Existing scanner lookup
+can consume the resulting RSIDB. Operator-supplied source certification no longer
+promotes a local manifest to genuine status.
+
+4. Threat Intelligence
+
+Verified genuine records acquired: 0. API key was absent; no live request was
+made. No operational synthetic records were added. One clearly synthetic
+indicator is used in an offline test; eight prior disputed indicators remain
+quarantined. No live rejected-record count is available. The source for future
+acquisitions is https://mb-api.abuse.ch/api/v1/; provenance stores the query,
+acquisition time, response hash, exact response and accepted metadata inside the
+private RSIDB. TLS authenticates the upstream during acquisition; stored
+provenance is not an independently verifiable upstream signature. Redistribution
+rights remain unverified; do not publish or redistribute the data.
+
+5. Verification
+
+cargo fmt --all -- --check: passed.
+cargo clippy --workspace --all-targets -- -D warnings: passed.
+cargo test --workspace: 95 passed, 0 failed.
+Tests cover synthetic response parsing, duplicate and malformed records,
+synthetic RSIDB compilation/lookup, missing key, and an API authentication
+status in JSON. Existing scanner and source-policy tests pass. No genuine data
+was obtained; database size, load time, memory and lookup benchmarks were not
+measured.
+
+6. Git
+
+Branch: phase-2d
+Commit: 1c59d3aa0aa5803c43c08ae6af0bfb93b7757d44
+Not pushed or merged. CTO reports remain untracked and preserved.
+
+7. Outstanding Issues
+
+Live authenticated acquisition and upstream HTTP authentication/rate-limit
+responses remain untested. Observation timestamps are required and bounded but
+are not semantically validated as calendar dates. The importer processes one
+latest-100 response per run; it does not paginate or merge multiple acquisitions.
+The RSIDB is private research-only, and filesystem permissions cannot prevent an
+operator from copying it. Stored provenance is not cryptographic proof to a third
+party. No comprehensive malware protection is claimed.
+
+8. CTO Decision Required
+
+Provide a MalwareBazaar Auth-Key through a private Codespaces secret named
+RAXO_ABUSECH_AUTH_KEY; do not paste it into chat or commit it. Then run the
+private import and verify the live response and performance. Review redistribution
+rights separately before any publication. See docs/MALWAREBAZAAR.md for usage.

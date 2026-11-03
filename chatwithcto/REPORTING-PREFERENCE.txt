@@ -1,0 +1,8 @@
+Reporting instruction from project owner
+
+Put replies and findings intended for the CTO as text reports in this chatwithcto
+folder, organized in relevant subfolders. The owner will paste the CTO's prompts.
+Keep the chat reply brief and point to the report; do not require the owner to
+read a long terminal response.
+
+Name each CTO report with its creation date and time in UTC, using YYYY-MM-DD_HH-MM-SS_UTC.txt.

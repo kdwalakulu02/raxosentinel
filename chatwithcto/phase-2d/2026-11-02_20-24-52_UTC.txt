@@ -1,0 +1,49 @@
+RaxoSentinel Phase 2D.3 core handover — 2026-11-02 UTC
+
+1. Status
+The multi-source core is implemented and verified. It merges independently validated source generations, persists source-specific associations, quarantines conflicting sizes, and publishes immutable generations. The production source adapter is MalwareBazaar; synthetic source adapters A and B are compiled only in unit tests and are explicitly classified synthetic test only. No other real feed is claimed or supported. Branch phase-2d, commit 99d1a08ca6d730817aa419ece1ed28739065cf6c.
+
+2. Registry format
+Each new generation contains database.rsidb, registry.json, associations.json, and one source-<source-id>.json evidence file per source. The version-1 registry holds stable source IDs, name, provider, acquisition method and Unix timestamp, classification, provenance qualification, redistribution status, enabled state, accepted-indicator count and evidence SHA-256. Registry and association filenames and SHA-256 digests are embedded in the RSIDB provenance manifest. Source descriptors are fixed by supported code adapters, not created by arbitrary operator labels. The existing MalwareBazaar source status means locally consistent evidence, not a provider-issued signature. Test adapters are test-only and cannot be used by production binaries.
+
+3. Source associations and scanner records
+Version-1 associations store each unique SHA-256 with sorted source-ID, size and source-specific family claims, plus a quarantine flag. Source evidence is independently parsed and associations are deterministically re-derived at every generation load; the persisted associations must match exactly. For a non-conflicting SHA-256 the scanner database contains one SHA-256/size operational record with a generic intelligence detection name, independent of source count. Family labels remain source-specific in associations. If any sources disagree about size, that entire SHA-256 is quarantined and omitted from operational scanner records; no size is silently selected. Lookup performs no source-table work. JSON tables are bounded and intended for this core, not claimed to be a compact binary representation.
+
+4. Merge and removal test results
+Synthetic source A: hash 1, hash 2, hash 3. Synthetic source B: hash 2, hash 3, hash 4. Two independent synthetic generations were validated and merged. Exact result: four operational indicators; hash 1 -> A, hash 2 -> A+B, hash 3 -> A+B, hash 4 -> B. Different family labels A2 and B2 remain separate claims. Removing source A published a NEW generation containing exactly hash 2, hash 3 and hash 4, each retained by B; hash 1 disappeared. The original merged DB remained byte-identical and reloadable with four records. Removing the last source produced a valid empty scanner generation. These are synthetic fixtures, not genuine indicators.
+
+5. Scanner and quarantine verification
+The strict private scanner loader verified the merged generation and matched all four exact hash/size pairs; wrong sizes and a negative hash missed. A scanner SignatureDatabase attachment detected actual synthetic content before and after removing source A, and missed it after removing the last source. A separate conflicting-size case quarantined the shared hash and rejected both reported sizes while retaining the non-conflicting indicator. The test checks registry classification for both synthetic sources.
+
+6. Security, publication and compatibility
+Strict loading validates RSIDB structure and payload, manifest, registry and association digests, each evidence file, supported source descriptors, re-derived associations and correspondence to the exact owned operational index. Tests reject invalid source IDs, missing evidence, and a forged source association even after the association digest and internal RSIDB checksum are recomputed. Locally consistent evidence and source labels do not independently authenticate upstream acquisition, establish malware classification, or grant redistribution permission. Private research handling remains mandatory.
+
+The new publisher uses the Phase 2D.2 owner-controlled private root and descriptor-relative, no-follow operations, writes and syncs every file, validates the staged generation, syncs its directory, performs a same-filesystem no-replace directory rename, then syncs the root. Published generations are not modified. Pre-publication failures attempt confined cleanup; ambiguous staging leftovers remain subject to the Phase 2D.2 recovery limitations. Post-rename root-sync failure reports uncertain durability. No new fault-injection or real power-loss test was added for the new multi-file publication routine.
+
+Legacy Phase 2D.2 single-source generation loading remains supported; an executable test loads and migrates a prior-format fixture. The preserved genuine 100-record Phase 2D.2 generation was migrated to a NEW private generation phase2d3-core in /home/vscode/raxosentinel-private-phase2d1 and successfully loaded by the release scanner against a benign file. Its original pair and prior generation remain untouched. No API call or malware binary download occurred.
+
+7. Commands and supported scope
+  cargo run --release -p raxosentinel-cli --bin raxosentinel -- db merge-private --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION
+Repeat --input to merge multiple generations with distinct source IDs. Duplicate source IDs are rejected.
+  cargo run --release -p raxosentinel-cli --bin raxosentinel -- db remove-private-source --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION --source SOURCE_ID
+The Rust private_store::multi::inspect API verifies and returns registry and associations. Existing db sources/db indicator commands remain limited to earlier single-source generations. No hot reload or commercial adapters were introduced.
+
+8. Tests
+cargo fmt --all -- --check: PASS.
+cargo clippy --workspace --all-targets -- -D warnings: PASS.
+cargo test --workspace: PASS, 106 passed, 0 failed, 0 ignored across 17 result groups. Four focused multi-source tests cover all ten required acceptance categories; they exercise deterministic merge, both source associations, scanner lookup and detection, source removal, size quarantine, family conflicts, invalid IDs, recomputed-checksum association forgery, missing evidence, and Phase 2D.2 compatibility.
+
+9. Files changed
+crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/multi.rs: registry, evidence-derived merge/verification, immutable publication, removal and focused tests.
+crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store.rs: strict multi-source manifest dispatch while retaining single-source verification.
+crates/raxosentinel-cli/src/main.rs: merge-private and remove-private-source operations.
+docs/private-intelligence.md: usage and current adapter limits.
+
+10. Git and data handling
+Commit 99d1a08ca6d730817aa419ece1ed28739065cf6c on phase-2d. Staged changes reviewed for credentials and private evidence; no private intelligence was committed. Earlier chatwithcto reports remain untracked and preserved. No push, merge, public intelligence publication or production infrastructure change.
+
+11. Remaining limitations
+Only MalwareBazaar is usable as a real-source adapter. The synthetic adapters are restricted to unit tests; a second independent real feed requires a separately reviewed adapter and evidence-validation policy. Local integrity digests do not provide provider-issued signatures. Current source inspection CLI commands do not inspect multi-source generations; the validated Rust API does. Merging two generations with the same source ID fails rather than choosing a refresh; select one generation for that source. No broad scale/performance study, multi-source publication fault-injection campaign, or real power-loss durability proof was performed. Owner/root compromise remains outside the supported threat model.
+
+12. Next CTO decision
+Decide which independent source adapter and authentication/redistribution policy to review next, and whether to add a source-refresh selection workflow and broader durability/scaling tests before deployment.

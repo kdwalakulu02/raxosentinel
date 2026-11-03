@@ -1,0 +1,627 @@
+================================================================================
+RAXOSENTINEL — INDEPENDENT CTO SECURITY & IMPLEMENTATION AUDIT REPORT
+Date (UTC)       : 2026-11-03 16:31:37 UTC
+Audited Branch   : phase-3b
+Audited Commit   : 1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d
+Audit Mode       : Strictly Read-Only (No source or test files modified)
+================================================================================
+
+================================================================================
+A. EXECUTIVE VERDICT
+================================================================================
+
+Overall Audit Verdict: VERIFIED WITH LIMITATIONS
+
+Plain-Language Explanation:
+The RaxoSentinel repository on branch `phase-3b` at commit `1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d`
+is a genuine, compiling, well-structured Rust prototype that passes all 129 active
+unit and integration tests plus its release-mode concurrency benchmark suite with zero
+compiler or Clippy warnings. Core security invariants claimed across Phases 2D.3–3B.3
+are substantively implemented in source code:
+  1. The persistent coordinator (`raxosentinel serve`) and supervised worker actually
+     invoke `private_store::load`, which enforces mandatory cryptographic evidence
+     verification across all three private database formats (`sidecar-v1`,
+     `multisource-v1`, and `multisource-history-v2`), independently re-derives source
+     associations, excludes size-conflicting quarantined indicators, and fails closed
+     on tampering.
+  2. The supervised worker applies `PR_SET_NO_NEW_PRIVS`, `close_range(3, u32::MAX, 0)`,
+     and a zero-access Landlock ABI 1 filesystem ruleset (`crates/raxosentinel-cli/src/main.rs:501-506`)
+     strictly BEFORE reading any untrusted target bytes from the sealed `memfd` snapshot
+     (`scan_descriptor` at `main.rs:518`).
+  3. The signed-public release loader (`public_release::local::load`) enforces Ed25519
+     release and independent reviewer signatures, key separation (`reviewer != release_key`),
+     and serializes rollback-state inspection and atomic update under an exclusive
+     `flock(LOCK_EX)` lock.
+
+However, the audit uncovered significant discrepancies between previous handover reports
+and the actual code, as well as concrete architectural and security limitations that
+block production deployment:
+  - Inaccurate Phase 3B.3 Handover Reporting: The previous Phase 3B.3 report falsely
+    stated that private generations use `rules.rsidb` and `metadata.json` and that
+    workers memory-map `MmapCompactDirIndex`. In reality, private generations use
+    `database.rsidb` (plus format-specific evidence/registry/association files) and
+    load into a heap-allocated `Vec<u8>` via `MmapSortedIndex` (which does not use `mmap`).
+  - Per-Scan Full Database Re-Verification Bottleneck: The coordinator verifies the
+    database at startup and discards it; every spawned worker process reloads and
+    re-verifies the entire database and all raw evidence files from disk before scanning.
+    For `--public-release`, every worker also acquires an exclusive `flock(LOCK_EX)`
+    during load, serializing concurrent worker startups.
+  - Slow-Client ("Slowloris") Worker Starvation: `recv_fd_request` relies on `SO_RCVTIMEO`
+    (`stream.set_read_timeout`), which only bounds individual `read()`/`recvmsg()` calls
+    rather than enforcing a total request read deadline. A local client dripping 1 byte
+    every `(client_timeout_secs - 1)` seconds can tie up a coordinator worker thread for
+    up to `65,536 * (client_timeout_secs - 1)` seconds.
+  - Snapshot Memory Budget Bypass on Concurrent File Growth: `SnapshotReservation::update`
+    adjusts `in_flight_snapshot_bytes` after `sealed_snapshot` finishes without re-checking
+    `max_total_snapshot_bytes`, allowing files that grow between `fstat` and snapshot copy
+    to push total in-flight snapshot memory past the configured coordinator cap.
+  - Substring-Based Multipart MIME Boundary Check: `validate_mime_boundaries` checks
+    for `--<boundary>--` via unanchored substring search across `raw_bytes`, allowing a
+    truncated multipart email to pass boundary validation if the closing delimiter string
+    appeared earlier inside a benign part body.
+  - Test-Only Multi-Source Adapters: Non-MalwareBazaar multi-source adapters
+    (`test_source_a`, `test_source_b`) are gated behind `#[cfg(test)]` inside the
+    `raxosentinel-signatures` library crate, so the compiled CLI binary and coordinator
+    integration tests only exercise single-source `malwarebazaar` generations.
+
+
+================================================================================
+B. CLAIMS-VERSUS-EVIDENCE TABLE
+================================================================================
+
+1. Claimed Behavior : Repository state is on branch `phase-3b` at commit
+                      `1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d` with clean working tree.
+   Actual Impl.     : Confirmed. `HEAD` is `1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d` on
+                      `phase-3b`; all tracked files are clean (`chatwithcto/` is untracked).
+   File & Line Refs : Workspace root `.git`, `Cargo.toml:1-27`
+   Test Evidence    : `git status --short --ignored`, `git log -n 5`
+   Verdict          : PASS
+
+2. Claimed Behavior : Phase 3B.3 report claim that private generations consist of
+                      `rules.rsidb` and `metadata.json` and workers memory-map
+                      `MmapCompactDirIndex`.
+   Actual Impl.     : FALSE in the handover text, though the underlying code is stronger
+                      than the report claimed. Private generations actually store
+                      `database.rsidb` plus `database.rsidb.evidence` (v1 sidecar), or
+                      `registry.json`, `associations.json`, and `source-<id>.json` /
+                      `acq-<sha256>.json` (multi-source v1 / history v2). Workers load
+                      `MmapSortedIndex` into a heap `Vec<u8>` (no `mmap` syscall is used
+                      in `MmapSortedIndex` or `MmapCompactDirIndex`).
+   File & Line Refs : `chatwithcto/phase-3b/2026-11-03_16-16-36_UTC.txt:49-51`
+                      `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store.rs:140-183`
+                      `crates/raxosentinel-signatures/src/rsidb/mmap_sorted.rs:27-54`
+                      `crates/raxosentinel-signatures/src/rsidb/mmap_compact_dir.rs:51-60`
+   Test Evidence    : Code inspection of `private_store::load` and `MmapSortedIndex::from_bytes`.
+   Verdict          : FAIL (Handover report description inaccurate; code uses `database.rsidb`)
+
+3. Claimed Behavior : Persistent coordinator and worker support genuine Phase 2D.3
+                      multi-source (`raxosentinel-multisource-v1`), Phase 2D.4/2D.5
+                      history (`raxosentinel-multisource-history-v2`), and legacy
+                      sidecar (`raxosentinel-malwarebazaar-sidecar-v1`) formats with
+                      mandatory evidence verification, independent association
+                      re-derivation, and conflict quarantine.
+   Actual Impl.     : `private_store::load` dispatches on `manifest["format"]` in
+                      `database.rsidb` provenance to `multi::history::verify`,
+                      `multi::verify`, or `verify_index`. All three paths mandatorily
+                      parse and hash raw evidence files, re-derive associations from raw
+                      records, exclude `quarantined: true` size-conflicting hashes from
+                      `operational()`, and verify exact 1:1 record parity against
+                      `db.total_records()`. However, in non-test builds, `source_adapter`
+                      only accepts `"malwarebazaar"` (`test_source_a`/`b` are
+                      `#[cfg(test)]`), and `tests/coordinator.rs` only tests `sidecar-v1`.
+   File & Line Refs : `crates/raxosentinel-cli/src/coordinator.rs:203-222`
+                      `crates/raxosentinel-cli/src/main.rs:449-465`
+                      `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store.rs:140-183`
+                      `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/multi.rs:63-85,107-231`
+                      `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/multi/history.rs:74-204,235-324`
+   Test Evidence    : Unit tests in `multi::tests` (10 tests) and `tests/private_scanner.rs`
+                      (1 test); coordinator integration tests only exercise `sidecar-v1`.
+   Verdict          : PARTIAL
+
+4. Claimed Behavior : Scanner engine performs full-file SHA-256, exact hash+size RSIDB
+                      matching, Aho-Corasick byte-pattern detection, recursive in-memory
+                      ZIP and MIME/Base64/QP scanning, enforces decompression/size/depth
+                      limits, and preserves `Infected > Failed > Unsupported > Clean`.
+   Actual Impl.     : Implemented in `EmailScanner::scan_object`, `scan_zip`, and
+                      `scan_internal`. Unsupported archives (TAR, RAR, 7z, GZIP, BZIP2,
+                      XZ, CAB), encrypted ZIP entries, and malformed Base64/QP encodings
+                      return `ScanStatus::Unsupported` (`UNSCANNED`). Quota/size/depth
+                      breaches return `ScanStatus::Failed` (`ERROR`). Minor defect:
+                      `validate_mime_boundaries` uses unanchored `bytes_contains` for
+                      `--boundary--`, and root-level valid MIME messages do not run
+                      `db.match_bytes(raw_bytes)` on raw headers (only on parsed text/html
+                      bodies and attachments).
+   File & Line Refs : `crates/raxosentinel-email/src/scanner.rs:94-800,809-1041`
+                      `crates/raxosentinel-signatures/src/database.rs:69-206`
+                      `crates/raxosentinel-core/src/limits.rs:58-196`
+                      `crates/raxosentinel-core/src/status.rs:27-91`
+   Test Evidence    : `crates/raxosentinel-email` (20 tests), `tests/phase3a_corpus.rs`,
+                      `tests/integration_test.rs` (25 tests).
+   Verdict          : PASS (with minor MIME boundary substring caveat in Finding C.4)
+
+5. Claimed Behavior : Supervised worker validates descriptors, seals `memfd` snapshots,
+                      clears environment, sets `RLIMIT_AS` and new process group in
+                      `pre_exec`, applies Landlock ABI 1 and closes FDs >= 3 BEFORE
+                      processing untrusted input, and kills the process group on timeout.
+   Actual Impl.     : Verified. `sealed_snapshot` creates an anonymous `memfd` and
+                      applies `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`.
+                      In `--worker-internal`, `supervised::restrict_worker_filesystem()`
+                      is called at `main.rs:503` (setting `PR_SET_NO_NEW_PRIVS`,
+                      `close_range(3, u32::MAX, 0)`, and Landlock ABI 1 `handled_access_fs`
+                      with zero allowed rules) before `scan_descriptor` (`main.rs:518`)
+                      reads a single byte from `stdin` (FD 0). `terminate_group` sends
+                      `SIGKILL` to `-(child.id() as i32)` and reaps the child.
+   File & Line Refs : `crates/raxosentinel-cli/src/supervised.rs:35-79,114-164,209-360`
+                      `crates/raxosentinel-cli/src/main.rs:501-627`
+   Test Evidence    : `crates/raxosentinel-cli/tests/supervised.rs` (9 tests, including
+                      Landlock probe, snapshot mutation race, timeout reaping, and
+                      descendant process-group kill).
+   Verdict          : PASS
+
+6. Claimed Behavior : Persistent coordinator (`raxosentinel serve`) binds a Unix-domain
+                      socket in an owner-controlled `0700` directory, authenticates clients
+                      via `SO_PEERCRED`, receives files via `SCM_RIGHTS`, enforces bounded
+                      worker concurrency (`--max-workers`), pending queue (`--max-pending`),
+                      and global snapshot byte accounting (`--max-total-snapshot-bytes`),
+                      and rejects excess load immediately with `BUSY`.
+   Actual Impl.     : Unix socket setup, `SO_PEERCRED` check, `SCM_RIGHTS` single-FD
+                      validation, worker pool, bounded `pending_queue`, and immediate
+                      `BUSY` responses are implemented and tested. However:
+                      (a) `client_timeout_secs` uses `SO_RCVTIMEO` per-read timeout
+                          instead of a total request deadline;
+                      (b) `SnapshotReservation::update` can exceed
+                          `max_total_snapshot_bytes` if a file grows during snapshotting;
+                      (c) every scan spawns a fresh CLI process that reloads and
+                          re-verifies the entire signature database from disk.
+   File & Line Refs : `crates/raxosentinel-cli/src/coordinator.rs:194-1117`
+   Test Evidence    : `crates/raxosentinel-cli/tests/coordinator.rs` (19 tests).
+   Verdict          : PARTIAL
+
+7. Claimed Behavior : Signed-public release verification enforces Ed25519 manifest
+                      signature, independent reviewer approval with distinct key,
+                      anti-rollback sequence persistence, and concurrency-safe state
+                      updates across concurrent workers.
+   Actual Impl.     : `public_release::local::load` locks `public-release-lock` with
+                      `flock(LOCK_EX)` for the entire duration of state read, manifest/
+                      artifact/approval verification, anti-equivocation check, and
+                      atomic temp-file `fsync` + `renameat` of `public-release-state`.
+                      Public key files (`--public-key`, `--public-approval-key`),
+                      however, are loaded via `std::fs::read` without `O_NOFOLLOW` or
+                      owner/permission checks.
+   File & Line Refs : `crates/raxosentinel-signatures/src/rsidb/public_release.rs:149-272,486-655`
+                      `crates/raxosentinel-signatures/src/rsidb/crypto.rs:79-85`
+   Test Evidence    : `public_release::tests` (3 unit tests), `tests/public_scanner.rs`
+                      (1 test), `tests/coordinator.rs::test_11` (4-worker concurrent test).
+   Verdict          : PASS (with key-file permission check gap noted in Finding C.6)
+
+8. Claimed Behavior : Phase 3B.3 performance benchmarks are reproducible from actual
+                      workspace benchmark code.
+   Actual Impl.     : `crates/raxosentinel-cli/tests/benchmark.rs` is real, executable,
+                      and reproduces the same scaling pattern on this 2-vCPU machine
+                      (1 MB: ~78 req/s at 1W, ~118 req/s at 2W, ~129 req/s at 4W;
+                      worker peak VmHWM: 6.05 MiB for 1 MB, 14.84 MiB for 10 MB,
+                      54.84 MiB for 50 MB). Note that the benchmark uses a 1-record
+                      synthetic database (`setup_private_db`), which masks per-worker
+                      database reload cost for large databases.
+   File & Line Refs : `crates/raxosentinel-cli/tests/benchmark.rs:31-497`
+   Test Evidence    : Executed `cargo test --release --test benchmark -- --nocapture --ignored`.
+   Verdict          : PASS (with 1-record fixture limitation noted in Finding C.2)
+
+
+================================================================================
+C. SECURITY FINDINGS (RANKED BY SEVERITY)
+================================================================================
+
+--------------------------------------------------------------------------------
+[HIGH-01] Per-Read Socket Timeout (`SO_RCVTIMEO`) Allows Slow-Client ("Slowloris")
+          Starvation of Coordinator Worker Threads
+--------------------------------------------------------------------------------
+- Severity          : HIGH
+- Location          : `crates/raxosentinel-cli/src/coordinator.rs:458-593, 765, 1003-1028`
+- Why It Is a Problem:
+  When the coordinator's accept loop admits a connection, it pushes the raw
+  `UnixStream` into `pending_queue` (`coordinator.rs:1100`). A worker thread pops
+  the stream, increments `active_workers`, calls
+  `stream.set_read_timeout(Some(Duration::from_secs(client_timeout_secs)))`
+  (`coordinator.rs:765`), and invokes `recv_fd_request(&mut stream)`.
+  `set_read_timeout` configures Linux `SO_RCVTIMEO`, which only bounds the
+  inactivity duration of a single `recvmsg()` or `read()` syscall. Inside
+  `recv_fd_request`, the payload loop (`coordinator.rs:568-582`) repeatedly calls
+  `stream.read(&mut chunk)` until `payload_len` (up to `MAX_REQUEST_PAYLOAD = 65,536`
+  bytes) is received, without checking total elapsed wall-clock time.
+- Reproducible Failure Scenario:
+  An authorized local client (or compromised process running under `--authorized-uid`)
+  opens `max_workers + max_pending` connections to the Unix socket, sends a valid
+  1-FD `SCM_RIGHTS` header declaring `payload_len = 65536`, and then writes 1 byte
+  every 4 seconds (with default `--client-timeout-secs = 5`). Neither `SO_RCVTIMEO`
+  nor `worker_timeout_ms` ever triggers. All `max_workers` threads remain blocked
+  in `recv_fd_request` for up to `65,536 * 4s = 262,144s` (~72.8 hours), causing a
+  complete denial of service (all subsequent legitimate requests receive `BUSY`).
+- Recommended Fix   :
+  Pass an `Instant` deadline (`Instant::now() + Duration::from_secs(client_timeout_secs)`)
+  into `recv_fd_request`. Before each `recvmsg`/`read` iteration, compute
+  `remaining = deadline.checked_duration_since(Instant::now())`, return a timeout
+  error immediately if `remaining` is `None` or zero, and set `stream.set_read_timeout(Some(remaining))`.
+- Blocks Production : YES
+
+--------------------------------------------------------------------------------
+[HIGH-02] Per-Scan Full Database and Evidence Re-Verification in Every Spawned
+          Worker Causes Severe CPU/I/O Amplification and Lock Contention
+--------------------------------------------------------------------------------
+- Severity          : HIGH
+- Location          : `crates/raxosentinel-cli/src/coordinator.rs:194-251, 906`
+                      `crates/raxosentinel-cli/src/supervised.rs:209-257`
+                      `crates/raxosentinel-cli/src/main.rs:414-466`
+                      `crates/raxosentinel-signatures/src/rsidb/public_release.rs:531-654`
+- Why It Is a Problem:
+  1. `raxosentinel serve` verifies the configured private generation or signed-public
+     release at startup (`verify_startup_database`, `coordinator.rs:194-251`) and
+     immediately drops the resulting `MmapSortedIndex`.
+  2. For every scan request, `execute_worker_on_snapshot` spawns a fresh
+     `raxosentinel scan --worker-internal` process that re-reads `database.rsidb`
+     into a heap `Vec<u8>`, re-reads and SHA-256 hashes every evidence/artifact file,
+     re-parses all raw JSON records, re-derives all associations, and verifies every
+     entry against the index before applying Landlock.
+  3. While the Phase 3B.3 benchmark used a 1-record synthetic database (~5 ms startup),
+     Phase 2D.4 measurements (`chatwithcto/phase-2d/2026-11-02_21-10-45_UTC.txt:25`)
+     show that verifying a 100,000-record `multisource-history-v2` generation takes
+     ~2.76 seconds and ~197 MiB RSS per load. Spawning 4 concurrent workers on a
+     100k-record generation would consume ~11 CPU-seconds and ~800 MiB of transient
+     verification memory per 4 scans.
+  4. In `--public-release` mode, `public_release::local::load` acquires an exclusive
+     `flock(LOCK_EX)` on `public-release-lock` (`public_release.rs:534`) and holds it
+     while reading and verifying up to 128 MiB of artifacts (`public_release.rs:551-598`),
+     serializing concurrent worker startups on a single file lock.
+- Reproducible Failure Scenario:
+  Start `raxosentinel serve --max-workers 4` with a 50,000-record `multisource-history-v2`
+  generation and submit 4 concurrent 1 KB files with `--worker-timeout-ms 1000`. All 4
+  workers spend >1,000 ms re-verifying raw acquisition JSON files before `scan_descriptor`
+  is even reached, causing every scan to fail with a worker timeout (`ERROR`).
+- Recommended Fix   :
+  Verify and compile the `SignatureDatabase` + `MmapSortedIndex` once in the
+  coordinator at startup, serialize the validated index into a read-only sealed
+  `memfd` (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`), and pass that
+  sealed FD to each worker (or fork workers from a pre-initialized template / pass
+  the verified sealed `database.rsidb` FD), allowing the worker to enter Landlock
+  immediately without touching the filesystem or acquiring `public-release-lock`.
+- Blocks Production : YES
+
+--------------------------------------------------------------------------------
+[MEDIUM-01] Global Snapshot Memory Accounting Can Exceed `max_total_snapshot_bytes`
+            When Target File Grows Between `fstat` and `sealed_snapshot`
+--------------------------------------------------------------------------------
+- Severity          : MEDIUM
+- Location          : `crates/raxosentinel-cli/src/coordinator.rs:696-708, 783-886`
+- Why It Is a Problem:
+  In `handle_client_connection`, the coordinator calls `fstat(raw_fd)` (`line 783`)
+  to obtain `file_size`, reserves `file_size` bytes via `SnapshotReservation::new`
+  (`line 837`), and then copies up to `max_size` bytes from `raw_fd` into a `memfd`
+  via `sealed_snapshot(source, max_size)` (`line 869`). Afterward (`line 884-886`),
+  it calls `reservation.update(meta.len())`.
+  Inside `SnapshotReservation::update` (`lines 699-701`), if `actual_bytes > self.reserved_bytes`,
+  it executes:
+  `guard.in_flight_snapshot_bytes = guard.in_flight_snapshot_bytes.saturating_add(diff);`
+  without checking whether `guard.in_flight_snapshot_bytes + diff > guard.max_total_snapshot_bytes`!
+  Furthermore, the `memfd` bytes have already been allocated in kernel tmpfs during
+  `sealed_snapshot` before `reservation.update` is called.
+- Reproducible Failure Scenario:
+  Configure `--max-workers 4 --max-total-snapshot-bytes 52428800` (50 MiB) and
+  `--max-size 52428800` (50 MiB). A client opens 4 empty (0-byte) files, submits all
+  4 FDs concurrently (`fstat` sees `file_size = 0`, so all 4 pass `SnapshotReservation::new`
+  with 0 bytes reserved), and concurrently appends 50 MiB to each file while
+  `sealed_snapshot` is reading. `sealed_snapshot` caps each file at `max_size` (50 MiB),
+  allocating `4 * 50 MiB = 200 MiB` of in-flight `memfd` snapshots—4x the configured
+  `max_total_snapshot_bytes` budget.
+- Recommended Fix   :
+  Cap `sealed_snapshot` for a given request at `min(max_size, remaining_snapshot_budget)`,
+  or reserve chunks incrementally through `SnapshotReservation` inside the
+  `sealed_snapshot` read loop so any growth past `max_total_snapshot_bytes` aborts
+  snapshot creation immediately before allocating additional `memfd` pages.
+- Blocks Production : YES
+
+--------------------------------------------------------------------------------
+[MEDIUM-02] Unanchored Substring Search in `validate_mime_boundaries` Can Miss
+            Truncated Multipart MIME Containers
+--------------------------------------------------------------------------------
+- Severity          : MEDIUM
+- Location          : `crates/raxosentinel-email/src/scanner.rs:876-935`
+- Why It Is a Problem:
+  `validate_mime_boundaries` verifies that a `multipart/*` message contains its
+  opening (`--<boundary>`) and closing (`--<boundary>--`) delimiters by calling
+  `bytes_contains(raw_bytes, close_delim.as_bytes())` (`scanner.rs:907, 923`).
+  `bytes_contains` (`scanner.rs:876-881`) performs a raw sliding-window substring
+  search across the entire `raw_bytes` slice without requiring `--<boundary>--` to
+  appear on its own MIME boundary line or after the last parsed MIME part.
+- Reproducible Failure Scenario:
+  Construct a `multipart/mixed; boundary="BOUND"` email where Part 1 (`text/plain`)
+  contains the benign text `"Note: do not use --BOUND-- in this text"`, followed by
+  `--BOUND\r\nContent-Type: application/octet-stream\r\n\r\n` and a truncated
+  payload with no closing `--BOUND--` at the end of the file. `mail_parser` parses
+  the available bytes, and `validate_mime_boundaries` returns `Ok(())` because
+  `--BOUND--` appeared as a substring inside Part 1. If neither Part 1 nor the
+  truncated bytes of Part 2 match a signature, the email is reported as `CLEAN`
+  instead of `UNSCANNED` (`ScanStatus::Unsupported`).
+- Recommended Fix   :
+  Verify that `--<boundary>--` occurs at a valid RFC 2046 line boundary (`^--<boundary>--[ \t]*(\r?\n|$)`)
+  located at or after the end offset (`part.offset_end()`) of all child parts
+  belonging to that multipart container.
+- Blocks Production : YES
+
+--------------------------------------------------------------------------------
+[MEDIUM-03] Phase 3B.3 Handover Report Misstates Private Database Filenames and
+            Memory-Mapping Implementation
+--------------------------------------------------------------------------------
+- Severity          : MEDIUM (Governance / Documentation Integrity)
+- Location          : `chatwithcto/phase-3b/2026-11-03_16-16-36_UTC.txt:49-51`
+                      vs. `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store.rs:140-183`
+                      and `crates/raxosentinel-signatures/src/rsidb/mmap_sorted.rs:27-54`
+- Why It Is a Problem:
+  The Phase 3B.3 handover report claimed:
+  "Private database generations (`--private-db-root` / `--private-generation`) are
+  immutable once published. Each worker independently opens the generation directory,
+  verifies the metadata/evidence sidecar (`metadata.json` and `rules.rsidb`), and
+  memory-maps the `MmapCompactDirIndex`."
+  Every technical detail in that sentence is false:
+  1. Neither `metadata.json` nor `rules.rsidb` exists anywhere in `private_store`.
+     The actual files are `database.rsidb` plus `database.rsidb.evidence` (sidecar-v1)
+     or `registry.json`, `associations.json`, and `source-<id>.json` / `acq-<id>.json`.
+  2. `private_store::load` returns `MmapSortedIndex`, not `MmapCompactDirIndex`.
+  3. Neither `MmapSortedIndex` nor `MmapCompactDirIndex` uses OS `mmap`; both wrap a
+     heap-allocated `Vec<u8>` (`mmap_sorted.rs:21`, `mmap_compact_dir.rs:45`).
+- Reproducible Failure Scenario:
+  An operator or downstream integrator provisioning a private generation directory
+  with `rules.rsidb` and `metadata.json` based on the Phase 3B.3 handover report will
+  experience an immediate startup failure (`Cannot open private file` for `database.rsidb`).
+- Recommended Fix   :
+  Update engineering documentation and operational runbooks to reflect the actual
+  `private_store` schemas (`database.rsidb`, `registry.json`, `associations.json`,
+  `acq-<sha256>.json` / `source-<id>.json` / `database.rsidb.evidence`) and clarify
+  that `MmapSortedIndex` / `MmapCompactDirIndex` read into heap memory unless true
+  read-only `mmap` over a sealed descriptor is implemented.
+- Blocks Production : NO (Code works on real formats; documentation was wrong)
+
+--------------------------------------------------------------------------------
+[MEDIUM-04] Non-MalwareBazaar Multi-Source Adapters Are Gated Behind `#[cfg(test)]`
+--------------------------------------------------------------------------------
+- Severity          : MEDIUM
+- Location          : `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/multi.rs:63-85, 206-211`
+                      `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/multi/history.rs:279-284`
+- Why It Is a Problem:
+  In both `multi.rs` and `history.rs`, `source_adapter(id)` only recognizes
+  `"malwarebazaar"` in non-test builds; `"test_source_a"` and `"test_source_b"` are
+  compiled only under `#[cfg(test)]` inside the `raxosentinel-signatures` crate.
+  Consequently:
+  1. The compiled `raxosentinel` CLI binary (`db merge-private`, `db remove-private-source`,
+     `db refresh-private-source`, `scan`, `serve`) cannot verify or operate on any
+     multi-source generation containing a second source ID other than `"malwarebazaar"`.
+  2. Integration tests in `crates/raxosentinel-cli/tests/` cannot construct a 2-source
+     generation and therefore only test `raxosentinel serve` with single-source
+     `"malwarebazaar"` fixtures (`coordinator.rs:41-60`).
+- Reproducible Failure Scenario:
+  Running `raxosentinel scan --private-db-root <root> --private-generation <gen>` on a
+  multi-source generation containing `"test_source_a"` fails with
+  `Error: private database rejected: Unsupported private source adapter`.
+- Recommended Fix   :
+  Implement the production source adapters (or a generic schema-validated private
+  evidence adapter) in non-test builds and add an integration test in
+  `crates/raxosentinel-cli/tests/coordinator.rs` exercising `raxosentinel serve` against
+  both `raxosentinel-multisource-v1` and `raxosentinel-multisource-history-v2` generations.
+- Blocks Production : NO (Blocks multi-feed private deployments beyond MalwareBazaar)
+
+--------------------------------------------------------------------------------
+[LOW-01] Public Verification Key and External Rule Pack Loaders Do Not Enforce
+         Owner-Only Permissions or `O_NOFOLLOW`
+--------------------------------------------------------------------------------
+- Severity          : LOW
+- Location          : `crates/raxosentinel-signatures/src/rsidb/crypto.rs:79-85`
+                      `crates/raxosentinel-signatures/src/loader.rs:26-31`
+                      `crates/raxosentinel-cli/src/main.rs:416, 437-440`
+                      `crates/raxosentinel-cli/src/coordinator.rs:236-238`
+- Why It Is a Problem:
+  While `private_store::root`/`readat` and `public_release::local::load` strictly
+  enforce `O_NOFOLLOW`, `st_uid == geteuid()`, `st_nlink == 1`, `0700` directory mode,
+  and `0600` file mode on `--private-db-root`, `--public-release`, and `--public-state`,
+  the loaders for `--public-key`, `--public-approval-key` (`crypto::load_verifying_key_from_file`),
+  and `--rules` (`load_rules_from_file`) use `std::fs::read(path)` directly without
+  checking symlink status, file owner UID, or group/world write permissions.
+- Reproducible Failure Scenario:
+  If an operator places `public.key`, `approval.key`, or `rules.json` in a shared
+  directory (e.g., `/tmp` or a group-writable config directory) or with `0666` mode,
+  another local user can replace the key or rule file via symlink or overwrite without
+  RaxoSentinel rejecting the insecure file permissions.
+- Recommended Fix   :
+  Open `--public-key`, `--public-approval-key`, and `--rules` with
+  `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` and verify via `fstat` that `st_uid == geteuid()`
+  (or root `0`), `S_IFREG`, and `(st_mode & 0o022) == 0`.
+- Blocks Production : NO (Defense-in-depth hardening)
+
+--------------------------------------------------------------------------------
+[LOW-02] Socket Preparation and Cleanup Have Minor Path-Based TOCTOU Windows
+--------------------------------------------------------------------------------
+- Severity          : LOW
+- Location          : `crates/raxosentinel-cli/src/coordinator.rs:254-368`
+- Why It Is a Problem:
+  In `prepare_socket`, the parent directory is validated to be owned by `geteuid()`
+  with mode `0700` (`lines 266-305`), which prevents other non-root UIDs from racing
+  inside the directory. However:
+  1. `UnixListener::bind(socket_path)` creates the socket with the process's current
+     `umask` before `std::fs::set_permissions(socket_path, 0o600)` is called (`lines 348-353`).
+  2. `cleanup_socket` (`lines 359-368`) checks `symlink_metadata(socket_path)` and
+     removes `socket_path` by path without verifying the inode number (`st_ino`/`st_dev`)
+     bound by this coordinator instance.
+  3. As documented in `SUPERVISED.md:13-17`, ancestor directories above `socket_path.parent()`
+     are not checked for symlinks or world-writable permissions.
+- Reproducible Failure Scenario:
+  Same-UID processes can race `prepare_socket`/`cleanup_socket` (though same-UID
+  isolation is explicitly disclaimed). If `umask` is `0000` and parent directory
+  traversal is somehow bypassed before `chmod 0700` completes, the socket file is
+  briefly world-writable between `bind` and `set_permissions` (mitigated by
+  `SO_PEERCRED` check on accept).
+- Recommended Fix   :
+  Record `(st_dev, st_ino)` of the bound socket after `UnixListener::bind` and verify
+  they match in `cleanup_socket` before unlinking.
+- Blocks Production : NO
+
+--------------------------------------------------------------------------------
+[LOW-03] Absence of cgroup v2 Memory/PIDs Enforcement and Seccomp Syscall Filter
+         in Supervised Worker
+--------------------------------------------------------------------------------
+- Severity          : LOW (Correctly Disclaimed in `SUPERVISED.md` and Phase 3B.3 Report)
+- Location          : `crates/raxosentinel-cli/src/supervised.rs:35-79, 271-297`
+                      `crates/raxosentinel-cli/SUPERVISED.md:28-44`
+- Why It Is a Problem:
+  The supervised worker uses `RLIMIT_AS`, `PR_SET_NO_NEW_PRIVS`, `close_range`,
+  Landlock ABI 1, and process-group `SIGKILL`. Because `EmailScanner` and
+  `MmapSortedIndex` are 100% safe Rust (no C/C++ parsing libraries), memory-corruption
+  RCE risk during parsing is low. However, if arbitrary code execution inside the
+  worker were ever achieved:
+  1. Landlock ABI 1 restricts filesystem access only; it does not block `fork`/`clone`,
+     `setsid`/`setpgid` (which would allow a compromised child to escape the negative-PID
+     process group `SIGKILL` in `terminate_group`), or abstract Unix sockets/network.
+  2. `RLIMIT_AS` caps per-process virtual address space, not physical RSS across a
+     forked process tree.
+  Both limitations are honestly and explicitly documented in `SUPERVISED.md:28-44`.
+- Recommended Fix   :
+  Before production deployment, run the coordinator under a dedicated unprivileged
+  service UID/GID with a systemd unit / cgroup v2 slice (`MemoryMax=`, `TasksMax=`,
+  `PrivateNetwork=yes`) and add a strict seccomp-bpf allowlist after Landlock lockdown.
+- Blocks Production : YES (for untrusted production MTA deployment; acceptable for Phase 3B prototype)
+
+
+================================================================================
+D. VERIFICATION RESULTS
+================================================================================
+
+All verification commands were executed directly in `/workspaces/raxosentinel` on
+commit `1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d` without modifying any tracked files.
+
+1. Command: `git status --short --ignored && git rev-parse HEAD`
+   Observed Result:
+   - `HEAD`: `1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d` on branch `phase-3b`.
+   - Tracked working tree: 100% clean (zero staged or unstaged changes).
+   - Untracked directories: `?? chatwithcto/`, ignored `!! target/`.
+
+2. Command: `cargo fmt --all -- --check`
+   Observed Result:
+   - Exited with code `0` (zero formatting diffs across all 5 workspace crates).
+
+3. Command: `cargo clippy --workspace --all-targets -- -D warnings`
+   Observed Result:
+   - Exited with code `0` (zero warnings or errors across all library, binary, test,
+     and bench targets).
+
+4. Command: `cargo test --workspace`
+   Observed Result:
+   - Exited with code `0`. All 129 active tests passed, 0 failed, 2 scale/benchmark
+     tests ignored by default:
+     * `raxosentinel-cli` (`src/main.rs` unit tests)  :  5 passed, 0 failed
+     * `raxosentinel-cli` (`tests/coordinator.rs`)    : 19 passed, 0 failed (3.43s)
+     * `raxosentinel-cli` (`tests/integration_test.rs`): 25 passed, 0 failed (1.26s)
+     * `raxosentinel-cli` (`tests/malwarebazaar_import.rs`): 1 passed, 0 failed (0.09s)
+     * `raxosentinel-cli` (`tests/phase3a_corpus.rs`) :  1 passed, 0 failed (0.85s)
+     * `raxosentinel-cli` (`tests/private_scanner.rs`):  1 passed, 0 failed (0.06s)
+     * `raxosentinel-cli` (`tests/public_scanner.rs`) :  1 passed, 0 failed (0.22s)
+     * `raxosentinel-cli` (`tests/supervised.rs`)     :  9 passed, 0 failed (1.76s)
+     * `raxosentinel-core` (unit tests)               :  9 passed, 0 failed
+     * `raxosentinel-email` (unit tests)              : 20 passed, 0 failed
+     * `raxosentinel-filetypes` (unit tests)          :  9 passed, 0 failed
+     * `raxosentinel-signatures` (unit tests)         : 50 passed, 0 failed, 1 ignored (2.20s)
+     * `raxosentinel-cli` (`tests/benchmark.rs`)      :  0 passed, 0 failed, 1 ignored
+
+5. Command: `cargo test --release --test benchmark -- --nocapture --ignored`
+   Observed Result:
+   - Exited with code `0` in 8.22s on 2-vCPU Linux 6.8.0-1064-azure x86_64:
+     * Per-worker peak RSS (`VmHWM`):
+       - 1 MB target  :  6,192 KiB (6.05 MiB)
+       - 10 MB target : 15,192 KiB (14.84 MiB)
+       - 50 MB target : 56,160 KiB (54.84 MiB)
+     * Concurrency scaling (1, 2, 4 workers):
+       - 1 Worker : 1 MB =  78.28 req/s (median 12.04 ms, p95 16.29 ms);
+                    10 MB = 13.31 req/s (median 70.29 ms, p95 116.45 ms);
+                    50 MB =  3.08 req/s (median 332.33 ms, p95 333.55 ms)
+       - 2 Workers: 1 MB = 117.76 req/s (median 16.27 ms, p95 24.18 ms);
+                    10 MB = 18.83 req/s (median 109.81 ms, p95 141.87 ms);
+                    50 MB =  4.32 req/s (median 479.53 ms, p95 480.61 ms)
+       - 4 Workers: 1 MB = 129.19 req/s (median 27.51 ms, p95 38.96 ms);
+                    10 MB = 17.49 req/s (median 226.90 ms, p95 242.36 ms);
+                    50 MB =  3.17 req/s (median 1256.71 ms, p95 1262.11 ms)
+     * Overload `BUSY` rejection latency: 4.982 ms
+     * Timeout abort latency (20 ms timeout on 50 MB): 87.94 ms; subsequent recovery scan: 6.92 ms
+
+6. Repository Hygiene & Secrets Inspection:
+   - Confirmed no private MalwareBazaar data, API keys (`RAXO_ABUSECH_AUTH_KEY`), or
+     private Ed25519 signing keys are committed to the repository.
+   - Confirmed debug fault-injection hooks (`RAXOSENTINEL_TEST_WORKER_ACTION`) in
+     `main.rs:339-340, 351-380, 507-514`, `supervised.rs:30-31, 259-264`, and
+     `coordinator.rs:157-159, 168-169, 890-893, 1165-1168` are all strictly gated
+     behind `#[cfg(debug_assertions)]` and absent from `--release` binaries.
+
+
+================================================================================
+E. CTO RECOMMENDATION
+================================================================================
+
+1. Does Phase 3B.3 Deserve Acceptance?
+   YES, WITH CONDITIONS (Accept as a Research Prototype Milestone; Do Not Deploy to
+   Production).
+   The Phase 3B.3 code meets its core prototype objectives: bounded worker pool
+   (1, 2, 4 workers), bounded pending queue, immediate `BUSY` overload response,
+   `SO_PEERCRED` authentication, `SCM_RIGHTS` descriptor passing, sealed `memfd`
+   snapshots, Landlock worker isolation before untrusted input parsing, and `flock`-
+   serialized signed-public rollback state. However, the inaccurate database file
+   descriptions in the Phase 3B.3 handover report (`rules.rsidb`/`metadata.json`)
+   must be corrected in project documentation, and the security findings in Section C
+   must be resolved before any MTA/Raxo Email integration.
+
+2. Which Earlier Phases Remain Trustworthy?
+   - Phase 2D.3 (Multi-Source Signature Database) & Phase 2D.4–2D.5 (History-Aware
+     Database & Signed-Release Prototype): TRUSTWORTHY in library logic
+     (`raxosentinel-signatures`), with the caveat that non-MalwareBazaar source
+     adapters (`test_source_a`/`b`) are currently `#[cfg(test)]`-only.
+   - Phase 3A (File, ZIP & MIME Scanning): TRUSTWORTHY for exact-hash, byte-pattern,
+     ZIP, and Base64/QP inspection, subject to fixing the unanchored substring check
+     in `validate_mime_boundaries` (`[MEDIUM-02]`).
+   - Phase 3B.1 & 3B.1H (Supervised Worker & Hardening): TRUSTWORTHY as a Linux
+     process-isolation layer; execution order (`restrict_worker_filesystem` before
+     `scan_descriptor`) is verified.
+   - Phase 3B.2 & 3B.3 (Persistent Local Coordinator & Bounded Concurrency):
+     TRUSTWORTHY for cooperative local clients and small signature databases; requires
+     remediation of `[HIGH-01]`, `[HIGH-02]`, and `[MEDIUM-01]` before handling
+     adversarial local clients or large (10k–100k record) signature generations.
+
+3. Which Issues Require Immediate Repair?
+   - `[HIGH-01]`: Replace per-read `SO_RCVTIMEO` timeout in `recv_fd_request` with an
+     enforced total wall-clock request deadline so slow-loris clients cannot starve
+     worker threads.
+   - `[HIGH-02]`: Eliminate per-scan full database and evidence re-verification in
+     worker processes by loading/verifying the database once in the coordinator and
+     passing a sealed read-only `memfd` index to workers.
+   - `[MEDIUM-01]`: Enforce `max_total_snapshot_bytes` during `sealed_snapshot` copy
+     (not merely on initial `fstat` size) so concurrently growing files cannot exceed
+     the coordinator's snapshot memory budget.
+   - `[MEDIUM-02]`: Anchor `--<boundary>--` validation in `validate_mime_boundaries`
+     to RFC 2046 line boundaries at the end of the multipart structure.
+
+4. Is Proceeding to Phase 3B.4 Justified?
+   NOT UNTIL `[HIGH-01]`, `[HIGH-02]`, `[MEDIUM-01]`, and `[MEDIUM-02]` ARE FIXED.
+   A targeted hardening pass (Phase 3B.3H) should resolve these four issues and add
+   multi-source (`v1`/`v2`) coordinator integration tests before advancing to
+   Phase 3B.4 (e.g., zero-reload shared index / hot database reload / MTA integration).
+
+5. Next Three Highest-Priority Engineering Tasks:
+   - Priority 1 (Coordinator Shared Sealed Database Index — Fixes `[HIGH-02]` & `[MEDIUM-04]`):
+     Have `raxosentinel serve` verify the private generation or signed-public release
+     once at startup, place the validated RSIDB binary into a write-sealed `memfd`
+     (and support real `mmap` over that sealed FD), pass the sealed FD to each worker
+     so workers enter Landlock immediately with zero disk I/O or lock contention, and
+     enable multi-source (`v1`/`v2`) integration tests in `tests/coordinator.rs`.
+   - Priority 2 (Total Request Read Deadline & Incremental Snapshot Accounting — Fixes `[HIGH-01]` & `[MEDIUM-01]`):
+     Enforce a strict wall-clock deadline across the entire `recv_fd_request` framing
+     loop, and enforce `max_total_snapshot_bytes` incrementally inside `sealed_snapshot`
+     so concurrent file growth cannot bypass the global snapshot memory cap.
+   - Priority 3 (RFC 2046 Line-Anchored Multipart Closing Boundary & Key-File Permission Checks — Fixes `[MEDIUM-02]` & `[LOW-01]`):
+     Harden `validate_mime_boundaries` in `crates/raxosentinel-email/src/scanner.rs`
+     to require line-anchored closing boundaries after the final part offset, and
+     enforce `O_NOFOLLOW` + owner/mode checks when loading `--public-key`,
+     `--public-approval-key`, and `--rules`.
+================================================================================

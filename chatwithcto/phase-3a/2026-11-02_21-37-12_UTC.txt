@@ -1,0 +1,57 @@
+RaxoSentinel Phase 3A handover — 2026-11-02 UTC
+
+1. Existing scanner capability audit
+The branch phase-3a was created at verified baseline 3840b219596376de741bf307163222c56e9c8119. Full-file SHA-256 and exact hash+size RSIDB lookup work in the CLI using a structurally validated database, demonstrated with a real synthetic file. The core hash_file_bounded helper streams SHA-256 with a bounded buffer; the complete CLI scan does NOT stream the whole scan: it reads the complete target into memory for byte-pattern and container inspection, then hashes it. RSIDB matching may calculate additional digests as needed. This distinction matters for memory and throughput.
+
+MIME parsing and base64 attachment inspection work for the generated tests, including an email containing a ZIP attachment. ZIP, nested ZIP, archive entries and nested MIME objects are inspected in memory under shared limits. File-type identification is based on recognizable content and extensions. PDF, JPEG and PNG data are scanned as raw bytes and hashed; the scanner does not decode images, parse PDF objects, inspect PDF scripts, or certify that these formats are structurally valid. An image or document reported CLEAN only had no matching current raw signatures. Private-generation and signed-public-release verification paths were not weakened or modified.
+
+2. Implemented or repaired
+External JSON and human verdicts now use CLEAN, DETECTED, UNSCANNED and ERROR. Existing Rust enum variants remain, and older INFECTED, UNSUPPORTED and FAILED JSON values can still be deserialized; emitted JSON names are an intentional compatibility change for consumers. CLI exit codes remain 0, 1, 2 and 3 respectively. Detected threats take precedence over partial failures, but errors or unsupported results never become CLEAN.
+
+File and email reads now check the deadline and file-size accounting between bounded 64 KiB reads and use fallible buffer reservations. ZIP decompression checks deadlines between chunks and enforces the remaining cumulative extraction budget before further output allocation. A filename or MIME type claiming ZIP now triggers ZIP inspection even if the magic bytes are damaged; an unparseable archive is UNSCANNED. A damaged ZIP without recognizable bytes or a ZIP claim may still be indistinguishable from arbitrary data.
+
+A zero or excessive configured streaming buffer is rejected by hashing and pattern-stream matching rather than silently producing no data. Repeated byte-pattern matches retain at most 32 offsets per rule plus an explicit omitted-offset notice, avoiding unbounded per-occurrence threat allocations. All signature rules still participate in detection; details beyond the cap are intentionally omitted. Nested archive detections no longer report zero threats and the human report now prints nested sub-targets recursively.
+
+3. Safe test corpus
+The generated, temporary corpus contains ordinary text; a small PDF with catalog, page tree and cross-reference; a generated 1x1 PNG; a handcrafted 8x8 grayscale JPEG; ZIP and nested ZIP files; a multipart MIME email; an email containing a ZIP attachment; an attachment with an executable-like header and misleading image extension; a malformed ZIP; a missing path; a high-compression ZIP; and a ZIP with 31 entries. It also creates a synthetic hash-signature DB and harmless synthetic signature content. No real malware or downloaded sample is used. The JPEG and PDF specimens were not independently decoded by an external codec in this environment; the scanner itself only checks their raw bytes and identifiable headers. Prior existing EICAR test-string tests remain controlled, harmless fixtures.
+
+4. Successful detections
+The end-to-end test creates a real file, computes its SHA-256 independently, compiles a structurally valid synthetic RSIDB, invokes the CLI, confirms DETECTED with exit code 1, checks the reported full-file SHA-256, and finds the expected synthetic detection name. Matching content was also detected inside a ZIP, a nested ZIP, a MIME base64 attachment and a MIME ZIP attachment. The nested human report includes the actual synthetic detection name. A misleading extension produces a non-CLEAN result; that is an anomaly result, not proof of malware. No synthetic signature is described as genuine threat intelligence.
+
+5. Negative and failure tests
+Ordinary nonmatching text, PDF, PNG and JPEG specimens produced CLEAN under the test signatures. A missing file produced ERROR. An invalid ZIP claim produced UNSCANNED. A too-small root file-size limit, archive-entry limit and decompression limits produced ERROR or another non-CLEAN result. A deterministic expired tracker returned a timeout error. The serialized legacy status aliases and invalid zero streaming-buffer cases were tested. A repeated synthetic pattern appearing 10,000 times remains detected with bounded reporting. These tests do not establish detection efficacy for real malware.
+
+6. Unsupported formats and resource limits
+Known TAR, RAR, 7-Zip, GZIP, BZIP2, XZ, CAB and encrypted or unsupported ZIP members are not deeply inspected and should be UNSCANNED unless another detection has precedence. Other unrecognized formats can be scanned as raw files without format-specific inspection. Default limits are 50 MiB top-level file, 25 MiB per extracted item, 100 MiB cumulative extracted data, 30 shared attachment/archive entries, depth 5 and 10 seconds; tests exercise smaller configured budgets and oversize input. ZIP parsing can allocate its central-directory structures before the entry count is checked, and MIME parsing/decode and individual blocking reads are not preemptible at arbitrary points. There is no separate compression-ratio threshold or OS-enforced per-process memory ceiling. Limits are checked cooperatively; they are not a hard sandbox or real-time guarantee.
+
+7. Release-mode performance and archive overhead
+The committed benchmark generates harmless deterministic files of 1,000,000, 10,000,000 and 50,000,000 bytes, a 216-byte synthetic one-record RSIDB, and a 39,464-byte ZIP containing 10,000,000 bytes of generated data. It uses a new process for each run, 3 file/hash runs per size, and 5 isolated structural DB-load runs. First-run elapsed time is shown, but the files were just generated and cached; no true cold-page-cache test was performed. Thus these are fresh-process, warm/unspecified-page-cache measurements, not cold-cache or production capacity claims.
+
+file | hash median ms | hash MiB/s | scan first ms | scan median ms | scan range ms | peak process RSS KiB
+1,000,000 bytes | 0.792 | 1203.45 | 7.982 | 8.022 | 7.982–10.437 | 10,340
+10,000,000 bytes | 8.289 | 1150.47 | 49.311 | 49.311 | 46.243–52.576 | 14,208
+50,000,000 bytes | 39.376 | 1210.99 | 217.180 | 233.335 | 217.180–306.564 | 53,376
+ZIP, 39,464 bytes compressed / 10,000,000 bytes extracted | not measured | n/a | 50.921 | 50.921 | 48.948–52.112 | 14,336
+
+The 10 MB ZIP and raw-file medians differed by about 1.61 ms in this small, noisy sample; that is not an isolated decompression cost. The 216-byte fixture DB's isolated structural load median was 0.020 ms (range 0.020–0.039 ms, five processes). It does not measure authenticated public-release verification or private evidence verification, and a one-record DB is not representative of a large deployment. Full-scan timings include process startup and loading that synthetic DB, so DB load and file-processing figures should not be subtracted as exact independent costs.
+
+Reproduce from the checkout:
+  cargo build --release -p raxosentinel-cli --bin raxosentinel --bin phase3a_bench_helper
+  python3 crates/raxosentinel-cli/benches/phase3a_scan.py target/release/raxosentinel target/release/phase3a_bench_helper
+
+8. Scanner memory measurements
+RSS values above are OS wait4 peak process RSS for entire scanner child processes, including runtime, libraries, DB, file buffers and potentially pre-exec launcher effects. They are not incremental DB memory or strict heap limits. Peak RSS rose to about 52 MiB for the 50,000,000-byte file, consistent with the whole-file buffering design. No reliable allocation-by-component or cold-cache memory measurement was made.
+
+9. Persistent-scanner architecture recommendation
+A future daemon is feasible, but not implemented or deployed. It should load and verify one selected private or signed-public generation once, keep the resulting owned immutable index in shared Arc state, and serve length-limited requests over an owner-controlled Unix-domain socket with restrictive directory/socket permissions and peer-credential checks. Use bounded queues, fixed worker/concurrency limits, per-request size/extraction/depth/time budgets and explicit overload responses. Prefer passing already-open regular-file descriptors over trusting mutable paths; isolate complex parsing/decompression in constrained worker processes so wall-clock and memory limits can be enforced even when a library call blocks. Load and verify any replacement completely before an atomic pointer swap, preserve the previous verified instance on failure, and never fall back to an unverified or empty database. Preserve explicit CLEAN/DETECTED/UNSCANNED/ERROR outcomes and auditability. Define trust, authorization, lifecycle and recovery before implementation; do not expose network IPC by default.
+
+10. Tests, files and Git
+cargo fmt --all -- --check: PASS. cargo clippy --workspace --all-targets -- -D warnings: PASS. cargo test --workspace: PASS, 121 passed, 0 failed and 1 intentionally ignored scalability benchmark across 22 result groups. These include existing strict private-generation and signed-release tests.
+
+Changed: crates/raxosentinel-cli/src/main.rs, tests/integration_test.rs, tests/phase3a_corpus.rs, benches/phase3a_scan.py, src/bin/phase3a_bench_helper.rs; crates/raxosentinel-core/src/hash.rs, report.rs, status.rs; crates/raxosentinel-email/src/scanner.rs; crates/raxosentinel-signatures/src/database.rs. Branch phase-3a, commit f55a3c1f31354ec2562ab038f7143e4cb683a402. No push, merge, production service changes, new network service or malware download. Private intelligence and prior CTO reports were not committed.
+
+11. Outstanding issues
+The full scanner buffers target and extracted objects; it is not an end-to-end streaming scanner. Streaming hash and streaming byte-pattern APIs exist, but ZIP/MIME inspection still needs bounded buffering and further hardening. Timeouts cannot interrupt every individual blocking read, parser call or byte-pattern search. No hard process memory limit, independent compression-ratio cap, real cold-cache benchmark, broad decoder validation or production workload benchmark was performed. Extension mismatch is a heuristic. PDF/image inner content, unsupported archive formats and encrypted data require future format-aware support or explicit unscanned treatment as applicable. The public-release verifier remains a prototype with prior documented trust and governance limitations. Emitted status strings changed as requested, so consumers must update.
+
+12. Next CTO decision
+Decide whether to prioritize a bounded persistent local scanner with worker isolation, stronger format parsers and hard OS resource controls, or first improve streaming behavior and broaden the safe format corpus. Do not treat this research validation as production readiness.

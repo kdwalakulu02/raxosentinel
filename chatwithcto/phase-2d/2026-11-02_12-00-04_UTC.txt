@@ -1,0 +1,30 @@
+RaxoSentinel Phase 2D — Baseline report to CTO
+Date: 2026-11-02
+
+Repository: clean checkout on phase-2c, commit d299f35
+(fix(phase-2c): emergency intelligence integrity correction).
+
+Baseline test: cargo test --workspace could not start: cargo is not on PATH.
+No Cargo toolchain was found in /home/codespace/.cargo/bin or /usr/local/cargo/bin.
+The reported 91 passing tests therefore could not be independently verified.
+
+The Phase 2C handover reports zero verified genuine operational indicators. Eight
+previously claimed indicators are stored in the quarantined synthetic fixtures;
+their source manifest marks them synthetic_test, approved false, and internal_only.
+The test suite could not be run to independently verify count enforcement.
+
+A review of the existing ingestion code found that an operator can certify a
+source as genuine using verify_genuine_source / --verify-genuine-source along
+with a content hash. This does not establish authenticity from the acquisition
+process and does not meet Phase 2D's requirement. It must be addressed in the
+implementation, independently of redistribution permission.
+
+No Phase 2D branch, importer, database, benchmark, or implementation commit was
+created. No genuine indicators were obtained. No production infrastructure was
+touched. Work stopped because the CTO instruction required reporting a broken
+baseline before proceeding.
+
+Action requested: provide a working Rust toolchain with Cargo in this environment,
+then rerun the workspace baseline before creating phase-2d and implementing the
+importer. A MalwareBazaar API key will also be needed for a live acquisition;
+it should be supplied through RAXO_ABUSECH_AUTH_KEY, never in a report or commit.

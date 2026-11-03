@@ -1,0 +1,31 @@
+RaxoSentinel — Codespaces setup and Phase 2D status
+Date: 2026-11-02
+
+Environment: Ubuntu 24.04 Codespace. Official stable Rust 1.99.1, Cargo,
+rustfmt, Clippy and rust-analyzer installed via rustup. Cargo environment can
+be loaded with: source "$HOME/.cargo/env".
+
+Repository: phase-2d branch created from Phase 2C commit d299f35. No new commit.
+The prior CTO report remains untracked. Added .devcontainer/devcontainer.json
+using the official Rust Dev Container Feature; it has not been rebuilt or tested
+in a new Codespace.
+
+Baseline verification:
+- cargo fmt --all -- --check: passed.
+- cargo clippy --workspace --all-targets -- -D warnings: passed.
+- cargo test --workspace: 91 passed, 0 failed.
+
+The eight disputed indicators remain in the synthetic quarantine fixture. The
+handover reports zero verified genuine operational indicators. Existing tests
+cover synthetic and unverified source handling, but the current operator-controlled
+source certification is insufficient evidence of authentic acquisition.
+
+Phase 2D implementation is incomplete: no authenticated MalwareBazaar importer,
+acquisition-based authenticity pipeline, genuine intelligence acquisition, or
+benchmark has been completed. No production infrastructure was touched. No
+credentials were committed. No implementation commit was made.
+
+Next: implement and test the metadata-only authenticated importer and RSIDB
+pipeline, ensuring source authenticity derives from acquisition and keeping
+redistribution rights separate. Configure RAXO_ABUSECH_AUTH_KEY privately for
+live acquisition when available.

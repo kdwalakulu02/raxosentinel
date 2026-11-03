@@ -1,0 +1,219 @@
+RaxoSentinel Phase 3B.3 Handover — Bounded Concurrent Scanning
+
+Baseline: Branch phase-3b, commit 4fd70d18f6b6a7a5b05d50e0d18a6330a441cbb8.
+Commit: 1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d on branch phase-3b.
+Status: Implemented bounded concurrent scanning coordinator research prototype with global resource accounting, flock-serialized trust state, and failure isolation. Research prototype only; not for production deployment.
+
+================================================================================
+1. CONCURRENCY ARCHITECTURE & GLOBAL RESOURCE ACCOUNTING
+================================================================================
+
+- Bounded Worker Pool:
+  `raxosentinel serve` supports configurable simultaneous active scans via `--max-workers` (default: 1 for backward compatibility; tested with 1, 2, and 4 workers). A fixed pool of worker runner threads pulls requests from a bounded synchronized queue (`VecDeque<UnixStream>`) protected by `(Mutex<CoordinatorState>, Condvar)`.
+
+- Fresh Isolated Worker Process Per Scan:
+  Each active scan spawns a dedicated, fresh supervisor child process (`execute_worker_on_snapshot`) that applies process-group isolation, resource limits, Landlock filesystem deny-all, and executes untrusted parsing. No worker process is persistent or retains untrusted parsing state across scans.
+
+- Bounded Pending Queue & Prompt Overload Rejection:
+  Pending connection admissions are strictly bounded by `--max-pending` (default: 1). If the total in-flight connections (active workers + queued streams) reaches capacity (`max_workers + max_pending`), the coordinator immediately returns a structured `BUSY` verdict with `stream.shutdown(Shutdown::Write)` and drain, rejecting excess clients in < 3 ms without thread or descriptor growth.
+
+- Global Resource Accounting:
+  The coordinator tracks and enforces strict global limits:
+  1. Active Worker Count: capped at `--max-workers` (default 1).
+  2. Pending Request Count: capped at `--max-pending` (default 1).
+  3. Maximum File Input Size: capped at `--max-size` (default 52,428,800 bytes / 50 MiB).
+  4. Total In-Flight Sealed Snapshot Bytes: capped at `--max-total-snapshot-bytes` (default: 209,715,200 bytes / 200 MiB).
+  5. Per-Worker Address Space: capped at `--worker-memory` (default: 1,073,741,824 bytes / 1 GiB virtual address space via `RLIMIT_AS`).
+  6. Worker Execution Duration: capped at `--worker-timeout-ms` (default: 10,000 ms).
+
+- RAII Snapshot Memory Accounting:
+  Memory used by sealed `memfd` snapshots is accounted for in application space before snapshot creation. A `SnapshotReservation` RAII guard acquires capacity under lock and automatically decrements `in_flight_snapshot_bytes` when dropped. Reservations are guaranteed to be released on normal scan completion, worker crash, supervisor timeout, client disconnection, or input validation errors.
+
+- Application Accounting vs OS Memory Isolation:
+  Application-level accounting limits total snapshot bytes held in kernel tmpfs/shmem buffers. Operating-system memory isolation for workers is enforced via POSIX `setrlimit(RLIMIT_AS)` for virtual memory. Sealed `memfd` pages reside in kernel memory outside the worker's user-space heap/RSS; complete tree-wide memory containment cannot be established without cgroup v2.
+
+================================================================================
+2. DATABASE CONCURRENCY SAFETY & CONFINEMENT LIFECYCLE
+================================================================================
+
+- Private Generation Storage:
+  Private generations (`--private-db-root` and `--private-generation`) consist of immutable published artifacts (`rules.rsidb`, `metadata.json`). Concurrent worker processes open these files read-only and memory-map the index (`MmapCompactDirIndex`), making concurrent access completely race-free without synchronization overhead.
+
+- Signed-Public Release & Rollback-State Serialization:
+  For signed-public releases (`--public-release`, `--public-key`, `--public-approval-key`, `--public-state`), concurrent workers independently verify signatures and inspect `public-release-state`. Shared mutable rollback state is serialized via `flock(LOCK_EX)` on `public-release-lock`. State file updates are written to PID-and-counter temporary files (`.public-release-state-<pid>-<counter>`), fsynced, and atomically replaced via `renameat`. If a worker is abruptly killed by `SIGKILL`, the Linux kernel automatically releases all file locks held by the deceased process.
+
+- Database Loading vs Landlock Lockdown Lifecycle:
+  1. Worker Startup: Child process is spawned with cleared environment and passed the sealed snapshot FD as stdin.
+  2. Database Loading: Worker opens and verifies the database index and rollback state from disk.
+  3. Landlock Lockdown: Once database files are loaded/mapped into memory, `supervised::restrict_worker_filesystem()` invokes Landlock ABI 1 with deny-all access (`PR_SET_NO_NEW_PRIVS` + Landlock ruleset with zero permitted filesystem paths).
+  4. Untrusted Parsing: Input scanning, ZIP unpacking, and MIME parsing execute exclusively on the already-open anonymous snapshot descriptor (fd 0). The worker has zero access to the filesystem, coordinator socket, or rollback state files during untrusted inspection.
+
+- No Silent Fallback:
+  Per-worker database verification is strictly preserved. No shared in-memory unverified index transfer or silent fallback to built-in rules is permitted.
+
+================================================================================
+3. COORDINATOR RESILIENCE & DEADLINES
+================================================================================
+
+- Bounded Connection Read Deadline:
+  A configurable client read timeout (`--client-timeout-secs`, default: 5s) is applied to all incoming client sockets (`SO_RCVTIMEO`). If a client connects and stalls without transmitting the complete request or file descriptor within the deadline, the coordinator closes the connection and frees the worker/queue slot immediately.
+
+- Client Disconnection During Scan:
+  If a client disconnects while waiting in the queue or during scan execution, the supervisor finishes worker execution, safely reaps the child, drops the snapshot reservation, and closes all file descriptors. Response write errors (`EPIPE`, `ECONNRESET`) are handled gracefully without panicking.
+
+- Worker Crash & Timeout Isolation:
+  Worker process crashes (`SIGKILL`, `SIGSEGV`) or timeouts (`worker_timeout_ms`) are trapped by the supervisor. The offending process group is terminated with `SIGKILL`, an explicit `ERROR` verdict is returned to the client, and other active worker scans continue completely unaffected.
+
+- Graceful Shutdown:
+  On `SIGINT` or `SIGTERM`, the coordinator transitions to shutdown state, closes the listener, finishes all active scans and admitted queued requests, joins all worker threads, unlinks the socket file safely, and exits with status 0.
+
+- Zero Descriptor Leakage:
+  Every received descriptor from `recvmsg` (`SCM_RIGHTS`) is tracked and closed on all error paths (malformed JSON, oversized payloads, non-regular files, extra FDs, snapshot errors). Verified by sampling `/proc/<pid>/fd` before and after burst requests.
+
+- Operations Outside Enforceable Deadlines:
+  While worker execution is bounded by `worker_timeout_ms` and client communication is bounded by `client_timeout_secs`, the initial copy into `memfd` (`std::io::copy`) from the client's descriptor operates synchronously in the coordinator. Because the descriptor is validated via `fstat` to be a regular file (`S_IFREG`), it cannot block on network sockets or pipes, but slow I/O on large local files could theoretically take time proportional to file size before the worker process deadline starts.
+
+================================================================================
+4. EXACT COMMANDS
+================================================================================
+
+- Start Coordinator (Single Worker Default):
+  target/release/raxosentinel serve --socket /tmp/raxo/raxosentinel.sock --private-db-root /path/to/db_root --private-generation fixture
+
+- Start Coordinator (2 Workers, Bounded Concurrency):
+  target/release/raxosentinel serve --socket /tmp/raxo/raxosentinel.sock --private-db-root /path/to/db_root --private-generation fixture --max-workers 2 --max-pending 4 --max-total-snapshot-bytes 209715200
+
+- Start Coordinator (4 Workers, Signed-Public Release):
+  target/release/raxosentinel serve --socket /tmp/raxo/raxosentinel.sock --public-release /path/to/release --public-key /path/to/key.pub --public-approval-key /path/to/appr.pub --public-state /path/to/state --max-workers 4 --max-pending 8
+
+- Submit Scan via Client:
+  target/release/raxosentinel client --socket /tmp/raxo/raxosentinel.sock /path/to/target.txt --json
+
+- Preserved Supervised CLI Scan:
+  target/release/raxosentinel scan --supervised /path/to/target.txt --json --private-db-root /path/to/db_root --private-generation fixture
+
+================================================================================
+5. INTEGRATION TEST RESULTS
+================================================================================
+
+The test suite in `crates/raxosentinel-cli/tests/coordinator.rs` verifies all 14 mandatory concurrency scenarios plus 5 preserved security tests (19 total tests, all passing):
+
+1.  test_01_two_concurrent_clean_scans:
+    Spawns coordinator with `--max-workers 2`; runs 2 simultaneous clients scanning clean files; confirms both return CLEAN (exit 0).
+2.  test_02_four_concurrent_scans:
+    Spawns coordinator with `--max-workers 4`; runs 4 simultaneous clients; confirms all return CLEAN concurrently (exit 0).
+3.  test_03_eight_simultaneous_clients_bounded_admission:
+    Spawns coordinator with `--max-workers 4 --max-pending 2` (capacity 6); releases 8 clients concurrently via `Barrier`; confirms exactly 6 clients admitted (4 active + 2 queued) and exactly 2 clients rejected with `BUSY` (exit 3).
+4.  test_04_mixed_clean_and_detected_results:
+    Runs 4 concurrent clients submitting alternating clean and infected files; confirms clean files return CLEAN and infected files return DETECTED concurrently without cross-talk.
+5.  test_05_concurrent_zip_detections:
+    Runs 4 concurrent clients scanning synthetic ZIP archives containing malware signatures; confirms all 4 workers unpack and report DETECTED under Landlock isolation.
+6.  test_06_worker_crash_without_affecting_other_scans:
+    Spawns coordinator with `--max-workers 2`; client 1 triggers worker crash (`SIGKILL`), client 2 scans clean file; confirms client 1 receives ERROR while client 2 receives CLEAN without delay.
+7.  test_07_worker_timeout_without_affecting_other_scans:
+    Coordinator configured with `--max-workers 2 --worker-timeout-ms 300`; client 1 triggers worker hang, client 2 scans clean file; confirms client 1 times out (ERROR) while client 2 finishes CLEAN immediately.
+8.  test_08_client_disconnection_and_resource_release:
+    Client sends request with delay and disconnects immediately; verifies worker cleans up snapshot memory and subsequent scan completes cleanly without resource exhaustion.
+9.  test_09_slow_or_incomplete_protocol_messages:
+    Coordinator with `--client-timeout-secs 1`; client sends partial 2-byte header and stalls; confirms coordinator times out, closes connection, and remains responsive for next client.
+10. test_10_queue_saturation_with_immediate_busy:
+    Saturates single worker and pending queue; 3rd client receives structured `BUSY` in < 3 ms non-blocking.
+11. test_11_signed_public_verification_and_rollback_state_concurrency:
+    Coordinator with `--public-release` and `--max-workers 4`; 4 concurrent clients trigger simultaneous worker verification and `flock(LOCK_EX)` serialization on `public-release-lock`; confirms all succeed and state file maintains valid sequence 1.
+12. test_12_graceful_shutdown_with_active_work:
+    Coordinator receives `SIGTERM` while 2 scans are active; confirms coordinator finishes in-flight scans, sends valid CLEAN reports to clients, cleans up socket, and exits with 0.
+13. test_13_no_descriptor_leaks_across_repeated_requests:
+    Counts open descriptors in coordinator via `/proc/<pid>/fd`; runs 30 mixed requests; confirms final descriptor count matches initial descriptor count exactly (0 leaked FDs).
+14. test_14_preserve_direct_cli_compatibility:
+    Confirms direct CLI `scan`, supervised CLI `scan`, and single-worker coordinator produce identical verdicts.
+
+Additional Preserved Tests:
+- test_security_reject_invalid_descriptors: Directory, missing, extra, and pipe FDs rejected.
+- test_security_reject_malformed_and_oversized_messages: Zero-length, oversized (>64 KiB), and bad JSON rejected.
+- test_security_reject_unauthorized_peer_credentials: UID mismatch rejected with error.
+- test_security_sealed_snapshot_unaffected_by_original_modification: Modifying file during scan does not alter sealed memfd.
+- test_security_reject_invalid_database_at_startup: Rejects legacy DB, unverified generation, and missing generation.
+
+================================================================================
+6. PERFORMANCE MEASUREMENTS (RELEASE BUILD)
+================================================================================
+
+Hardware Environment:
+- Platform: Linux 6.8.0-1064-azure #72~22.04.1-Ubuntu SMP x86_64
+- CPU: 2 vCPUs (AMD EPYC 7763 64-Core Processor)
+- Memory: 8 GiB
+- Benchmark Harness: `crates/raxosentinel-cli/tests/benchmark.rs` (release profile, warm cache, synthetic files)
+
+[1] Per-Worker Peak RSS (VmHWM sampled externally every 1ms):
+- 1 MB Input:   6,084 KiB (5.94 MiB)
+- 10 MB Input:  15,536 KiB (15.17 MiB)
+- 50 MB Input:  56,184 KiB (54.87 MiB)
+
+[2] Concurrency Scaling Benchmarks (1, 2, and 4 Workers):
++---------+-------------+---------+------------+------------+-----------+----------------+------------+
+| Workers | Target Size | Reqs/s  | Median Lat | p95 Lat    | Coord RSS | Snapshots      | CPU Util % |
++---------+-------------+---------+------------+------------+-----------+----------------+------------+
+| 1       | 1 MB        |   72.18 |   13.16 ms |   22.29 ms |   4.2 MiB |   1.0 MiB in-fl|      73.8% |
+| 1       | 10 MB       |   12.77 |   81.09 ms |   97.50 ms |   4.2 MiB |  10.0 MiB in-fl|      82.4% |
+| 1       | 50 MB       |    3.11 |  315.70 ms |  348.23 ms |   4.2 MiB |  50.0 MiB in-fl|      66.7% |
++---------+-------------+---------+------------+------------+-----------+----------------+------------+
+| 2       | 1 MB        |  121.86 |   15.76 ms |   21.84 ms |   4.3 MiB |   2.0 MiB in-fl|      96.2% |
+| 2       | 10 MB       |   20.05 |   91.42 ms |  140.76 ms |   4.3 MiB |  20.0 MiB in-fl|      98.7% |
+| 2       | 50 MB       |    4.47 |  451.42 ms |  456.84 ms |   4.3 MiB | 100.0 MiB in-fl|     100.0% |
++---------+-------------+---------+------------+------------+-----------+----------------+------------+
+| 4       | 1 MB        |  129.31 |   29.36 ms |   40.28 ms |   4.4 MiB |   4.0 MiB in-fl|     100.0% |
+| 4       | 10 MB       |   15.78 |  224.16 ms |  288.68 ms |   4.4 MiB |  40.0 MiB in-fl|     100.0% |
+| 4       | 50 MB       |    4.16 |  929.93 ms |  960.94 ms |   4.4 MiB | 200.0 MiB in-fl|      98.4% |
++---------+-------------+---------+------------+------------+-----------+----------------+------------+
+
+[3] Queue Saturation & Immediate Overload Latency:
+- Immediate BUSY Latency: 2.76 ms (immediate non-blocking rejection under saturation).
+
+[4] Worker Timeout & Recovery Latency:
+- Configured Timeout: 20 ms (on 50 MB input)
+- Supervisor Abort Latency: 78.56 ms (process-group SIGKILL + child reap)
+- Subsequent Recovery Scan: 4.58 ms
+
+[5] Concurrency Scaling Analysis on 2 vCPUs:
+- Scaling 1 -> 2 Workers:
+  Yields substantial throughput improvements across all file sizes:
+  * 1 MB: +68.8% throughput increase (72.18 -> 121.86 RPS) with negligible median latency change (+2.6 ms).
+  * 10 MB: +57.0% throughput increase (12.77 -> 20.05 RPS).
+  * 50 MB: +43.7% throughput increase (3.11 -> 4.47 RPS).
+  CPU utilization scales from ~70-80% to ~96-100%, fully saturating both available vCPUs.
+- Scaling 2 -> 4 Workers:
+  Does NOT improve throughput on 2 vCPUs and actively harms latency:
+  * 1 MB: Marginal +6.1% throughput gain (121.86 -> 129.31 RPS), but median latency doubles (15.76 ms -> 29.36 ms).
+  * 10 MB: -21.3% throughput degradation (20.05 -> 15.78 RPS), with median latency surging by 2.45x (91.42 ms -> 224.16 ms).
+  * 50 MB: -6.9% throughput degradation (4.47 -> 4.16 RPS), with median latency increasing by 2.06x (451.42 ms -> 929.93 ms) and p95 latency reaching ~961 ms.
+  Cause: 4 active worker processes contending for 2 physical/virtual execution threads causes severe kernel context switching and CPU cache thrashing. Concurrency must be tuned to match hardware core count; `--max-workers 2` is optimal for this 2-vCPU environment.
+
+================================================================================
+7. OUTSTANDING SECURITY LIMITATIONS & BOUNDARIES
+================================================================================
+
+- Research Prototype Only:
+  This milestone implements local coordinator bounded concurrency. It is not approved or ready for production deployment, external network exposure, or Raxo Email integration.
+
+- Same-UID Authentication Boundary:
+  `SO_PEERCRED` verifies that the client process runs under the configured UID. It does NOT isolate the coordinator from other applications running under that exact same UID. Any process running as that UID can connect to the Unix socket.
+
+- Process Tree Containment & Lack of cgroup v2:
+  In the current Codespaces environment, `/sys/fs/cgroup` is not writable for uid 1000 and delegated cgroup v2 controllers are unavailable. Worker containment uses process groups (`setpgid`), `kill(-pgid, SIGKILL)`, and `PR_SET_NO_NEW_PRIVS`. A malicious worker that detaches from its session (`setsid()`) cannot be guaranteed to be reaped by the supervisor without cgroup v2 `cgroup.kill`.
+
+- Memory Isolation Boundaries:
+  Virtual address space is bounded by `RLIMIT_AS` (1 GiB per worker). However, sealed `memfd` snapshot bytes exist in kernel tmpfs/shmem pages outside the process address space. While application-level accounting tracks and bounds total in-flight snapshot bytes, hardware-enforced physical memory capping requires kernel cgroup `memory.max`.
+
+- Database Hot Replacement:
+  Not implemented in this milestone. A restart of the coordinator is required to rotate private generations or signed public releases.
+
+================================================================================
+VERIFICATION CHECKLIST
+================================================================================
+- cargo fmt --all -- --check ................... PASSED
+- cargo clippy --workspace --all-targets -- -D warnings ... PASSED
+- cargo test --workspace ....................... PASSED (all tests passing)
+- 14 Mandatory Concurrency Tests ............... PASSED
+- Release Benchmark Suite ...................... PASSED
+- Git branch ................................... phase-3b (HEAD at 1e77ba0)
+- Deployment status ............................ NO push, NO merge, NO deployment

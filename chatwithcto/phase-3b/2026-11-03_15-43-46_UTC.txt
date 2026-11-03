@@ -1,0 +1,102 @@
+RaxoSentinel Phase 3B.2 Handover — Persistent Local Scanner Coordinator
+
+Baseline: Branch phase-3b, commit a030e4411f87f124aee3bf29b202e84f945c8d37.
+Commit: 4fd70d18f6b6a7a5b05d50e0d18a6330a441cbb8 on branch phase-3b.
+Status: Implemented persistent Linux-local scanner coordinator research prototype with Unix file-descriptor passing. Not production ready.
+
+1. ARCHITECTURE & COORDINATOR SERVICE
+- Daemon: Implemented `raxosentinel serve` command listening strictly on a Unix domain socket. No TCP listener or network exposure exists.
+- Socket Directory & Permissions: Safe directory validation enforces owner-controlled restrictive permissions (0700). Parent directories must be owned by the current process UID; attempts to use insecure or foreign directories are refused. The socket file is created with 0600 permissions.
+- Stale Socket & Safe Cleanup: Symlink metadata inspection verifies socket ownership and file type before binding or unlinking. Symlinks, regular files, and foreign sockets are never overwritten or removed. Stale sockets from crashed instances are safely verified via connection failure and cleaned up on startup. Clean exit (SIGINT/SIGTERM) unlinks only the verified socket file.
+- Client Authentication: OS peer credentials (`SO_PEERCRED`) verify the connecting client's UID against the configured authorized UID (`--authorized-uid`, default current process UID). Unauthorized clients are rejected immediately with an explicit ERROR status without executing scans.
+- Concurrency & Queue Scope: Enforces one active scan at a time via a dedicated worker runner thread and a bounded synchronization channel (`sync_channel`, default `--max-pending 1`). Connections beyond admitted capacity receive an immediate, non-blocking structured `BUSY` verdict with write shutdown and incoming drain to prevent connection reset races. No unbounded queue, threads, or memory accumulation can occur.
+- Resilience: The coordinator survives individual scan failures, client disconnects, worker crashes, and worker timeouts, continuing to serve subsequent requests cleanly.
+
+2. CLIENT INTERFACE & FILE DESCRIPTOR PASSING
+- Client: Implemented `raxosentinel client --socket <PATH> <TARGET>` and preserved `raxosentinel scan --socket <PATH> <TARGET>`.
+- Descriptor Passing: The client opens the target file locally with `O_NOFOLLOW | O_CLOEXEC` and transfers the open descriptor to the coordinator via `SCM_RIGHTS`. The coordinator never opens arbitrary file paths supplied by clients.
+- Descriptor Validation: The coordinator inspects the received descriptor using `fstat`. Exactly one descriptor must be received; missing descriptors, extra descriptors (including `MSG_CTRUNC` truncation), directory descriptors, pipe/FIFO descriptors, and non-regular files are rejected with structured ERROR responses. Received descriptors are closed in all failure paths without leakage.
+- Framing & Protocol: Bounded framing prefixes payloads with a 4-byte big-endian length header. Maximum request payload is strictly capped at 64 KiB; maximum response payload is capped at 2 MiB. Malformed JSON and oversized headers fail closed.
+- Structured Results: Results return explicit verdicts (`CLEAN`, `DETECTED`, `UNSCANNED`, `ERROR`, `BUSY`). Communication failures, truncations, and errors always exit with non-zero status (code 3) and are never treated as CLEAN.
+
+3. WORKER ISOLATION & PROTECTION REUSE
+- Snapshot Sealing: The received file descriptor is copied into an anonymous Linux `memfd` (`MFD_CLOEXEC | MFD_ALLOW_SEALING`) subject to running size limits (`--max-size`, default 50 MiB). The memfd is sealed with `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL` before worker invocation.
+- Process Confinement: The Phase 3B.1H supervised scanning path is executed on the sealed snapshot. The worker is spawned in a separate process group (`setpgid(0, 0)`), virtual address space limit is applied via `RLIMIT_AS`, environment is cleared (`env_clear()`), and Landlock ABI 1 deny-all filesystem isolation is activated before untrusted input parsing.
+- Deadlines & Reaping: The coordinator supervisor enforces worker execution deadlines (`--worker-timeout-ms`, default 10s). On timeout or crash, `SIGKILL` is sent to the worker process group, and the direct child is reaped.
+
+4. DATABASE TRUST & LOADING BEHAVIOR
+- Trust Requirements: At startup, `raxosentinel serve` requires an explicitly selected, verified private generation (`--private-db-root` and `--private-generation`) or an authenticated signed-public release (`--public-release`, `--public-key`, `--public-approval-key`, `--public-state`). Legacy database options (`--db`, `--db-store`) are rejected.
+- Startup Verification: The generation/release is verified before the coordinator binds the socket or accepts client connections.
+- Loading Behavior: Workers spawned by the coordinator independently reload and re-verify the database generation files under Landlock rules. The database is NOT loaded into coordinator memory or shared across workers in this prototype.
+
+5. EXACT COMMANDS
+- Start Coordinator (Private Generation):
+  target/release/raxosentinel serve --socket /tmp/raxo_runtime/raxosentinel.sock --private-db-root /path/to/db_root --private-generation fixture
+- Start Coordinator (Signed Public Release):
+  target/release/raxosentinel serve --socket /tmp/raxo_runtime/raxosentinel.sock --public-release /path/to/release --public-key /path/to/key.pub --public-approval-key /path/to/appr.pub --public-state /path/to/state
+- Submit Scan via Dedicated Client:
+  target/release/raxosentinel client --socket /tmp/raxo_runtime/raxosentinel.sock /path/to/target.txt --json
+- Submit Scan via Standard CLI Wrapper:
+  target/release/raxosentinel scan --socket /tmp/raxo_runtime/raxosentinel.sock /path/to/target.txt --json
+- Preserved Direct CLI Scan:
+  target/release/raxosentinel scan /path/to/target.txt --json --private-db-root /path/to/db_root --private-generation fixture
+- Preserved Supervised CLI Scan:
+  target/release/raxosentinel scan --supervised /path/to/target.txt --json --private-db-root /path/to/db_root --private-generation fixture
+
+6. INTEGRATION TESTS
+Test suite `crates/raxosentinel-cli/tests/coordinator.rs` exercises the Unix socket and supervised worker process across all 14 mandatory scenarios:
+- test_01_and_02_start_coordinator_and_clean_file: Starts coordinator, connects client, submits clean synthetic file; confirms status CLEAN (exit 0).
+- test_03_detect_harmless_synthetic_signature: Submits synthetic signature; confirms DETECTED verdict with threat name (exit 1).
+- test_04_detect_content_inside_zip: Submits ZIP archive containing synthetic signature; confirms DETECTED verdict (exit 1).
+- test_05_reject_invalid_descriptors: Exercises directory FD, missing FD, extra FDs, and pipe FD; confirms all rejected with ERROR and coordinator remains operational.
+- test_06_reject_malformed_and_oversized_messages: Exercises oversized payload length (>64 KiB), malformed JSON, and truncated connections; confirms fail-closed behavior.
+- test_07_reject_unauthorized_peer_credentials: Starts coordinator with `--authorized-uid` set to a foreign UID; confirms client is rejected with UID mismatch error (exit 3).
+- test_08_bounded_overload_behavior: Configures `--max-pending 1`; saturates runner and queue with delayed tasks; confirms third concurrent request receives immediate non-blocking BUSY (exit 3).
+- test_09_recover_after_worker_crash: Triggers worker fault crash; confirms coordinator returns ERROR, survives, and processes subsequent clean scan.
+- test_10_recover_after_worker_timeout: Triggers worker hang; confirms parent enforces timeout, terminates process group, and recovers for subsequent scan.
+- test_11_sealed_snapshot_unaffected_by_original_modification: Submits file with worker delay, overwrites original file on disk with signature during delay; confirms worker reports CLEAN on snapshot while subsequent disk scan reports DETECTED.
+- test_12_shutdown_and_restart_cleanly: Verifies SIGTERM causes clean exit and socket removal, restarts coordinator on same path, and validates stale socket recovery.
+- test_13_reject_invalid_database_at_startup: Confirms coordinator rejects missing DB, legacy DB, and unverified generations before socket binding (exit 3).
+- test_14_preserve_direct_cli_compatibility: Verifies direct scan and supervised scan CLI commands remain functional and produce identical verdicts.
+
+7. MEASUREMENTS (RELEASE BUILD)
+Platform: Linux codespaces-882688 6.8.0-1064-azure #72~22.04.1-Ubuntu SMP x86_64, 2 vCPUs AMD EPYC 7763, warm cache, synthetic inputs, 5 runs each.
+Benchmark binary: `crates/raxosentinel-cli/tests/benchmark.rs`
+
+- Coordinator Startup & Database Verification:
+  Median startup + verification latency: 2.28 ms
+  Idle coordinator process RSS: 4,396 KiB (4.29 MiB)
+
+- Sequential Scan Latency & Throughput:
+  Target Size   | Direct CLI        | Supervised CLI     | Socket Client
+  Empty (0 B)   |  2.05 ms          |   4.10 ms          |   4.26 ms
+  1 MB          | 10.45 ms (95.7 MB/s)| 11.55 ms (86.6 MB/s)| 13.97 ms (71.6 MB/s)
+  10 MB         | 55.55 ms (180 MB/s)| 75.82 ms (132 MB/s)| 71.73 ms (139 MB/s)
+
+- Worker Peak RSS (VmHWM sampled externally every 1 ms):
+  1 MB input:   5,912 KiB (5.77 MiB)
+  10 MB input: 15,532 KiB (15.17 MiB)
+  50 MB input: 56,340 KiB (55.02 MiB)
+
+- Overload Response Behavior:
+  With `--max-pending 1`, when active worker and pending queue are occupied, overloaded requests receive structured `BUSY` verdict in 2.93 ms without blocking or queuing.
+
+- Worker Timeout and Recovery:
+  Configured worker deadline (15 ms on 50 MB scan): aborted in 68.08 ms (group SIGKILL + reap).
+  Subsequent recovery scan latency: 7.87 ms.
+
+- Memory Model Note (User-space RSS vs Kernel memfd):
+  Reported process RSS/HWM captures only mapped user-space pages. The sealed anonymous memfd snapshot is held in the Linux kernel shmem/tmpfs layer (`Shmem` in /proc/meminfo), consuming an additional ~file size of kernel RAM (e.g. 1 MB, 10 MB, 50 MB) during scan execution, which is reclaimed when the descriptor is closed.
+
+8. OUTSTANDING LIMITATIONS & SECURITY BOUNDARIES
+- Not complete sandboxing: Hostile code that intentionally detaches from its session/process group can outlive the supervisor group kill. Parent cannot generally reap grandchildren.
+- Lack of cgroup v2 containment: In this container environment, `/sys/fs/cgroup` is not writable for uid 1000 and no delegated cgroup v2 subtree is available. No tree-wide `memory.max`, `pids.max`, or `cgroup.kill` is enforced.
+- Concurrency scope: Single active scan runner with bounded pending queue. A multi-worker process pool is not implemented in this milestone.
+- Identity separation: The coordinator and worker processes execute under the same user identity. Verified database files, keys, and state files must remain accessible to this identity during worker initialization.
+- Future deployment requirements: Dedicated worker user identity, delegated cgroup v2 controller placement, openat2 path resolution restrictions, and full request-lifecycle timeouts.
+
+Verification:
+- cargo fmt --all -- --check (passed)
+- cargo clippy --workspace --all-targets -- -D warnings (passed)
+- cargo test --workspace (passed, 0 failures, 1 ignored benchmark)
+- No push, merge or deployment performed.

@@ -1,0 +1,42 @@
+RaxoSentinel — Debian 13 and Phase 2D validation report
+
+1. Container configuration
+The Dev Container now builds from the official mcr.microsoft.com/devcontainers/base:trixie image, with build-essential, ca-certificates and pkg-config. The official Rust Dev Container Feature installs Rust 1.99.1; the VS Code rust-analyzer extension remains configured. No mail server, database, GUI or antivirus service was added. Cargo.lock is unchanged.
+
+2. Toolchain and verification
+rust-toolchain.toml pins 1.99.1 with the minimal profile, rustfmt and Clippy. Rust 1.99.1 (58cf8f9c3 2026-10-13), Cargo 1.99.1, rustfmt 1.10.0 and Clippy 0.1.99 were verified on the existing Ubuntu 24.04.5 container. The precise pin was installed and used for the checks below.
+
+3. Fresh container build
+Not performed. This is an active Codespace, the Dev Container CLI is unavailable, and the current session cannot access the Docker daemon. Debian, the feature installation and native dependencies have therefore not been tested in a fresh container. In the Codespaces VS Code command palette, run “Codespaces: Rebuild Container” (or “Dev Containers: Rebuild Container” when using VS Code's Dev Containers command). A restart alone is not a rebuild. The configuration commit is in place and existing untracked CTO reports have been preserved. After rebuilding, verify /etc/os-release, rustc --version, cargo clippy --version, and rerun the three checks in section 8.
+
+4. MalwareBazaar authentication
+RAXO_ABUSECH_AUTH_KEY was absent from this process. No request was made, so neither authentication success nor an API error was observed. No secret was printed or stored. Confirm the Codespaces secret is available to this repository and rebuild/reopen as required for the secret to reach the environment; check presence without printing its value.
+
+5. Indicators
+Genuine indicators acquired: 0. Accepted, invalid and duplicate counts are unavailable; no live response was received. No replacement data was manufactured and no malware binaries were downloaded.
+
+6. Database and lookups
+No genuine RSIDB was compiled or verified and no genuine hash lookup was performed. Existing offline tests exercise a synthetic response and lookup only. The importer retains both the complete response and accepted metadata inside provenance in the RSIDB. This duplicates information and increases index size and memory footprint; retain the raw source evidence privately in a separate restricted file with a response digest and acquisition metadata in the database when a safe sidecar design is implemented and validated. Evidence stored this way would still not be an upstream cryptographic signature. Timestamp validation currently checks only nonempty bounded strings, not valid calendar timestamps; live validation must address this before trusting imported records. Duplicate and invalid counts are currently combined.
+
+7. Performance
+Genuine indicator count, RSIDB size, load time, memory consumption and lookup throughput: not measured, because there is no authenticated live dataset. No ClamAV-equivalent protection is claimed.
+
+8. Tests
+Before changes: cargo test --workspace passed, 95 tests, 0 failures. After changes using the pinned 1.99.1 toolchain on Ubuntu: cargo fmt --all -- --check passed; cargo clippy --workspace --all-targets -- -D warnings passed; cargo test --workspace passed, 95 tests, 0 failures. These are not Debian rebuild results. No real API response was available from which to derive additional regression tests.
+
+9. Files changed in implementation commit
+.devcontainer/devcontainer.json
+.devcontainer/Dockerfile
+rust-toolchain.toml
+This report and earlier reports remain untracked under chatwithcto, as found. No production service was modified.
+
+10. Commit
+Branch: phase-2d
+Implementation commit: 9eb189ded56c58b2cb7630a53608e536eb2887a6
+Not pushed or merged.
+
+11. Outstanding issues
+Fresh Debian build and checks; authenticated metadata-only acquisition; semantic timestamp validation; distinct invalid/duplicate accounting; private evidence separation and live database verification, lookups and measurements. API authentication errors and actual upstream response formats are untested. Source redistribution rights remain unverified.
+
+12. Next CTO decision/action
+Rebuild the Codespace container using the command in section 3 and ensure the existing Codespaces secret is available to this repository and session without sharing its value. Then continue live validation and make an informed decision on secure evidence sidecar storage and redistribution before any publication.
