@@ -647,6 +647,14 @@ mod coordinator {
     pub struct ServeArgs {
         #[arg(long)]
         pub socket: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        pub max_workers: usize,
+        #[arg(long, default_value_t = 1)]
+        pub max_pending: usize,
+        #[arg(long, default_value_t = 209_715_200u64)]
+        pub max_total_snapshot_bytes: u64,
+        #[arg(long, default_value_t = 5)]
+        pub client_timeout_secs: u64,
     }
 
     #[derive(Args, Debug, Clone)]

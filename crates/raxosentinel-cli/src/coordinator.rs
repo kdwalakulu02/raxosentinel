@@ -25,6 +25,7 @@ use raxosentinel_core::{ScanReport, ScanStatus};
 use raxosentinel_signatures::rsidb::crypto;
 use raxosentinel_signatures::rsidb::malwarebazaar::private_store;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -32,7 +33,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -55,9 +56,21 @@ pub struct ServeArgs {
     #[arg(long)]
     pub authorized_uid: Option<u32>,
 
+    /// Maximum number of active worker scans running simultaneously (default: 1)
+    #[arg(long, default_value_t = 1)]
+    pub max_workers: usize,
+
     /// Maximum number of queued/pending requests while a scan is active (default: 1)
     #[arg(long, default_value_t = 1)]
     pub max_pending: usize,
+
+    /// Maximum total bytes of in-flight sealed snapshots allowed concurrently (default: 200 MiB)
+    #[arg(long, default_value_t = 209_715_200u64)]
+    pub max_total_snapshot_bytes: u64,
+
+    /// Client connection read timeout in seconds (default: 5s)
+    #[arg(long, default_value_t = 5)]
+    pub client_timeout_secs: u64,
 
     /// Worker address-space limit in bytes (default 1 GiB).
     #[arg(long, default_value_t = 1_073_741_824u64)]
@@ -625,8 +638,131 @@ pub fn recv_framed_response(stream: &mut UnixStream) -> Result<CoordinatorRespon
     Ok(response)
 }
 
-fn handle_client_connection(mut stream: UnixStream, worker_config: &SupervisedWorkerConfig) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+pub struct CoordinatorState {
+    pub pending_queue: VecDeque<UnixStream>,
+    pub max_pending: usize,
+    pub active_workers: usize,
+    pub max_workers: usize,
+    pub in_flight_snapshot_bytes: u64,
+    pub max_total_snapshot_bytes: u64,
+    pub shutdown: bool,
+}
+
+#[derive(Debug)]
+pub enum ReservationError {
+    ExceedsMaxBudget(String),
+    OverCapacity(String),
+}
+
+pub struct SnapshotReservation {
+    state: Arc<(Mutex<CoordinatorState>, Condvar)>,
+    reserved_bytes: u64,
+}
+
+impl SnapshotReservation {
+    pub fn new(
+        state: Arc<(Mutex<CoordinatorState>, Condvar)>,
+        requested_bytes: u64,
+    ) -> Result<Self, ReservationError> {
+        let (lock, _cvar) = &*state;
+        let mut guard = lock.lock().unwrap();
+        if requested_bytes > guard.max_total_snapshot_bytes {
+            return Err(ReservationError::ExceedsMaxBudget(format!(
+                "File size ({} bytes) exceeds coordinator snapshot budget ({} bytes)",
+                requested_bytes, guard.max_total_snapshot_bytes
+            )));
+        }
+        let needed = match guard.in_flight_snapshot_bytes.checked_add(requested_bytes) {
+            Some(n) => n,
+            None => {
+                return Err(ReservationError::OverCapacity(
+                    "Snapshot byte counter overflow".into(),
+                ));
+            }
+        };
+        if needed > guard.max_total_snapshot_bytes {
+            return Err(ReservationError::OverCapacity(format!(
+                "Coordinator busy: snapshot memory limit exceeded (current in-flight: {} bytes, requested: {} bytes, limit: {} bytes)",
+                guard.in_flight_snapshot_bytes, requested_bytes, guard.max_total_snapshot_bytes
+            )));
+        }
+        guard.in_flight_snapshot_bytes = needed;
+        Ok(Self {
+            state: Arc::clone(&state),
+            reserved_bytes: requested_bytes,
+        })
+    }
+
+    pub fn update(&mut self, actual_bytes: u64) {
+        let (lock, cvar) = &*self.state;
+        let mut guard = lock.lock().unwrap();
+        if actual_bytes > self.reserved_bytes {
+            let diff = actual_bytes - self.reserved_bytes;
+            guard.in_flight_snapshot_bytes = guard.in_flight_snapshot_bytes.saturating_add(diff);
+        } else if actual_bytes < self.reserved_bytes {
+            let diff = self.reserved_bytes - actual_bytes;
+            guard.in_flight_snapshot_bytes = guard.in_flight_snapshot_bytes.saturating_sub(diff);
+            cvar.notify_all();
+        }
+        self.reserved_bytes = actual_bytes;
+    }
+}
+
+impl Drop for SnapshotReservation {
+    fn drop(&mut self) {
+        if self.reserved_bytes > 0 {
+            let (lock, cvar) = &*self.state;
+            let mut guard = lock.lock().unwrap();
+            guard.in_flight_snapshot_bytes = guard
+                .in_flight_snapshot_bytes
+                .saturating_sub(self.reserved_bytes);
+            self.reserved_bytes = 0;
+            cvar.notify_all();
+        }
+    }
+}
+
+fn send_busy_response(mut stream: UnixStream, reason: &str) {
+    let resp = CoordinatorResponse {
+        status: CoordinatorVerdict::Busy,
+        report: None,
+        error: Some(reason.into()),
+    };
+    let _ = send_framed_response(&mut stream, &resp);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut discard = [0u8; 1024];
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    while let Ok(n) = stream.read(&mut discard) {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+fn send_unauthorized_response(mut stream: UnixStream, reason: &str) {
+    let resp = CoordinatorResponse {
+        status: CoordinatorVerdict::Error,
+        report: None,
+        error: Some(reason.into()),
+    };
+    let _ = send_framed_response(&mut stream, &resp);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut discard = [0u8; 1024];
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    while let Ok(n) = stream.read(&mut discard) {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+fn handle_client_connection(
+    mut stream: UnixStream,
+    worker_config: &SupervisedWorkerConfig,
+    client_timeout_secs: u64,
+    shared_state: &Arc<(Mutex<CoordinatorState>, Condvar)>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(client_timeout_secs)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
     let (request, raw_fd) = match recv_fd_request(&mut stream) {
@@ -670,10 +806,65 @@ fn handle_client_connection(mut stream: UnixStream, worker_config: &SupervisedWo
         return;
     }
 
-    let source = unsafe { File::from_raw_fd(raw_fd) };
+    let file_size = if stat.st_size < 0 {
+        0u64
+    } else {
+        stat.st_size as u64
+    };
     let max_size = request
         .max_size
         .unwrap_or(worker_config.max_size.unwrap_or(52_428_800));
+
+    if file_size > max_size {
+        unsafe {
+            libc::close(raw_fd);
+        }
+        let target_path = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
+        let msg = format!(
+            "File size ({} bytes) exceeds maximum allowed size ({} bytes)",
+            file_size, max_size
+        );
+        let report = error_report(&target_path, msg.clone());
+        let resp = CoordinatorResponse {
+            status: CoordinatorVerdict::Error,
+            report: Some(report),
+            error: Some(msg),
+        };
+        let _ = send_framed_response(&mut stream, &resp);
+        return;
+    }
+
+    let mut reservation = match SnapshotReservation::new(Arc::clone(shared_state), file_size) {
+        Ok(res) => res,
+        Err(ReservationError::ExceedsMaxBudget(msg)) => {
+            unsafe {
+                libc::close(raw_fd);
+            }
+            let target_path = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
+            let report = error_report(&target_path, msg.clone());
+            let resp = CoordinatorResponse {
+                status: CoordinatorVerdict::Error,
+                report: Some(report),
+                error: Some(msg),
+            };
+            let _ = send_framed_response(&mut stream, &resp);
+            return;
+        }
+        Err(ReservationError::OverCapacity(msg)) => {
+            unsafe {
+                libc::close(raw_fd);
+            }
+            let resp = CoordinatorResponse {
+                status: CoordinatorVerdict::Busy,
+                report: None,
+                error: Some(msg),
+            };
+            let _ = send_framed_response(&mut stream, &resp);
+            return;
+        }
+    };
+
+    let source = unsafe { File::from_raw_fd(raw_fd) };
 
     let snapshot = match sealed_snapshot(source, max_size) {
         Ok(snap) => snap,
@@ -689,6 +880,10 @@ fn handle_client_connection(mut stream: UnixStream, worker_config: &SupervisedWo
             return;
         }
     };
+
+    if let Ok(meta) = snapshot.metadata() {
+        reservation.update(meta.len());
+    }
 
     let target_name = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
     let mut effective_config = worker_config.clone();
@@ -739,6 +934,11 @@ fn handle_client_connection(mut stream: UnixStream, worker_config: &SupervisedWo
 
 /// Run persistent coordinator service (`raxosentinel serve`).
 pub fn serve(args: ServeArgs) -> i32 {
+    if args.max_workers == 0 {
+        eprintln!("Coordinator startup error: --max-workers must be at least 1");
+        return 3;
+    }
+
     if let Err(e) = verify_startup_database(&args) {
         eprintln!("Coordinator startup error: {e}");
         return 3;
@@ -782,21 +982,59 @@ pub fn serve(args: ServeArgs) -> i32 {
         test_worker_action: None,
     };
 
-    let max_pending = args.max_pending;
-    let (tx, rx) = sync_channel::<UnixStream>(max_pending);
+    let shared_state = Arc::new((
+        Mutex::new(CoordinatorState {
+            pending_queue: VecDeque::new(),
+            max_pending: args.max_pending,
+            active_workers: 0,
+            max_workers: args.max_workers,
+            in_flight_snapshot_bytes: 0,
+            max_total_snapshot_bytes: args.max_total_snapshot_bytes,
+            shutdown: false,
+        }),
+        Condvar::new(),
+    ));
 
-    // Spawn single active scan runner thread
-    let worker_cfg = worker_config.clone();
-    let runner_handle = thread::spawn(move || {
-        while let Ok(stream) = rx.recv() {
-            handle_client_connection(stream, &worker_cfg);
-        }
-    });
+    let mut worker_handles = Vec::with_capacity(args.max_workers);
+    for _ in 0..args.max_workers {
+        let state_clone = Arc::clone(&shared_state);
+        let worker_cfg = worker_config.clone();
+        let client_timeout = args.client_timeout_secs;
+        let handle = thread::spawn(move || {
+            let (lock, cvar) = &*state_clone;
+            loop {
+                let stream = {
+                    let mut guard = lock.lock().unwrap();
+                    while guard.pending_queue.is_empty() && !guard.shutdown {
+                        guard = cvar.wait(guard).unwrap();
+                    }
+                    if guard.pending_queue.is_empty() && guard.shutdown {
+                        break;
+                    }
+                    let stream = guard.pending_queue.pop_front().unwrap();
+                    guard.active_workers += 1;
+                    stream
+                };
+
+                handle_client_connection(stream, &worker_cfg, client_timeout, &state_clone);
+
+                {
+                    let mut guard = lock.lock().unwrap();
+                    guard.active_workers -= 1;
+                    cvar.notify_all();
+                }
+            }
+        });
+        worker_handles.push(handle);
+    }
 
     tracing::info!(
-        "Coordinator serving on '{}' (authorized UID: {})",
+        "Coordinator serving on '{}' (authorized UID: {}, max workers: {}, max pending: {}, snapshot limit: {} bytes)",
         args.socket.display(),
-        authorized_uid
+        authorized_uid,
+        args.max_workers,
+        args.max_pending,
+        args.max_total_snapshot_bytes
     );
     println!("RAXOSENTINEL_COORDINATOR_READY");
     let _ = std::io::stdout().flush();
@@ -821,7 +1059,7 @@ pub fn serve(args: ServeArgs) -> i32 {
             continue;
         }
 
-        let (mut stream, _) = match listener.accept() {
+        let (stream, _) = match listener.accept() {
             Ok(pair) => pair,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::Interrupted {
@@ -835,68 +1073,45 @@ pub fn serve(args: ServeArgs) -> i32 {
         match check_peer_creds(&stream, authorized_uid) {
             Ok(true) => {}
             Ok(false) => {
-                let resp = CoordinatorResponse {
-                    status: CoordinatorVerdict::Error,
-                    report: None,
-                    error: Some("Unauthorized peer credentials (UID mismatch)".into()),
-                };
-                let _ = send_framed_response(&mut stream, &resp);
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                let mut discard = [0u8; 1024];
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                while let Ok(n) = stream.read(&mut discard) {
-                    if n == 0 {
-                        break;
-                    }
-                }
+                send_unauthorized_response(stream, "Unauthorized peer credentials (UID mismatch)");
                 continue;
             }
             Err(e) => {
-                let resp = CoordinatorResponse {
-                    status: CoordinatorVerdict::Error,
-                    report: None,
-                    error: Some(format!("Peer credentials check failed: {e}")),
-                };
-                let _ = send_framed_response(&mut stream, &resp);
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                let mut discard = [0u8; 1024];
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                while let Ok(n) = stream.read(&mut discard) {
-                    if n == 0 {
-                        break;
-                    }
-                }
+                send_unauthorized_response(stream, &format!("Peer credentials check failed: {e}"));
                 continue;
             }
         }
 
         // Bounded pending admission; reject immediately with BUSY on overload
-        match tx.try_send(stream) {
-            Ok(()) => {}
-            Err(TrySendError::Full(mut stream)) => {
-                let resp = CoordinatorResponse {
-                    status: CoordinatorVerdict::Busy,
-                    report: None,
-                    error: Some("Coordinator busy: request rejected due to overload".into()),
-                };
-                let _ = send_framed_response(&mut stream, &resp);
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                let mut discard = [0u8; 1024];
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                while let Ok(n) = stream.read(&mut discard) {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                break;
-            }
+        let (lock, cvar) = &*shared_state;
+        let mut guard = lock.lock().unwrap();
+        if guard.shutdown {
+            drop(guard);
+            send_busy_response(stream, "Coordinator is shutting down");
+            continue;
         }
+        let total_in_flight = guard.active_workers + guard.pending_queue.len();
+        if total_in_flight >= guard.max_workers + guard.max_pending {
+            drop(guard);
+            send_busy_response(stream, "Coordinator busy: request rejected due to overload");
+            continue;
+        }
+
+        guard.pending_queue.push_back(stream);
+        cvar.notify_one();
     }
 
-    drop(tx);
-    let _ = runner_handle.join();
+    {
+        let (lock, cvar) = &*shared_state;
+        let mut guard = lock.lock().unwrap();
+        guard.shutdown = true;
+        cvar.notify_all();
+    }
+
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
+
     cleanup_socket(&socket_path);
     0
 }
