@@ -21,7 +21,7 @@ use raxosentinel_core::{
     MemoryUsage, ResourceLimits, ResourceTracker, ScanReport, ScanStatus, TargetMetadata,
 };
 use raxosentinel_email::EmailScanner;
-use raxosentinel_filetypes::{detect_file_type, FileCategory};
+use raxosentinel_filetypes::{detect_file_type, detect_type, FileCategory};
 use raxosentinel_signatures::rsidb::crypto;
 use raxosentinel_signatures::rsidb::ingest::{BuildProfile, IngestPipeline, SourceManifest};
 use raxosentinel_signatures::rsidb::lifecycle::DbStore;
@@ -203,6 +203,21 @@ enum DbCommand {
 
 #[derive(Args, Debug)]
 struct ScanArgs {
+    /// Run the scan in a supervised Linux worker process.
+    #[arg(long)]
+    supervised: bool,
+
+    /// Worker address-space limit in bytes (default 1 GiB).
+    #[arg(long, default_value_t = 1_073_741_824u64)]
+    worker_memory: u64,
+
+    /// Parent-enforced worker deadline in milliseconds (default 10 seconds).
+    #[arg(long, default_value_t = 10_000u64)]
+    worker_timeout_ms: u64,
+
+    #[arg(long, hide = true)]
+    worker_internal: bool,
+
     /// Target file path to scan
     #[arg(value_name = "FILE_PATH")]
     target: PathBuf,
@@ -285,6 +300,36 @@ fn main() {
 }
 
 fn run_scan(args: ScanArgs) -> i32 {
+    #[cfg(debug_assertions)]
+    if args.worker_internal {
+        if let Ok(action) = std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION") {
+            match action.as_str() {
+                "hang" => loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                },
+                "crash" => {
+                    unsafe {
+                        libc::raise(libc::SIGKILL);
+                    }
+                    return 3;
+                }
+                "malformed" => {
+                    println!("not a scan report");
+                    return 0;
+                }
+                "oversized" => {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&vec![b'x'; 2 * 1024 * 1024 + 1]);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+    }
+    if args.supervised {
+        return supervised::run(&args);
+    }
+
     let mut limits = ResourceLimits::default();
     if let Some(max_sz) = args.max_size {
         limits.max_file_size = max_sz;
@@ -397,7 +442,11 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     let mut tracker = ResourceTracker::new(limits);
-    let report = scan_path(&args.target, &db, &mut tracker);
+    let report = if args.worker_internal {
+        scan_descriptor(&args.target, &db, &mut tracker)
+    } else {
+        scan_path(&args.target, &db, &mut tracker)
+    };
 
     let mem_usage = if args.memory {
         Some(MemoryUsage::capture())
@@ -418,6 +467,101 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     report.status.exit_code()
+}
+
+fn scan_descriptor(
+    path: &Path,
+    db: &SignatureDatabase,
+    tracker: &mut ResourceTracker,
+) -> ScanReport {
+    let fail = |message: String| {
+        ScanReport::new(
+            TargetMetadata {
+                path: Some(path.display().to_string()),
+                file_name: path.file_name().map(|v| v.to_string_lossy().into_owned()),
+                file_size_bytes: 0,
+                sha256: String::new(),
+                detected_mime: "application/unknown".into(),
+                declared_mime: None,
+            },
+            ScanStatus::Failed,
+            Vec::new(),
+            Vec::new(),
+            0,
+            Some(message),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // fd 0 is supplied by the supervisor and must be a regular file.
+        if unsafe { libc::fstat(0, stat.as_mut_ptr()) } != 0 {
+            return fail("Invalid worker input descriptor".into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return fail("Worker input descriptor is not a regular file".into());
+        }
+    }
+    let mut input = std::io::stdin().lock();
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => return fail(format!("Read failed: {e}")),
+        };
+        if n == 0 {
+            break;
+        }
+        if let Err(e) = tracker.record_bytes_read(n) {
+            return fail(e.to_string());
+        }
+        if data.try_reserve(n).is_err() {
+            return fail("Cannot allocate scan buffer".into());
+        }
+        data.extend_from_slice(&chunk[..n]);
+    }
+    let file_type = detect_type(&data);
+    let is_email = file_type.category == FileCategory::Email
+        || file_type.mime_type == "message/rfc822"
+        || path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("eml") || e.eq_ignore_ascii_case("msg"))
+            .unwrap_or(false);
+    let scanner = EmailScanner::new(db);
+    let result = if is_email {
+        tracker.reset_bytes_read();
+        scanner.scan_bytes(&data, path.to_str(), tracker)
+    } else {
+        scanner.scan_object(
+            &data,
+            &path
+                .file_name()
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            None,
+            tracker,
+            0,
+        )
+    };
+    match result {
+        Ok(mut report) => {
+            report.target.path = Some(path.display().to_string());
+            report
+        }
+        Err(e) => fail(format!("Scan failed: {e}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod supervised;
+#[cfg(not(target_os = "linux"))]
+mod supervised {
+    pub fn run(_: &super::ScanArgs) -> i32 {
+        eprintln!("Supervised scanning requires Linux");
+        3
+    }
 }
 
 fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker) -> ScanReport {

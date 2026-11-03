@@ -31,6 +31,7 @@ tracing-subscriber.workspace = true
 sha2 = { workspace = true }
 hex.workspace = true
 ed25519-dalek = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 rand.workspace = true

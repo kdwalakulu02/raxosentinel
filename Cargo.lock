@@ -1268,6 +1268,7 @@ dependencies = [
  "criterion",
  "ed25519-dalek",
  "hex",
+ "libc",
  "rand 0.8.8",
  "raxosentinel-core",
  "raxosentinel-email",

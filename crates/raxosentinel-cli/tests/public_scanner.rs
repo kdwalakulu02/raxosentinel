@@ -113,6 +113,28 @@ fn signed_public_scanner_rejects_tampered_artifacts() {
             .output()
             .unwrap()
     };
+    let supervised = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+        .arg("scan")
+        .arg(&target)
+        .arg("--supervised")
+        .arg("--json")
+        .arg("--public-release")
+        .arg(&release)
+        .arg("--public-key")
+        .arg(&public)
+        .arg("--public-approval-key")
+        .arg(&approval_public)
+        .arg("--public-state")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert_eq!(
+        supervised.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&supervised.stdout)
+    );
+    assert!(String::from_utf8_lossy(&supervised.stdout).contains("SyntheticFixture"));
     let good = run();
     assert_ne!(good.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&good.stdout).contains("SyntheticFixture"));
