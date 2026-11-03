@@ -304,6 +304,15 @@ fn run_scan(args: ScanArgs) -> i32 {
     if args.worker_internal {
         if let Ok(action) = std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION") {
             match action.as_str() {
+                "descendant" => {
+                    let mut child = std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .spawn()
+                        .unwrap();
+                    let _ = child.wait();
+                    return 3;
+                }
+                "delay" => std::thread::sleep(std::time::Duration::from_millis(500)),
                 "hang" => loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 },
@@ -441,6 +450,21 @@ fn run_scan(args: ScanArgs) -> i32 {
         }
     }
 
+    if args.worker_internal {
+        #[cfg(target_os = "linux")]
+        if let Err(e) = supervised::restrict_worker_filesystem() {
+            eprintln!("Worker filesystem isolation failed: {e}");
+            return 3;
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION").as_deref() == Ok("probe")
+            && (File::open(&args.target).is_ok()
+                || File::open(args.target.with_file_name("secret")).is_ok())
+        {
+            eprintln!("Worker unexpectedly accessed original target");
+            return 3;
+        }
+    }
     let mut tracker = ResourceTracker::new(limits);
     let report = if args.worker_internal {
         scan_descriptor(&args.target, &db, &mut tracker)
@@ -522,7 +546,7 @@ fn scan_descriptor(
         }
         data.extend_from_slice(&chunk[..n]);
     }
-    let file_type = detect_type(&data);
+    let file_type = detect_type(&data[..data.len().min(8192)]);
     let is_email = file_type.category == FileCategory::Email
         || file_type.mime_type == "message/rfc822"
         || path

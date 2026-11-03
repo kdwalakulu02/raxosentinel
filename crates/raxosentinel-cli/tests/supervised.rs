@@ -150,3 +150,90 @@ fn timed_out_worker_is_reaped() {
     assert_eq!(verdict(&output), "ERROR");
     assert!(!std::path::Path::new("/proc").join(worker).exists());
 }
+
+#[cfg(debug_assertions)]
+fn wait_for_child(parent: u32) -> String {
+    let path = format!("/proc/{parent}/task/{parent}/children");
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(pid) = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+        {
+            return pid.to_owned();
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "child not found"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+#[cfg(debug_assertions)]
+#[test]
+fn descendant_is_terminated_with_worker_group() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("target");
+    std::fs::write(&path, b"test").unwrap();
+    let parent = command(&path)
+        .args(["--worker-timeout-ms", "1200"])
+        .env("RAXOSENTINEL_TEST_WORKER_ACTION", "descendant")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let worker = wait_for_child(parent.id());
+    let descendant = wait_for_child(worker.parse().unwrap());
+    assert_eq!(verdict(&parent.wait_with_output().unwrap()), "ERROR");
+    let start = std::time::Instant::now();
+    loop {
+        let status =
+            std::fs::read_to_string(format!("/proc/{descendant}/status")).unwrap_or_default();
+        if status.is_empty()
+            || status
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains('Z'))
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "descendant still running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+#[cfg(debug_assertions)]
+#[test]
+fn worker_scans_snapshot_after_original_is_modified() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("target.txt");
+    std::fs::write(&path, b"safe original").unwrap();
+    let parent = command(&path)
+        .env("RAXOSENTINEL_TEST_WORKER_ACTION", "delay")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_child(parent.id());
+    std::fs::write(
+        &path,
+        b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
+    )
+    .unwrap();
+    assert_eq!(verdict(&parent.wait_with_output().unwrap()), "CLEAN");
+    assert_eq!(verdict(&command(&path).output().unwrap()), "DETECTED");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn worker_cannot_reopen_original_after_filesystem_lockdown() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("target");
+    std::fs::write(&path, b"safe").unwrap();
+    std::fs::write(d.path().join("secret"), b"synthetic secret").unwrap();
+    let output = command(&path)
+        .env("RAXOSENTINEL_TEST_WORKER_ACTION", "probe")
+        .output()
+        .unwrap();
+    assert_eq!(verdict(&output), "CLEAN");
+}

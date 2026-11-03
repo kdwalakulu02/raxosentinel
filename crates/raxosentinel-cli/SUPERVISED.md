@@ -1,38 +1,51 @@
 # Linux supervised scan prototype
 
-`raxosentinel scan FILE --supervised --json` starts a fresh worker for one scan.
-`--worker-timeout-ms` sets the parent deadline (default 10000); `--worker-memory`
-sets the worker RLIMIT_AS address-space limit in bytes (default 1 GiB). The
-existing `--max-size`, `--timeout`, `--max-depth`, rules, private-generation,
-and signed-public-release options are passed to the worker. A scan without a
-selected external database uses built-in signatures only. Legacy `--db` and
-`--db-store` are rejected in supervised mode. Authenticated database failures
-are errors; no fallback is attempted.
+`raxosentinel scan FILE --supervised --json` runs one worker. The parent opens
+and fstats the target and copies at most the configured file-size limit into an
+anonymous memfd. It applies F_SEAL_WRITE, F_SEAL_GROW, F_SEAL_SHRINK and
+F_SEAL_SEAL before passing the descriptor to the worker. The worker parses
+stable bytes; a concurrent writer may nevertheless change the source while the
+copy is in progress, so the snapshot is not an atomic point-in-time copy.
+Mail integration must deliver or otherwise act on exactly the accepted snapshot,
+not reopen or merely compare the original. This prototype does not return the
+snapshot to a caller and therefore does not yet provide that integration.
 
-The parent opens the final path component with O_NOFOLLOW and O_NONBLOCK,
-checks the opened descriptor with fstat, and passes it as worker stdin. The
-worker checks that descriptor again and performs bounded reads; it does not
-open the target path. The path is only used as a name and format hint. The
-request uses an exec argument vector limited to 65536 bytes and a file
-descriptor; the JSON response is limited to 2 MiB and validated against the
-worker exit status. A deadline applies to startup, verification, and scanning;
-the parent kills and waits for a timed-out child after process creation. The
-standard library spawn operation itself is synchronous and cannot be interrupted
-by this deadline if the operating system stalls during process creation. Worker failure, invalid
-response, and limits return ERROR. Detections retain precedence over partial
-inspection where supported by the existing scanner; uninspectable data must not
-be treated as CLEAN. CLEAN does not establish safety.
+The target's final component is opened O_NOFOLLOW; ancestor symlinks are still
+followed. If a future service confines paths to a trusted directory, use a
+trusted directory fd and evaluate openat2 RESOLVE_BENEATH or RESOLVE_IN_ROOT
+with RESOLVE_NO_SYMLINKS and RESOLVE_NO_MAGICLINKS; no confinement is claimed
+here. Filesystems and kernel support need explicit testing.
 
-RLIMIT_AS limits virtual address space, not RSS; mappings and shared libraries
-count against it, and it does not guarantee a particular RSS or system-wide
-memory bound. The wall deadline is enforced by the supervising process, not a
-kernel real-time guarantee. File contents can still be modified through other
-file descriptors while scanning, and symlinks in ancestor directories are not
-excluded. The worker runs with the caller's identity and filesystem access;
-there is no privilege separation, seccomp, namespace, filesystem isolation, or
-process-tree sandbox. A compromised worker may access unrelated files and
-spawn descendants. These are deployment blockers, not a security boundary for
-hostile code execution. The direct CLI remains path-based and does not gain
-the descriptor guarantee. Other operating systems report an error for
-supervised scans. Debug builds include environment-controlled worker fault
-injection for integration tests; do not use them in production.
+The parent removes inherited environment variables and marks extra descriptors
+close-on-exec. The worker loads the configured private generation or signed
+public release using existing strict verification, then closes all descriptors
+except standard streams, enables no_new_privs and applies a Landlock ABI 1
+ruleset that denies new filesystem access during parsing. Failure is ERROR.
+The verified database, public trust keys, rule file and, for signed releases,
+rollback state must be accessible to the caller during loading; the signed
+release state needs its existing write permissions. A worker without a selected
+external database uses built-in rules. Legacy --db and --db-store are rejected.
+Landlock does not isolate the loader, existing memory, network, process creation,
+or all kernel interfaces; it does not change UID. The loader executes with the
+caller's privileges before confinement, so unrelated private files and secrets
+are accessible to compromised loader code. Do not put signing credentials or
+authentication secrets in that identity's accessible filesystem. This is not a
+complete security boundary or a replacement for a separate dedicated identity.
+
+The worker gets RLIMIT_AS (virtual address space, not RSS), no_new_privs, and a
+separate process group. The parent kills the group on timeout and error, then
+reaps the direct child. A forked descendant that stays in the group is killed;
+a hostile process can change groups or sessions, and parent cancellation or
+crash is not reliably handled. Descendants are not necessarily reaped by the
+parent. No process-tree memory or process-count limits are enforced. A delegated
+cgroup v2 with memory.max, pids.max and cgroup.kill could provide stronger tree
+containment if properly delegated and managed; the current environment has a
+read-only cgroup root and no delegated subtree. It is not used. These gaps are
+deployment blockers.
+
+The deadline is enforced after process creation; snapshot copying and the
+synchronous spawn operation are outside its enforceable interval. Responses are
+bounded and malformed or incomplete results fail closed. CLEAN is not a safety
+guarantee. Direct CLI scanning remains path-based. Debug builds have
+fault-injection hooks for integration tests and must not be used in production.
+Other platforms do not support this supervised path.
