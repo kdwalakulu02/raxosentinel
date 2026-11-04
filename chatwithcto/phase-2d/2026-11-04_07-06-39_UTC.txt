@@ -1,0 +1,262 @@
+# RaxoSentinel Phase 2D.7C — Transactional Update State, Rollback Consistency & Restart Recovery Handover Report
+
+| Metric / Dimension | Specification / Observation |
+|---|---|
+| Phase Milestone | Phase 2D.7C: Transactional Update State, Rollback Consistency & Restart Recovery |
+| Git Branch | `phase-3b` |
+| Starting Commit Hash | `02cb8e72ef6d8e8b15cf44b64eb1fe298b4c05ef` (handover baseline) / `d28f604496e18d682e01baf2e23484bdaba03790` (Phase 2D.7B) |
+| Implementation Commit Hash | `b5d809a7b973d47f2022ce87e0ce3ecbe5ea2130` |
+| Native Database Target | ONE Canonical RSIDB (`database.rsidb`) |
+| Baseline Active Generation | `phase2d6-unified` (542,057 unique indicators) |
+| Updated Acceptance Generation | `phase2d7-unified-1793775598-0` (542,058 unique indicators) |
+| Rollback Restored Generation | `phase2d6-unified` (542,057 unique indicators) |
+| Reapplied Updated Generation | `phase2d7-unified-1793775685-0` (542,058 unique indicators) |
+| Rollback Consistency Defect Found | **YES** (Confirmed architectural defect in status persistence & version synchronization) |
+| Rollback Defect Resolved | **YES** (Authoritative active generation derivation & self-healing transactional reconciliation) |
+| Scenario A: Update then Rollback | Verified (542,057 -> 542,058 -> 542,057 with exact metadata alignment) |
+| Scenario B: Reapply after Rollback | Verified (Clean reapplication to 542,058; zero corruption or false duplicates) |
+| Scenario C: Restart & Stale Recovery | Verified (Process restarts heal corrupted or missing status from active registry) |
+| Scenario D: Repeated Operations | Verified (Update -> Rollback -> Update -> Rollback -> Legitimate Update clean) |
+| Scenario E: Unchanged Sources No-Op | Verified (`available=false`, zero disk writes, zero redundant compilation) |
+| Crash & Interruption Boundaries | All 7 transaction boundaries verified; scanner always sees pure single generation |
+| Workspace Test Suite | **185 passed; 0 failed; 2 ignored** |
+| Clippy / Format Invariants | 0 warnings (`-D warnings`); `cargo fmt --all -- --check` clean |
+
+---
+
+## 1. Rollback Consistency Defect: Investigation, Root Cause & Architectural Fix
+
+### 1.1 Was a Rollback Consistency Defect Actually Found?
+**YES.** A critical architectural defect existed in the rollback and status persistence subsystem prior to Phase 2D.7C.
+
+### 1.2 Defect Manifestation
+When an update was applied and subsequently rolled back:
+1. `raxosentinel db rollback` pointed the `current` filesystem pointer back to `phase2d6-unified` (542,057 indicators).
+2. However, `update_status.json` on disk still contained the provider metadata from the revoked generation (`phase2d7-unified-...`), claiming ClamAV was at version `main:63,daily:28174` with 541,954 indicators and that the last summary had 542,058 indicators.
+3. When the operator or scheduler executed `raxosentinel db update --status`, the output displayed a severe contradiction:
+   - `Current RSIDB Generation : phase2d6-unified`
+   - `ClamAV Source Version    : main:63,daily:28174` (Contradicting the active database, which actually contained 28173!)
+4. When `raxosentinel db update --check` or `--apply` was invoked after rollback:
+   - The engine inspected `status.sources["clamav"].source_version` (which was stale at `28174`).
+   - If the upstream provider was at version `28174`, `check_update()` concluded:
+     `"ClamAV CVD distribution unchanged at version main:63,daily:28174 (available=false)"`.
+   - The updater **refused to re-apply the update**, falsely believing the system was already up-to-date, even though the active database had been rolled back to `28173`!
+   - This completely broke Scenario B ("Reapply after rollback").
+
+### 1.3 Root Cause Analysis
+1. **Flawed `engine.rs:rollback()` Logic**:
+   The existing `rollback()` implementation only updated `status.current_generation` and `status.previous_generation` before persisting:
+   ```rust
+   // DEFECTIVE IMPLEMENTATION:
+   let mut status = UpdateStatus::load(&self.root);
+   status.current_generation = Some(prev_gen.clone());
+   status.previous_generation = old_current;
+   let _ = status.save(&self.root);
+   ```
+   It never inspected `prev_gen`'s registry or evidence files, leaving `status.sources` and `status.last_summary` frozen with the newer generation's metadata.
+2. **Flawed `UpdateStatus::load()` Pointer Prioritization**:
+   `UpdateStatus::load()` only read the `current` pointer file if `status.current_generation.is_none()`. If `update_status.json` existed on disk, the JSON content overrode the actual filesystem pointer.
+3. **Flawed `bootstrap_from_generation()` Guard**:
+   `bootstrap_from_generation()` contained a guard:
+   ```rust
+   let needs_bootstrap = match self.sources.get(&id) {
+       Some(existing) => existing.indicator_count == 0 && existing.source_version.is_empty(),
+       None => true,
+   };
+   ```
+   Because `self.sources` had been deserialized from `update_status.json`, `needs_bootstrap` was always `false`, permanently preventing the active generation's immutable metadata from correcting stale status entries.
+4. **Conflation of Active State vs. Upstream Observation**:
+   `SourceStatus` only had `source_version`, which failed to distinguish between the version active in the compiled RSIDB and the latest upstream version observed during remote queries.
+
+### 1.4 Exact Architectural Fix
+The architecture was refactored to establish a **Single Authoritative Active State**:
+1. **Filesystem Pointer is Authoritative**:
+   `UpdateStatus::load()` now unconditionally resolves `status.current_generation` from the filesystem `current` pointer (with deterministic fallback auto-discovery) and `status.previous_generation` from `previous`.
+2. **Immutable Generation Metadata Derivation**:
+   `UpdateStatus::load()` unconditionally calls `bootstrap_from_generation()`, which authoritatively reconciles `self.sources` directly from the active generation's `registry.json` and evidence files (`cvd_files` for ClamAV, `acquisitions` for MalwareBazaar).
+3. **Explicit State Separation in `SourceStatus`**:
+   - `active_version`: The authoritative version compiled into the active generation's RSIDB.
+   - `source_version`: Kept identical to `active_version` for full backwards compatibility.
+   - `latest_upstream_version`: The remote version observed during checks (preserved across rollbacks and checks).
+   - `indicator_count`: Authoritative count directly from the active generation's `registry.json`.
+4. **Explicit Rollback Transaction Accounting**:
+   `engine.rs:rollback()` now:
+   - Atomically updates pointers (`current -> prev_gen`, `previous -> old_current`).
+   - Derives the exact initial and final counts from the respective registries.
+   - Saves a formal rollback summary adhering to the accounting invariant:
+     `final_count = initial_count + 0 - removals`, with `verification_result: "PASS (ROLLBACK)"`.
+5. **Self-Healing on Crash or Restart**:
+   If `update_status.json` is missing, corrupted, or left with stale data from a crash, `UpdateStatus::load()` immediately self-heals by reading `current` and the active generation's immutable metadata.
+
+---
+
+## 2. Complete State Transitions Across Lifecycle Scenarios
+
+### 2.1 State Matrix: Before Update, After Update & After Rollback
+
+| Field / Component | Baseline (`phase2d6-unified`) | After Update (`phase2d7-unified-...`) | After Rollback (`phase2d6-unified`) |
+|---|---|---|---|
+| `current` Pointer | `phase2d6-unified` | `phase2d7-unified-1793775598-0` | `phase2d6-unified` |
+| `previous` Pointer | `none` | `phase2d6-unified` | `phase2d7-unified-1793775598-0` (Recoverable!) |
+| Total Indicators | **542,057** | **542,058** | **542,057** |
+| ClamAV Active Version | `main:63,daily:28173` | `main:63,daily:28174` | `main:63,daily:28173` |
+| ClamAV Latest Upstream | `main:63,daily:28173` | `main:63,daily:28174` | `main:63,daily:28174` |
+| ClamAV Tracked Count | **541,953** | **541,954** | **541,953** |
+| MalwareBazaar Version | `d23008091...` | `d23008091...` | `d23008091...` |
+| MalwareBazaar Tracked Count | **104** | **104** | **104** |
+| Last Update Metrics | Baseline Summary (542,057) | Update Summary (+2 additions, -1 removal) | Rollback Summary (542,058 - 1 = 542,057) |
+| Verification Status | `PASS` | `PASS` | `PASS (ROLLBACK)` |
+
+---
+
+## 3. Detailed Verification of Required Scenarios
+
+### 3.1 Scenario A — Update, Then Rollback
+- **Baseline**: `phase2d6-unified`, 542,057 indicators.
+- **Update Applied**: Representing `daily-28174` (+2 SHA-256 additions in `daily.hsb`, -1 MD5 revocation in `daily.fp`).
+  - New unique records: 2
+  - Removed records: 1
+  - Net count change: +1
+  - Final active total: 542,058
+  - Accounting invariant check: `542058 = 542057 + 2 - 1` (`VERIFIED OK`).
+- **Rollback Executed**: `raxosentinel db rollback --root /home/vscode/raxosentinel-test-2d7c`.
+  - Output: `Successfully rolled back active generation to 'phase2d6-unified'`.
+- **Persisted State Inspection**:
+  - `raxosentinel db update --status` reports:
+    - Current RSIDB Generation: `phase2d6-unified`
+    - Previous Generation: `phase2d7-unified-1793775598-0`
+    - Final Active Total: 542,057
+    - ClamAV Active RSIDB Version: `main:63,daily:28173` (Agrees 100% with active database)
+    - ClamAV Indicators Tracked: 541,953
+    - MalwareBazaar Indicators Tracked: 104
+    - Rollback Accounting Invariant: `VERIFIED OK (542057 = 542058 + 0 - 1)`
+    - Verification Status: `PASS (ROLLBACK)`
+
+### 3.2 Scenario B — Reapply After Rollback
+- **Update Check**: `raxosentinel db update --check ...`
+  - Output: `[clamav] available=true: New ClamAV CVD distribution version available: main:63,daily:28174`.
+  - The check correctly recognizes that `daily-28174` is newer than the active database's `daily-28173`.
+- **Reapply Execution**: `raxosentinel db update --apply ...`
+  - Output: `Update successful! Activated generation: phase2d7-unified-1793775685-0`.
+  - Initial active indicators: 542,057
+  - Final active total: 542,058
+  - Result: The database returned cleanly to 542,058 without any corrupt records, dangling entries, or false duplicate count inflation.
+
+### 3.3 Scenario C — Restart Recovery & Self-Healing Metadata
+- **Failure Injection**: Deleted `update_status.json` from the test root and executed `raxosentinel db update --status`.
+- **Result**:
+  - Output:
+    ```
+    Current RSIDB Generation : phase2d7-unified-1793775685-0
+    Previous Generation      : phase2d6-unified
+    Final Active Total       : 542058
+    Verification Status      : PASS (ACTIVE GENERATION)
+    Accounting Invariant     : VERIFIED OK (542058 = 542058 + 0 - 0)
+    Source: ClamAV [clamav]
+      Active RSIDB Version : main:63,daily:28174
+      Indicators Tracked   : 541954
+    Source: MalwareBazaar [malwarebazaar]
+      Active RSIDB Version : d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94
+      Indicators Tracked   : 104
+    ```
+  - `UpdateStatus::load()` automatically healed itself directly from `current` and the active generation's `registry.json` and evidence files.
+
+### 3.4 Scenario D — Repeated Operations Lifecycle
+Tested in automated test `test_19_repeated_operations_lifecycle`:
+1. Baseline: 1 indicator (v0).
+2. Cycle 1 Update: 2 indicators (v1).
+3. Cycle 1 Rollback: 1 indicator (v0).
+4. Cycle 2 Update: 2 indicators (v1).
+5. Cycle 2 Rollback: 1 indicator (v0).
+6. Cycle 3 Legitimate Update: 3 indicators (v2).
+At each step, pointers, registry records, status versions, and indicator lookups were strictly verified. Zero corruption, zero pointer leakage.
+
+### 3.5 Scenario E — Unchanged Official Sources
+Tested via CLI and automated test `test_20_unchanged_sources_safe_noop`:
+- When upstream CVD versions match the active database (`main:63,daily:28173`), `db update --check` reports `available=false`.
+- Executing `db update --apply` outputs:
+  `No updates available from any configured intelligence source (database unchanged).`
+- Zero bytes written to disk, zero unneeded generations created, rate-limits completely preserved.
+
+---
+
+## 4. Crash and Interruption Safety Verification
+
+Tested systematically in `test_21_crash_and_interruption_safety_at_transaction_boundaries` across all 7 transaction boundaries:
+
+1. **Interruption after downloading source data**:
+   - Injected leftover staging directory `.update-staging-9999-1` containing partial/corrupt data.
+   - `load_timed(root, "current")` strictly loaded the verified baseline; partial data remained completely scanner-invisible.
+2. **Interruption during generation compilation**:
+   - Injected leftover `.phase2d7-unified-crashed.tmp` directory containing a corrupt half-written RSIDB index.
+   - `load_timed(root, "current")` strictly loaded the verified baseline without error.
+3. **Interruption after compilation & verification but before pointer swap**:
+   - Published complete verified generation `gen-verified-unactivated` with 2 indicators.
+   - Kept `current` pointer pointing to `gen-verified-base` (1 indicator).
+   - Scanner strictly loaded `gen-verified-base` (1 indicator); unactivated generation remained invisible.
+4. **Interruption during generation-pointer activation**:
+   - Tested pointer replacement: `write_pointer` writes to `.<pointer>.tmp` and executes POSIX atomic `rename()`.
+   - Never exposes partial or malformed pointer file.
+5. **Interruption between pointer changes and status persistence**:
+   - `current` pointer switched to `gen-verified-unactivated`, but `update_status.json` on disk left with old status (`gen-verified-base`).
+   - On restart, `UpdateStatus::load()` immediately self-healed to `gen-verified-unactivated` and reconciled source counts (2 indicators).
+6. **Interruption during rollback**:
+   - Pointers and generations remain atomic; rollback switches `current` and `previous` safely.
+7. **Interruption recovery invariant**:
+   - **After every interruption, RaxoSentinel either exposes the last verified generation or a completely verified new generation. Never an inconsistent mixture.**
+
+---
+
+## 5. Test Suite Results
+
+```bash
+$ cargo test --workspace
+```
+- **Total Tests Passed**: **185**
+- **Total Tests Failed**: **0**
+- **Total Tests Ignored**: **2** (`run_phase_3b3_measurements`, `tests::supervised::worker_cannot_reopen_original_after_filesystem_lockdown`)
+- **Package Breakdown**:
+  - `raxosentinel-signatures`: **72 passed; 0 failed; 1 ignored**
+  - `raxosentinel-cli`: **8 unit tests + 22 coordinator + 25 integration + 1 public scanner + 1 private evidence + 8 supervised = 65 passed; 0 failed; 1 ignored**
+  - Other workspace crates: **48 passed; 0 failed**
+
+```bash
+$ cargo fmt --all -- --check
+```
+- Clean (0 formatting diffs).
+
+```bash
+$ cargo clippy --workspace --all-targets -- -D warnings
+```
+- Clean (0 warnings).
+
+---
+
+## 6. Modified Files
+
+| File Path | Description of Changes |
+|---|---|
+| `crates/raxosentinel-signatures/src/rsidb/updater/status.rs` | Refactored `UpdateStatus::load()` to authoritatively derive state from filesystem pointers; enhanced `bootstrap_from_generation()` to reconcile active source versions and counts; added `active_version` and `latest_upstream_version` to `SourceStatus`; enhanced `format_display()`. |
+| `crates/raxosentinel-signatures/src/rsidb/updater/engine.rs` | Refactored `rollback()` to update status directly from rolled-back generation and record `PASS (ROLLBACK)` summary; preserved `previous` pointer pointing to newer generation for recovery; ensured unique generation names using sequence counters; updated `apply_update()` and `check_all()` provider status recording. |
+| `crates/raxosentinel-signatures/src/rsidb/updater/tests.rs` | Added `create_initial_generation_with_version()`; added comprehensive unit and integration tests for Scenarios 17, 18, 19, 20, and 21 covering all 5 operational scenarios and all 7 crash/interruption transaction boundaries. |
+| `agent.md` | Recorded user operational guidelines (concise chat responses, direct handover file deliverables). |
+
+---
+
+## 7. Remaining Limitations & Blockers
+
+1. **Scheduler Systemd Runtime in Container**:
+   As noted in Phase 2D.7B, systemd PID 1 is not running inside this Docker container. Full systemd timer invocation has been statically validated via `systemd-analyze verify`, but runtime systemd validation requires a VM or host environment with an active systemd init.
+2. **Third-Party Provider Rate Limits**:
+   Live upstream ClamAV DNS queries must maintain rate limits. The current UDP DNS TXT pre-check avoids HTTP bandwidth entirely when upstream releases are unchanged.
+3. **Public VPS Deployment**:
+   Per strict instructions, no code has been pushed or deployed to the production VPS.
+
+---
+
+## 8. Recommended Next Engineering Phase
+
+**Phase 2D.8 / Phase 3 Acceptance Integration**:
+1. Integration of the automated updater with the background scanner coordinator daemon.
+2. Signal-based or file-watcher database hot-reload notification (`SIGHUP` or inotify on `current`) so running coordinator worker pools seamlessly switch to newly activated RSIDB generations without restart.
+3. VPS pre-deployment validation in staging environment.
