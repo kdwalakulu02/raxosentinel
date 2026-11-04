@@ -94,6 +94,9 @@ pub struct ExtractedIntelligence {
     pub claims: BTreeMap<RecordKey, BTreeSet<UnifiedClaim>>,
     pub revocations: HashSet<RecordKey>,
     pub evidence_files: Vec<(String, Vec<u8>)>,
+    pub gross_records: usize,
+    pub rejected_records: usize,
+    pub duplicate_records: usize,
 }
 
 /// Shared trait implemented by every intelligence provider adapter.

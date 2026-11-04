@@ -451,14 +451,18 @@ impl UpdateEngine {
         }
 
         // 7. Compile unified SignatureEntry list and deduplicate
-        let mut total_provider_raw_entries = 0usize;
-        let mut total_provider_unique_claims = 0usize;
+        let mut gross_records_acquired = 0usize;
+        let mut total_provider_rejected = 0usize;
+        let mut provider_duplicates = 0usize;
         for ext in extracted_by_source.values() {
-            total_provider_raw_entries += ext.entries.len();
-            total_provider_unique_claims += ext.claims.len();
+            gross_records_acquired += ext.gross_records;
+            total_provider_rejected += ext.rejected_records;
+            if ext.duplicate_records > 0 {
+                provider_duplicates += ext.duplicate_records;
+            } else {
+                provider_duplicates += ext.entries.len().saturating_sub(ext.claims.len());
+            }
         }
-        let provider_duplicates =
-            total_provider_raw_entries.saturating_sub(total_provider_unique_claims);
 
         let mut entries: Vec<SignatureEntry> = Vec::with_capacity(reconciled_claims.len());
         let mut unified_indicators: Vec<UnifiedIndicator> =
@@ -583,16 +587,74 @@ impl UpdateEngine {
             }
         }
 
-        let new_records = final_count.saturating_sub(previous_total_count);
-        let removed_records = previous_total_count.saturating_sub(final_count);
+        // Strict independent accounting of additions, removals, and retentions
+        let new_records = reconciled_claims
+            .keys()
+            .filter(|k| !existing_claims_by_record.contains_key(*k))
+            .count();
+
+        let removed_records = existing_claims_by_record
+            .keys()
+            .filter(|k| !reconciled_claims.contains_key(*k))
+            .count();
+
+        let retained_records = existing_claims_by_record
+            .iter()
+            .filter(|(k, old_claims)| {
+                if !reconciled_claims.contains_key(*k) {
+                    return false;
+                }
+                let had_updating_source = old_claims
+                    .iter()
+                    .any(|c| extracted_by_source.contains_key(&c.source_id));
+                if !had_updating_source {
+                    return false;
+                }
+                let new_claims = &reconciled_claims[*k];
+                let has_updating_source_now = new_claims
+                    .iter()
+                    .any(|c| extracted_by_source.contains_key(&c.source_id));
+                !has_updating_source_now
+            })
+            .count();
+
+        let net_count_change = (final_count as i64) - (previous_total_count as i64);
+
+        // Strict invariant enforcement: Final count = Initial count + additions − removals
+        let expected_final = previous_total_count + new_records - removed_records;
+        if final_count != expected_final {
+            return Err(UpdateError::VerificationFailed {
+                provider: "engine".to_string(),
+                message: format!(
+                    "Accounting invariant violated: final ({}) != initial ({}) + additions ({}) - removals ({})",
+                    final_count, previous_total_count, new_records, removed_records
+                ),
+            });
+        }
+
+        let effective_gross = if gross_records_acquired > 0 {
+            gross_records_acquired
+        } else {
+            final_count + deduplicated_count + total_provider_rejected
+        };
+
+        let effective_rejected = if total_provider_rejected > 0 {
+            total_provider_rejected
+        } else {
+            all_revocations.len()
+        };
 
         let summary = UpdateSummary {
             generation: gen_name.clone(),
+            initial_indicators: previous_total_count,
             total_indicators: final_count,
+            gross_records_acquired: effective_gross,
             new_records,
             removed_records,
+            retained_records,
             deduplicated_records: deduplicated_count,
-            rejected_records: all_revocations.len(),
+            rejected_records: effective_rejected,
+            net_count_change,
             verification_result: "PASS".to_string(),
             duration_ms: start_time.elapsed().as_millis() as u64,
         };

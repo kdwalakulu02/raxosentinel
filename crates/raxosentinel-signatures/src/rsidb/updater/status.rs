@@ -14,11 +14,19 @@ pub const STATUS_FILE: &str = "update_status.json";
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UpdateSummary {
     pub generation: String,
+    #[serde(default)]
+    pub initial_indicators: usize,
     pub total_indicators: usize,
+    #[serde(default)]
+    pub gross_records_acquired: usize,
     pub new_records: usize,
     pub removed_records: usize,
+    #[serde(default)]
+    pub retained_records: usize,
     pub deduplicated_records: usize,
     pub rejected_records: usize,
+    #[serde(default)]
+    pub net_count_change: i64,
     pub verification_result: String,
     pub duration_ms: u64,
 }
@@ -85,6 +93,18 @@ impl UpdateStatus {
         }
 
         status.bootstrap_from_generation(root);
+
+        if let Some(ref mut sum) = status.last_summary {
+            if sum.initial_indicators == 0
+                && sum.total_indicators > 0
+                && sum.new_records == 0
+                && sum.removed_records == 0
+            {
+                sum.initial_indicators = sum.total_indicators;
+                sum.gross_records_acquired = sum.total_indicators;
+            }
+        }
+
         status
     }
 
@@ -141,15 +161,23 @@ impl UpdateStatus {
                         if let Ok(ev_json) = serde_json::from_slice::<serde_json::Value>(&ev_bytes)
                         {
                             if id == "clamav" {
+                                let mut main_v = None;
+                                let mut daily_v = None;
                                 if let Some(files) = ev_json["cvd_files"].as_array() {
                                     for f in files {
-                                        if f["file"].as_str() == Some("daily.cvd") {
-                                            if let Some(v) = f["version"].as_u64() {
-                                                version = format!("daily-{}", v);
-                                                break;
-                                            }
+                                        if f["file"].as_str() == Some("main.cvd") {
+                                            main_v = f["version"].as_u64();
+                                        } else if f["file"].as_str() == Some("daily.cvd") {
+                                            daily_v = f["version"].as_u64();
                                         }
                                     }
+                                }
+                                if let (Some(m), Some(d)) = (main_v, daily_v) {
+                                    version = format!("main:{},daily:{}", m, d);
+                                } else if let Some(d) = daily_v {
+                                    version = format!("daily-{}", d);
+                                } else if let Some(v_str) = ev_json["version"].as_str() {
+                                    version = v_str.to_string();
                                 }
                             } else if id == "malwarebazaar" {
                                 if let Some(acqs) = ev_json["acquisitions"].as_array() {
@@ -212,11 +240,15 @@ impl UpdateStatus {
             if total > 0 {
                 self.last_summary = Some(UpdateSummary {
                     generation: active_gen.to_string(),
+                    initial_indicators: total,
                     total_indicators: total,
+                    gross_records_acquired: total,
                     new_records: 0,
                     removed_records: 0,
+                    retained_records: 0,
                     deduplicated_records: 0,
                     rejected_records: 0,
+                    net_count_change: 0,
                     verification_result: "PASS".to_string(),
                     duration_ms: 0,
                 });
@@ -276,31 +308,67 @@ impl UpdateStatus {
         if let Some(ref sum) = self.last_summary {
             out.push_str("--------------------------------------------------------------------------------\n");
             out.push_str("LAST UPDATE METRICS:\n");
-            out.push_str(&format!("  Target Generation      : {}\n", sum.generation));
             out.push_str(&format!(
-                "  Total Unique Records   : {}\n",
-                sum.total_indicators
+                "  Target Generation            : {}\n",
+                sum.generation
             ));
-            out.push_str(&format!("  New Records Added      : {}\n", sum.new_records));
             out.push_str(&format!(
-                "  Removed Records        : {}\n",
+                "  Initial Active Indicators    : {}\n",
+                sum.initial_indicators
+            ));
+            out.push_str(&format!(
+                "  Gross Records Acquired       : {}\n",
+                sum.gross_records_acquired
+            ));
+            out.push_str(&format!(
+                "  Gross New Unique Records     : {}\n",
+                sum.new_records
+            ));
+            out.push_str(&format!(
+                "  Records Removed or Revoked   : {}\n",
                 sum.removed_records
             ));
             out.push_str(&format!(
-                "  Deduplicated Records   : {}\n",
+                "  Retained via Other Provider  : {}\n",
+                sum.retained_records
+            ));
+            out.push_str(&format!(
+                "  Duplicates Deduplicated      : {}\n",
                 sum.deduplicated_records
             ));
             out.push_str(&format!(
-                "  Rejected/Excluded      : {}\n",
+                "  Rejected / Excluded Records  : {}\n",
                 sum.rejected_records
             ));
             out.push_str(&format!(
-                "  Verification Status    : {}\n",
+                "  Net Count Change             : {:+}\n",
+                sum.net_count_change
+            ));
+            out.push_str(&format!(
+                "  Final Active Total           : {}\n",
+                sum.total_indicators
+            ));
+            out.push_str(&format!(
+                "  Verification Status          : {}\n",
                 sum.verification_result
             ));
             out.push_str(&format!(
-                "  Pipeline Duration      : {} ms\n",
+                "  Pipeline Duration            : {} ms\n",
                 sum.duration_ms
+            ));
+            let invariant_ok = sum.total_indicators
+                == sum.initial_indicators + sum.new_records - sum.removed_records;
+            out.push_str(&format!(
+                "  Accounting Invariant Check   : {} ({} = {} + {} - {})\n",
+                if invariant_ok {
+                    "VERIFIED OK"
+                } else {
+                    "VIOLATION DETECTED"
+                },
+                sum.total_indicators,
+                sum.initial_indicators,
+                sum.new_records,
+                sum.removed_records
             ));
         }
 

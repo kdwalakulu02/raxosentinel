@@ -215,9 +215,15 @@ enum DbCommand {
         /// Force update even if sources report unchanged
         #[arg(long)]
         force: bool,
-        /// Path to ClamAV unpacked directory
+        /// Path to ClamAV unpacked directory (controlled fixtures or manual extraction)
         #[arg(long)]
         clamav_unpack: Option<PathBuf>,
+        /// Path to directory containing official ClamAV CVD archives (main.cvd, daily.cvd)
+        #[arg(long)]
+        clamav_cvd_dir: Option<PathBuf>,
+        /// Automatically fetch official ClamAV updates via FreshClam
+        #[arg(long)]
+        freshclam: bool,
     },
     /// Re-activate the previous (last known-good) database
     Rollback {
@@ -1246,18 +1252,40 @@ fn run_db(cmd: DbCommand) -> i32 {
             status,
             force,
             clamav_unpack,
+            clamav_cvd_dir,
+            freshclam,
         } => {
             let root_path = root.unwrap_or_else(|| {
                 PathBuf::from("/home/vscode/raxosentinel-private-phase2d1")
             });
-            let clam_path = clamav_unpack.unwrap_or_else(|| {
-                PathBuf::from("/home/vscode/clamav-unpack")
-            });
+
+            let clam_provider = if let Some(ref cvd_dir) = clamav_cvd_dir {
+                if freshclam {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_freshclam(cvd_dir)
+                } else {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir(cvd_dir)
+                }
+            } else if let Some(ref unpack) = clamav_unpack {
+                raxosentinel_signatures::rsidb::updater::ClamAvProvider::new(unpack)
+            } else {
+                let root_cvd = root_path.join("clamav-cvd");
+                if root_cvd.exists() {
+                    if freshclam {
+                        raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_freshclam(root_cvd)
+                    } else {
+                        raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir(root_cvd)
+                    }
+                } else if Path::new("/home/vscode/clamav-cvd").exists() {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir("/home/vscode/clamav-cvd")
+                } else if Path::new("/var/lib/clamav/daily.cvd").exists() {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir("/var/lib/clamav")
+                } else {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::new("/home/vscode/clamav-unpack")
+                }
+            };
 
             let mut engine = raxosentinel_signatures::rsidb::updater::UpdateEngine::new(&root_path)
-                .with_provider(Box::new(
-                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::new(&clam_path),
-                ));
+                .with_provider(Box::new(clam_provider));
 
             let mb_fixture = root_path.join("phase2d4-refreshed-final/acq-7009a4d2894c668fe056658b41674308fdeec5a21f315897717eaf1bb4d9175e.json");
             let mb_provider = if mb_fixture.exists() {
@@ -1293,13 +1321,18 @@ fn run_db(cmd: DbCommand) -> i32 {
                 match engine.apply_update(force) {
                     Ok(Some(summary)) => {
                         println!("Update successful!");
-                        println!("  Activated generation   : {}", summary.generation);
-                        println!("  Total unique indicators: {}", summary.total_indicators);
-                        println!("  New records added      : {}", summary.new_records);
-                        println!("  Removed records        : {}", summary.removed_records);
-                        println!("  Deduplicated records   : {}", summary.deduplicated_records);
-                        println!("  Verification status    : {}", summary.verification_result);
-                        println!("  Duration               : {} ms", summary.duration_ms);
+                        println!("  Activated generation         : {}", summary.generation);
+                        println!("  Initial active indicators    : {}", summary.initial_indicators);
+                        println!("  Gross records acquired       : {}", summary.gross_records_acquired);
+                        println!("  Gross new unique records     : {}", summary.new_records);
+                        println!("  Records removed or revoked   : {}", summary.removed_records);
+                        println!("  Retained via other provider  : {}", summary.retained_records);
+                        println!("  Duplicates deduplicated      : {}", summary.deduplicated_records);
+                        println!("  Rejected / excluded records  : {}", summary.rejected_records);
+                        println!("  Net count change             : {:+}", summary.net_count_change);
+                        println!("  Final active total           : {}", summary.total_indicators);
+                        println!("  Verification status          : {}", summary.verification_result);
+                        println!("  Duration                     : {} ms", summary.duration_ms);
                         0
                     }
                     Ok(None) => {

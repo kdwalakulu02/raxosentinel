@@ -8,6 +8,7 @@ use crate::rsidb::malwarebazaar::private_store::unified::{
     UnifiedSource,
 };
 use crate::rsidb::malwarebazaar::private_store::{self, multi::digest};
+use crate::rsidb::updater::providers::clamav::{authenticate_cvd, parse_clamav_dns_txt};
 use crate::rsidb::updater::traits::{
     AcquisitionResult, ExtractedIntelligence, IntelligenceProvider, ProviderState, RecordKey,
     UpdateCheckResult, UpdateError,
@@ -151,6 +152,9 @@ impl MockProvider {
                 claims: BTreeMap::new(),
                 revocations: HashSet::new(),
                 evidence_files: vec![(format!("evidence-{}.json", id), b"{\"ev\":1}".to_vec())],
+                gross_records: 0,
+                rejected_records: 0,
+                duplicate_records: 0,
             }),
         }
     }
@@ -169,6 +173,8 @@ impl MockProvider {
         }
         if let Ok(ref mut ext) = self.extract_result {
             ext.source_info.indicator_count = entries.len();
+            ext.gross_records = entries.len();
+            ext.duplicate_records = entries.len().saturating_sub(claims.len());
             ext.entries = entries;
             ext.claims = claims;
         }
@@ -778,4 +784,350 @@ fn test_13_suspiciously_large_reduction_triggers_anomaly_review() {
     assert_eq!(read_pointer(root, CURRENT_PTR).unwrap(), "gen-initial");
     let (db, _) = private_store::load_timed(root, "current").unwrap();
     assert_eq!(db.total_records(), 10);
+}
+
+// ============================================================================
+// SCENARIO 14: Strict Accounting Invariant & Multi-Source Retained Indicators
+// ============================================================================
+#[test]
+fn test_14_accounting_invariant_and_retained_records() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    // Baseline indicators:
+    // Threat.A is shared by src_a and src_b
+    // Threat.B is claimed by src_a only
+    // Threat.C is claimed by src_b only
+    let entry_a = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0xaa; 32],
+        "Threat.SharedA".to_string(),
+    );
+    let entry_b = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        200,
+        vec![0xbb; 32],
+        "Threat.SrcAOnlyB".to_string(),
+    );
+    let entry_c = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        300,
+        vec![0xcc; 32],
+        "Threat.SrcBOnlyC".to_string(),
+    );
+
+    let _key_a = (
+        entry_a.alg,
+        entry_a.digest.clone(),
+        entry_a.size,
+        entry_a.name.clone(),
+    );
+    let key_b = (
+        entry_b.alg,
+        entry_b.digest.clone(),
+        entry_b.size,
+        entry_b.name.clone(),
+    );
+    let _key_c = (
+        entry_c.alg,
+        entry_c.digest.clone(),
+        entry_c.size,
+        entry_c.name.clone(),
+    );
+
+    let indicators = vec![
+        UnifiedIndicator {
+            alg: "sha256".to_string(),
+            hash: hex::encode(&entry_a.digest),
+            size: entry_a.size,
+            name: entry_a.name.clone(),
+            claims: vec![
+                UnifiedClaim {
+                    source_id: "src_a".to_string(),
+                    size: 100,
+                    family: "Threat.SharedA".to_string(),
+                },
+                UnifiedClaim {
+                    source_id: "src_b".to_string(),
+                    size: 100,
+                    family: "Threat.SharedA".to_string(),
+                },
+            ],
+        },
+        UnifiedIndicator {
+            alg: "sha256".to_string(),
+            hash: hex::encode(&entry_b.digest),
+            size: entry_b.size,
+            name: entry_b.name.clone(),
+            claims: vec![UnifiedClaim {
+                source_id: "src_a".to_string(),
+                size: 200,
+                family: "Threat.SrcAOnlyB".to_string(),
+            }],
+        },
+        UnifiedIndicator {
+            alg: "sha256".to_string(),
+            hash: hex::encode(&entry_c.digest),
+            size: entry_c.size,
+            name: entry_c.name.clone(),
+            claims: vec![UnifiedClaim {
+                source_id: "src_b".to_string(),
+                size: 300,
+                family: "Threat.SrcBOnlyC".to_string(),
+            }],
+        },
+    ];
+
+    let ev_bytes = b"evidence".to_vec();
+    let registry = UnifiedRegistry {
+        version: 1,
+        sources: vec![
+            UnifiedSource {
+                id: "src_a".to_string(),
+                name: "Source A".to_string(),
+                provider: "Test".to_string(),
+                acquisition_method: "test".to_string(),
+                acquired_unix_seconds: 1000,
+                classification: "test".to_string(),
+                provenance: "test".to_string(),
+                redistribution: "test".to_string(),
+                enabled: true,
+                indicator_count: 2,
+                evidence_sha256: digest(&ev_bytes),
+                evidence_file: Some("evidence-src_a.json".to_string()),
+            },
+            UnifiedSource {
+                id: "src_b".to_string(),
+                name: "Source B".to_string(),
+                provider: "Test".to_string(),
+                acquisition_method: "test".to_string(),
+                acquired_unix_seconds: 1000,
+                classification: "test".to_string(),
+                provenance: "test".to_string(),
+                redistribution: "test".to_string(),
+                enabled: true,
+                indicator_count: 2,
+                evidence_sha256: digest(&ev_bytes),
+                evidence_file: Some("evidence-src_b.json".to_string()),
+            },
+        ],
+        total_indicators: 3,
+        md5_count: 0,
+        sha1_count: 0,
+        sha256_count: 3,
+    };
+    let associations = UnifiedAssociations {
+        version: 1,
+        total_indicators: 3,
+        indicators,
+    };
+
+    publish_unified(
+        root,
+        "gen-initial",
+        vec![entry_a.clone(), entry_b.clone(), entry_c.clone()],
+        registry,
+        associations,
+        vec![
+            ("evidence-src_a.json".to_string(), ev_bytes.clone()),
+            ("evidence-src_b.json".to_string(), ev_bytes),
+        ],
+    )
+    .unwrap();
+    write_pointer(root, CURRENT_PTR, "gen-initial").unwrap();
+
+    // Now, src_a updates:
+    // - Drops Threat.A (it was shared with src_b, so Threat.A is RETAINED via src_b)
+    // - Revokes Threat.B (it was only in src_a, so Threat.B is REMOVED)
+    // - Adds 2 new threats: Threat.D and Threat.E (GROSS NEW UNIQUE RECORDS)
+    let entry_d = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        400,
+        vec![0xdd; 32],
+        "Threat.NewD".to_string(),
+    );
+    let entry_e = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        500,
+        vec![0xee; 32],
+        "Threat.NewE".to_string(),
+    );
+
+    let mut prov_a =
+        MockProvider::new("src_a").with_entries(vec![entry_d.clone(), entry_e.clone()]);
+    if let Ok(ref mut ext) = prov_a.extract_result {
+        ext.revocations.insert(key_b);
+        ext.gross_records = 3;
+        ext.rejected_records = 1;
+    }
+
+    let engine = UpdateEngine::new(root)
+        .with_provider(Box::new(prov_a))
+        .with_anomaly_threshold(50.0);
+
+    let summary = engine.apply_update(true).unwrap().expect("summary");
+
+    // Independent Quantity Verification
+    assert_eq!(summary.initial_indicators, 3, "Initial count must be 3");
+    assert_eq!(
+        summary.new_records, 2,
+        "Gross new unique additions must be 2 (D and E)"
+    );
+    assert_eq!(
+        summary.removed_records, 1,
+        "Removed records must be 1 (B revoked)"
+    );
+    assert_eq!(
+        summary.retained_records, 1,
+        "Retained through another provider must be 1 (A retained via src_b)"
+    );
+    assert_eq!(
+        summary.net_count_change, 1,
+        "Net count change must be +1 (2 added - 1 removed)"
+    );
+    assert_eq!(
+        summary.total_indicators, 4,
+        "Final active count must be 4 (A, C, D, E)"
+    );
+
+    // Strict Accounting Invariant Verification:
+    // Final count = Initial count + additions − removals
+    assert_eq!(
+        summary.total_indicators,
+        summary.initial_indicators + summary.new_records - summary.removed_records,
+        "Invariant: Final ({}) == Initial ({}) + Additions ({}) - Removals ({})",
+        summary.total_indicators,
+        summary.initial_indicators,
+        summary.new_records,
+        summary.removed_records
+    );
+
+    // Verify indicators in active database
+    let active = read_pointer(root, CURRENT_PTR).unwrap();
+    let (db, _) = private_store::load_timed(root, &active).unwrap();
+    assert_eq!(db.total_records(), 4);
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 100, &[0xaa; 32]).len(),
+        1,
+        "A retained"
+    );
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 200, &[0xbb; 32]).len(),
+        0,
+        "B removed"
+    );
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 300, &[0xcc; 32]).len(),
+        1,
+        "C retained"
+    );
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 400, &[0xdd; 32]).len(),
+        1,
+        "D added"
+    );
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 500, &[0xee; 32]).len(),
+        1,
+        "E added"
+    );
+}
+
+// ============================================================================
+// SCENARIO 15: Dual Database Independent Tracking & CVD Authentication
+// ============================================================================
+#[test]
+fn test_15_clamav_dual_database_independent_tracking_and_authentication() {
+    let cvd_dir = Path::new("/var/lib/clamav");
+    if !cvd_dir.join("daily.cvd").exists() || !cvd_dir.join("main.cvd").exists() {
+        return; // Skip if run in environment without local ClamAV installation
+    }
+
+    // 1. Authenticate both official CVD databases
+    let daily_meta =
+        authenticate_cvd(&cvd_dir.join("daily.cvd")).expect("daily.cvd authentication");
+    assert_eq!(daily_meta.file_name, "daily.cvd");
+    assert!(daily_meta.version > 0);
+    assert!(daily_meta.verified, "Digital signature must be verified OK");
+
+    let main_meta = authenticate_cvd(&cvd_dir.join("main.cvd")).expect("main.cvd authentication");
+    assert_eq!(main_meta.file_name, "main.cvd");
+    assert!(main_meta.version > 0);
+    assert!(main_meta.verified, "Digital signature must be verified OK");
+
+    // 2. Tampered CVD signature authentication failure (fail closed)
+    let temp = setup_private_root();
+    let corrupt_cvd = temp.path().join("daily-corrupt.cvd");
+    let mut bytes = fs::read(cvd_dir.join("daily.cvd")).unwrap();
+    // Tamper with data payload
+    if bytes.len() > 1000 {
+        bytes[1000] ^= 0xff;
+    }
+    fs::write(&corrupt_cvd, &bytes).unwrap();
+    let auth_res = authenticate_cvd(&corrupt_cvd);
+    assert!(
+        auth_res.is_err(),
+        "Tampered CVD must fail cryptographic authentication"
+    );
+
+    // 3. Independent tracking: unchanged vs changed
+    let provider = ClamAvProvider::with_cvd_dir(cvd_dir);
+    let composite = format!("main:{},daily:{}", main_meta.version, daily_meta.version);
+
+    // State with same version -> available=false (no unnecessary build)
+    let state_same = ProviderState {
+        last_version: composite.clone(),
+        ..Default::default()
+    };
+    let chk_same = provider.check_update(&state_same).unwrap();
+    assert!(
+        !chk_same.available,
+        "Unchanged source must report available=false"
+    );
+
+    // State with changed daily version -> available=true
+    let state_diff_daily = ProviderState {
+        last_version: format!(
+            "main:{},daily:{}",
+            main_meta.version,
+            daily_meta.version - 1
+        ),
+        ..Default::default()
+    };
+    let chk_daily = provider.check_update(&state_diff_daily).unwrap();
+    assert!(
+        chk_daily.available,
+        "Changed daily must report available=true"
+    );
+
+    // State with changed main version -> available=true
+    let state_diff_main = ProviderState {
+        last_version: format!(
+            "main:{},daily:{}",
+            main_meta.version - 1,
+            daily_meta.version
+        ),
+        ..Default::default()
+    };
+    let chk_main = provider.check_update(&state_diff_main).unwrap();
+    assert!(
+        chk_main.available,
+        "Changed main must report available=true"
+    );
+}
+
+// ============================================================================
+// SCENARIO 16: ClamAV DNS TXT Record Parser
+// ============================================================================
+#[test]
+fn test_16_clamav_dns_txt_query_parser() {
+    let raw_record = "1.4.6:63:28173:1793768400:1:90:49192:339";
+    let (main_v, daily_v) = parse_clamav_dns_txt(raw_record).expect("parsed TXT");
+    assert_eq!(main_v, 63);
+    assert_eq!(daily_v, 28173);
+
+    // Invalid TXT record rejection
+    assert!(parse_clamav_dns_txt("invalid").is_none());
+    assert!(parse_clamav_dns_txt("1.4.6:notanumber:28173").is_none());
 }
