@@ -113,6 +113,16 @@ impl UpdateStatus {
             status.previous_generation = None;
         }
 
+        // Validate that previous_generation is not cyclic (does not equal current_generation)
+        // and that its database file actually exists.
+        if let Some(ref prev) = status.previous_generation {
+            if status.current_generation.as_ref() == Some(prev)
+                || !root.join(prev).join("database.rsidb").exists()
+            {
+                status.previous_generation = None;
+            }
+        }
+
         // 3. Authoritative reconciliation from active generation's registry and evidence
         status.bootstrap_from_generation(root);
 

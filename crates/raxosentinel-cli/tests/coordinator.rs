@@ -235,6 +235,39 @@ impl CoordinatorProcess {
         }
     }
 
+    fn spawn_root(socket_path: &Path, db_root: &Path, extra_args: &[&str]) -> Self {
+        let parent = socket_path.parent().unwrap_or_else(|| Path::new("."));
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_raxosentinel"));
+        cmd.arg("serve")
+            .arg("--socket")
+            .arg(socket_path)
+            .arg("--private-db-root")
+            .arg(db_root)
+            .args(extra_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("failed to spawn coordinator");
+        let stdout = child.stdout.take().expect("piped stdout");
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .expect("failed to read coordinator stdout");
+        if n == 0 || !line.contains("RAXOSENTINEL_COORDINATOR_READY") {
+            panic!("coordinator failed to start with db_root, output: {line}");
+        }
+
+        Self {
+            child,
+            socket_path: socket_path.to_path_buf(),
+        }
+    }
+
     fn stop(&mut self) -> std::process::ExitStatus {
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGTERM);
@@ -1690,4 +1723,597 @@ fn test_concurrent_file_growth_exceeding_budget() {
     let (code, rep) = run_client(&socket, &clean_file, &[], &[]);
     assert_eq!(code, 0);
     assert_eq!(rep["status"].as_str().unwrap(), "CLEAN");
+}
+
+// ===========================================================================
+// Phase 2D.8A: Live RSIDB Hot Reload & Coordinator Integration Tests
+// ===========================================================================
+
+fn publish_test_generation(root: &Path, name: &str, signatures: &[(&[u8], &str)]) {
+    let _ = std::fs::create_dir_all(root);
+    let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+
+    let entries: Vec<serde_json::Value> = signatures
+        .iter()
+        .map(|(sig, sig_name)| {
+            let h = hex::encode(Sha256::digest(sig));
+            serde_json::json!({
+                "sha256_hash": h,
+                "file_size": sig.len(),
+                "first_seen": "2024-02-29 00:00:00",
+                "signature": sig_name
+            })
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "query_status": "ok",
+        "data": entries
+    })
+    .to_string();
+
+    private_store::publish(root, name, response.as_bytes(), 1).unwrap();
+}
+
+fn scan_via_socket(
+    socket: &Path,
+    target: &Path,
+    test_worker_action: Option<&str>,
+) -> serde_json::Value {
+    let mut stream = UnixStream::connect(socket).expect("connect to coordinator socket");
+    let file = File::open(target).expect("open target file");
+    let req = serde_json::json!({
+        "file_name": target.file_name().unwrap().to_string_lossy(),
+        "test_worker_action": test_worker_action
+    });
+    let payload = serde_json::to_vec(&req).unwrap();
+    send_raw_fd_message(&stream, &[file.as_raw_fd()], &payload).unwrap();
+    recv_raw_response(&mut stream).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Scenario A: Live update without coordinator restart
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_scenario_a_live_update_without_coordinator_restart() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let sig_a: &[u8] = b"scenario_a_indicator_alpha";
+    let sig_b: &[u8] = b"scenario_a_indicator_beta";
+
+    publish_test_generation(&db_root, "gen-a-1", &[(sig_a, "AlphaMalware")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-a-1").unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    let target_a = d.path().join("target_a.bin");
+    std::fs::write(&target_a, sig_a).unwrap();
+    let target_b = d.path().join("target_b.bin");
+    std::fs::write(&target_b, sig_b).unwrap();
+
+    // Prior to update: target A is DETECTED, target B is CLEAN
+    let resp_a1 = scan_via_socket(&socket, &target_a, None);
+    assert_eq!(resp_a1["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(resp_a1["database_generation"].as_str().unwrap(), "gen-a-1");
+    assert!(!resp_a1["degraded_freshness"].as_bool().unwrap());
+
+    let resp_b1 = scan_via_socket(&socket, &target_b, None);
+    assert_eq!(resp_b1["status"].as_str().unwrap(), "CLEAN");
+    assert_eq!(resp_b1["database_generation"].as_str().unwrap(), "gen-a-1");
+
+    // Publish gen-a-2 adding indicator B
+    publish_test_generation(
+        &db_root,
+        "gen-a-2",
+        &[(sig_a, "AlphaMalware"), (sig_b, "BetaMalware")],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "previous", "gen-a-1")
+        .unwrap();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-a-2").unwrap();
+
+    // Allow inotify / periodic check to hot reload
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Post update without restarting coordinator: target B is now DETECTED
+    let resp_b2 = scan_via_socket(&socket, &target_b, None);
+    assert_eq!(
+        resp_b2["status"].as_str().unwrap(),
+        "DETECTED",
+        "Target B must be detected after live hot reload"
+    );
+    assert_eq!(resp_b2["database_generation"].as_str().unwrap(), "gen-a-2");
+    assert!(!resp_b2["degraded_freshness"].as_bool().unwrap());
+
+    let resp_a2 = scan_via_socket(&socket, &target_a, None);
+    assert_eq!(resp_a2["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(resp_a2["database_generation"].as_str().unwrap(), "gen-a-2");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario B: In-flight scan stability while database reloads
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_scenario_b_inflight_scan_stability_during_reload() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let sig_a: &[u8] = b"scenario_b_indicator_alpha";
+    let sig_b: &[u8] = b"scenario_b_indicator_beta";
+
+    publish_test_generation(&db_root, "gen-b-1", &[(sig_a, "AlphaMalware")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-b-1").unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    let target_a = d.path().join("target_a.bin");
+    std::fs::write(&target_a, sig_a).unwrap();
+    let target_b = d.path().join("target_b.bin");
+    std::fs::write(&target_b, sig_b).unwrap();
+
+    let sock_clone = socket.clone();
+    let target_a_clone = target_a.clone();
+
+    // Client 1 initiates scan with delay so it remains pinned in-flight
+    let h1 =
+        std::thread::spawn(move || scan_via_socket(&sock_clone, &target_a_clone, Some("delay")));
+
+    // Wait 50ms so Client 1 is admitted and pinned to gen-b-1
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Hot reload to gen-b-2 while Client 1 is in-flight
+    publish_test_generation(&db_root, "gen-b-2", &[(sig_b, "BetaMalware")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "previous", "gen-b-1")
+        .unwrap();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-b-2").unwrap();
+
+    // Wait 150ms for coordinator to reload
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Client 2 submits a scan on target B; must use newly activated gen-b-2
+    let resp_c2 = scan_via_socket(&socket, &target_b, None);
+    assert_eq!(resp_c2["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(resp_c2["database_generation"].as_str().unwrap(), "gen-b-2");
+
+    // In-flight Client 1 completes; must still be pinned to gen-b-1
+    let resp_c1 = h1.join().unwrap();
+    assert_eq!(
+        resp_c1["status"].as_str().unwrap(),
+        "DETECTED",
+        "In-flight scan must detect against its pinned generation"
+    );
+    assert_eq!(
+        resp_c1["database_generation"].as_str().unwrap(),
+        "gen-b-1",
+        "In-flight scan must report the generation it was pinned to"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario C: Live rollback automatically adopted
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_scenario_c_live_rollback_automatically_adopted() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let sig_a: &[u8] = b"scenario_c_indicator_alpha";
+    let sig_b: &[u8] = b"scenario_c_indicator_beta";
+
+    publish_test_generation(&db_root, "gen-c-1", &[(sig_a, "AlphaMalware")]);
+    publish_test_generation(
+        &db_root,
+        "gen-c-2",
+        &[(sig_a, "AlphaMalware"), (sig_b, "BetaMalware")],
+    );
+
+    // Start with gen-c-2
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "previous", "gen-c-1")
+        .unwrap();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-c-2").unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    let target_b = d.path().join("target_b.bin");
+    std::fs::write(&target_b, sig_b).unwrap();
+    let target_a = d.path().join("target_a.bin");
+    std::fs::write(&target_a, sig_a).unwrap();
+
+    // Initially gen-c-2 detects target B
+    let r1 = scan_via_socket(&socket, &target_b, None);
+    assert_eq!(r1["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r1["database_generation"].as_str().unwrap(), "gen-c-2");
+
+    // Execute live rollback to gen-c-1
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-c-1").unwrap();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "previous", "gen-c-2")
+        .unwrap();
+
+    // Allow hot reload to adopt rollback
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Post-rollback: target B is CLEAN (not present in gen-c-1)
+    let r2 = scan_via_socket(&socket, &target_b, None);
+    assert_eq!(
+        r2["status"].as_str().unwrap(),
+        "CLEAN",
+        "Target B must be clean after rolling back to gen-c-1"
+    );
+    assert_eq!(r2["database_generation"].as_str().unwrap(), "gen-c-1");
+
+    // Target A is still DETECTED
+    let r3 = scan_via_socket(&socket, &target_a, None);
+    assert_eq!(r3["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r3["database_generation"].as_str().unwrap(), "gen-c-1");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario D: Rapid successive updates without memory or descriptor leaks
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_scenario_d_rapid_successive_updates_and_no_resource_leaks() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let base_sig: &[u8] = b"scenario_d_base_indicator";
+    publish_test_generation(&db_root, "gen-d-0", &[(base_sig, "BaseMalware")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-d-0").unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=4"]);
+
+    let target_base = d.path().join("target_base.bin");
+    std::fs::write(&target_base, base_sig).unwrap();
+
+    // Publish 5 generations in rapid succession while submitting concurrent scans
+    for i in 1..=5 {
+        let gen_name = format!("gen-d-{}", i);
+        let extra_sig = format!("scenario_d_sig_{}", i).into_bytes();
+        publish_test_generation(
+            &db_root,
+            &gen_name,
+            &[(base_sig, "BaseMalware"), (&extra_sig, "ExtraMalware")],
+        );
+        raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", &gen_name)
+            .unwrap();
+        // Submit a scan concurrently during each reload
+        let resp = scan_via_socket(&socket, &target_base, None);
+        assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    // Allow final reload to settle
+    std::thread::sleep(Duration::from_millis(150));
+
+    let final_resp = scan_via_socket(&socket, &target_base, None);
+    assert_eq!(final_resp["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(
+        final_resp["database_generation"].as_str().unwrap(),
+        "gen-d-5"
+    );
+    assert!(!final_resp["degraded_freshness"].as_bool().unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Scenario E: Failed candidate generation safely rejected; coordinator keeps last known-good
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_scenario_e_failed_candidate_rejection_retains_last_known_good() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let sig: &[u8] = b"scenario_e_reliable_indicator";
+    publish_test_generation(&db_root, "gen-good", &[(sig, "GoodMalware")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-good")
+        .unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    let target = d.path().join("target.bin");
+    std::fs::write(&target, sig).unwrap();
+
+    let r0 = scan_via_socket(&socket, &target, None);
+    assert_eq!(r0["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r0["database_generation"].as_str().unwrap(), "gen-good");
+    assert!(!r0["degraded_freshness"].as_bool().unwrap());
+
+    // Failure Mode 1: Missing generation
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-missing")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    let r_fail1 = scan_via_socket(&socket, &target, None);
+    assert_eq!(
+        r_fail1["status"].as_str().unwrap(),
+        "DETECTED",
+        "Must retain last known-good generation when candidate is missing"
+    );
+    assert_eq!(r_fail1["database_generation"].as_str().unwrap(), "gen-good");
+    assert!(
+        r_fail1["degraded_freshness"].as_bool().unwrap(),
+        "Must report degraded freshness"
+    );
+
+    // Failure Mode 2: Corrupted RSIDB binary
+    let corrupt_dir = db_root.join("gen-corrupt");
+    std::fs::create_dir_all(&corrupt_dir).unwrap();
+    std::fs::write(
+        corrupt_dir.join("database.rsidb"),
+        b"corrupted garbage bytes",
+    )
+    .unwrap();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-corrupt")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    let r_fail2 = scan_via_socket(&socket, &target, None);
+    assert_eq!(r_fail2["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r_fail2["database_generation"].as_str().unwrap(), "gen-good");
+    assert!(r_fail2["degraded_freshness"].as_bool().unwrap());
+
+    // Failure Mode 3: Incomplete staging generation
+    std::fs::write(db_root.join("current"), ".staging-in-progress\n").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    let r_fail3 = scan_via_socket(&socket, &target, None);
+    assert_eq!(r_fail3["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r_fail3["database_generation"].as_str().unwrap(), "gen-good");
+    assert!(r_fail3["degraded_freshness"].as_bool().unwrap());
+
+    // Failure Mode 4: Malformed pointer file
+    std::fs::write(db_root.join("current"), "bad/dir/traversal!\n").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    let r_fail4 = scan_via_socket(&socket, &target, None);
+    assert_eq!(r_fail4["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r_fail4["database_generation"].as_str().unwrap(), "gen-good");
+    assert!(r_fail4["degraded_freshness"].as_bool().unwrap());
+
+    // Recovery: Publish a valid gen-recovered and verify degraded freshness clears
+    publish_test_generation(&db_root, "gen-recovered", &[(sig, "GoodMalware")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-recovered")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let r_rec = scan_via_socket(&socket, &target, None);
+    assert_eq!(r_rec["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(
+        r_rec["database_generation"].as_str().unwrap(),
+        "gen-recovered"
+    );
+    assert!(
+        !r_rec["degraded_freshness"].as_bool().unwrap(),
+        "Degraded freshness must clear after valid candidate is adopted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario F: Coordinator process restart recovery
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_scenario_f_coordinator_restart_recovery() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let sig: &[u8] = b"scenario_f_indicator";
+    publish_test_generation(&db_root, "gen-f-1", &[(sig, "MalwareF")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-f-1").unwrap();
+
+    let mut coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    let target = d.path().join("target.bin");
+    std::fs::write(&target, sig).unwrap();
+
+    let r1 = scan_via_socket(&socket, &target, None);
+    assert_eq!(r1["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r1["database_generation"].as_str().unwrap(), "gen-f-1");
+
+    // Stop coordinator daemon
+    let _ = coord.stop();
+
+    // While coordinator is offline, an update is activated on disk
+    let sig2: &[u8] = b"scenario_f_indicator_2";
+    publish_test_generation(
+        &db_root,
+        "gen-f-2",
+        &[(sig, "MalwareF"), (sig2, "MalwareF2")],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-f-2").unwrap();
+
+    // Restart coordinator process against the same root directory
+    let _coord2 = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    let target2 = d.path().join("target2.bin");
+    std::fs::write(&target2, sig2).unwrap();
+
+    // Verify restart recovered immediately and serves active generation
+    let r2 = scan_via_socket(&socket, &target2, None);
+    assert_eq!(
+        r2["status"].as_str().unwrap(),
+        "DETECTED",
+        "Restarted coordinator must detect new indicators from updated generation"
+    );
+    assert_eq!(r2["database_generation"].as_str().unwrap(), "gen-f-2");
+    assert!(!r2["degraded_freshness"].as_bool().unwrap());
+}
+
+fn pid_resident_memory_bytes(pid: u32) -> u64 {
+    let statm_str = match std::fs::read_to_string(format!("/proc/{pid}/statm")) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut parts = statm_str.split_whitespace();
+    let _total = parts.next();
+    let rss: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = if page_size > 0 {
+        page_size as u64
+    } else {
+        4096
+    };
+    rss * page_size
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry & Resource Bound Verification (Synthetic & Authentic Benchmarks)
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8a_memory_and_performance_benchmarks() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coordinator.sock");
+
+    let sig1: &[u8] = b"synthetic_perf_sig_1";
+    let sig2: &[u8] = b"synthetic_perf_sig_2";
+
+    publish_test_generation(&db_root, "gen-bench-1", &[(sig1, "PerfSig1")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-bench-1")
+        .unwrap();
+
+    let coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+    let pid = coord.child.id();
+
+    let target1 = d.path().join("target1.bin");
+    std::fs::write(&target1, sig1).unwrap();
+
+    // 1. Warm-up scan and measure initial RSS
+    let _ = scan_via_socket(&socket, &target1, None);
+    let rss_before = pid_resident_memory_bytes(pid);
+
+    // 2. Measure scan throughput before reload (20 iterations)
+    let n_iterations = 20;
+    let t0 = Instant::now();
+    for _ in 0..n_iterations {
+        let resp = scan_via_socket(&socket, &target1, None);
+        assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+    }
+    let duration_before = t0.elapsed();
+    let throughput_before = (n_iterations as f64) / duration_before.as_secs_f64();
+
+    // 3. Trigger reload to gen-bench-2
+    publish_test_generation(
+        &db_root,
+        "gen-bench-2",
+        &[(sig1, "PerfSig1"), (sig2, "PerfSig2")],
+    );
+    let reload_trigger = Instant::now();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-bench-2")
+        .unwrap();
+
+    // Poll until reload takes effect
+    let mut switch_latency = Duration::ZERO;
+    let mut rss_during = rss_before;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(10));
+        let cur_rss = pid_resident_memory_bytes(pid);
+        if cur_rss > rss_during {
+            rss_during = cur_rss;
+        }
+        let resp = scan_via_socket(&socket, &target1, None);
+        if resp["database_generation"].as_str() == Some("gen-bench-2") {
+            switch_latency = reload_trigger.elapsed();
+            break;
+        }
+    }
+    assert_ne!(switch_latency, Duration::ZERO, "Reload must be adopted");
+
+    let rss_after = pid_resident_memory_bytes(pid);
+
+    // 4. Measure scan throughput after reload (20 iterations)
+    let t1 = Instant::now();
+    for _ in 0..n_iterations {
+        let resp = scan_via_socket(&socket, &target1, None);
+        assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+        assert_eq!(resp["database_generation"].as_str().unwrap(), "gen-bench-2");
+    }
+    let duration_after = t1.elapsed();
+    let throughput_after = (n_iterations as f64) / duration_after.as_secs_f64();
+
+    println!("=== SYNTHETIC DATASET BENCHMARK METRICS ===");
+    println!(
+        "Resident Memory Before Reload : {:.2} MB ({} bytes)",
+        (rss_before as f64) / 1024.0 / 1024.0,
+        rss_before
+    );
+    println!(
+        "Resident Memory Peak / During : {:.2} MB ({} bytes)",
+        (rss_during as f64) / 1024.0 / 1024.0,
+        rss_during
+    );
+    println!(
+        "Resident Memory After Reload  : {:.2} MB ({} bytes)",
+        (rss_after as f64) / 1024.0 / 1024.0,
+        rss_after
+    );
+    println!(
+        "Switch Latency                : {:.2} ms ({:?})",
+        switch_latency.as_secs_f64() * 1000.0,
+        switch_latency
+    );
+    println!(
+        "Scan Throughput Before Reload : {:.1} scans/sec",
+        throughput_before
+    );
+    println!(
+        "Scan Throughput After Reload  : {:.1} scans/sec",
+        throughput_after
+    );
+
+    // Assert resource bounds: peak memory must be bounded (less than 2x reasonable overhead)
+    assert!(
+        rss_during <= rss_before.saturating_mul(2) + 20 * 1024 * 1024,
+        "Resident memory during reload must not exceed two generations in memory"
+    );
+
+    // 5. Authentic Dataset Benchmark (542,057 indicators)
+    let authentic_db =
+        Path::new("/home/vscode/raxosentinel-private-phase2d1/phase2d6-unified/database.rsidb");
+    if authentic_db.exists() {
+        let auth_socket = d.path().join("sock_dir/authentic_coordinator.sock");
+        let auth_coord = CoordinatorProcess::spawn(
+            &auth_socket,
+            Path::new("/home/vscode/raxosentinel-private-phase2d1"),
+            "phase2d6-unified",
+            &["--max-workers=2"],
+        );
+        let auth_pid = auth_coord.child.id();
+        let auth_rss = pid_resident_memory_bytes(auth_pid);
+
+        let test_clean = d.path().join("clean_auth.bin");
+        std::fs::write(
+            &test_clean,
+            b"safe text file content for authentic benchmark",
+        )
+        .unwrap();
+
+        let t_start = Instant::now();
+        let n_auth_iterations = 2;
+        for _ in 0..n_auth_iterations {
+            let resp = scan_via_socket(&auth_socket, &test_clean, None);
+            assert_eq!(resp["status"].as_str().unwrap(), "CLEAN");
+            assert_eq!(
+                resp["database_generation"].as_str().unwrap(),
+                "phase2d6-unified"
+            );
+            assert!(!resp["degraded_freshness"].as_bool().unwrap());
+        }
+        let auth_duration = t_start.elapsed();
+        let auth_throughput = (n_auth_iterations as f64) / auth_duration.as_secs_f64();
+
+        println!("\n=== AUTHENTIC DATASET COORDINATOR BENCHMARK (542,057 indicators) ===");
+        println!(
+            "Coordinator RSS (Authentic RSIDB): {:.2} MB ({} bytes)",
+            (auth_rss as f64) / 1024.0 / 1024.0,
+            auth_rss
+        );
+        println!(
+            "Authentic Scan Throughput        : {:.1} scans/sec",
+            auth_throughput
+        );
+    }
 }

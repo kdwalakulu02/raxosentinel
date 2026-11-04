@@ -680,6 +680,16 @@ impl UpdateEngine {
             UpdateError::RollbackFailed("No previous generation pointer found".to_string())
         })?;
 
+        let old_current = read_pointer(&self.root, CURRENT_PTR);
+        if let Some(ref cur) = old_current {
+            if cur == &prev_gen {
+                return Err(UpdateError::RollbackFailed(format!(
+                    "Cyclic rollback target: previous generation equals current generation '{}'",
+                    prev_gen
+                )));
+            }
+        }
+
         // Strict verification of the previous generation before activating it
         private_store::load(&self.root, &prev_gen).map_err(|e| {
             UpdateError::RollbackFailed(format!(
@@ -688,7 +698,6 @@ impl UpdateEngine {
             ))
         })?;
 
-        let old_current = read_pointer(&self.root, CURRENT_PTR);
         let old_total = old_current
             .as_deref()
             .and_then(|g| unified::inspect(&self.root, g).ok())
@@ -704,7 +713,9 @@ impl UpdateEngine {
 
         write_pointer(&self.root, CURRENT_PTR, &prev_gen)?;
         if let Some(ref old) = old_current {
-            let _ = write_pointer(&self.root, PREVIOUS_PTR, old);
+            if old != &prev_gen {
+                let _ = write_pointer(&self.root, PREVIOUS_PTR, old);
+            }
         }
 
         // Authoritatively derive status and source metadata from the active generation (prev_gen)

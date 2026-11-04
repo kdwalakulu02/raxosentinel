@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+use super::hot_reload::DatabaseManager;
 use super::print_human_report;
 use super::supervised::{
     error_report, execute_worker_on_snapshot, sealed_snapshot_with_budget, SnapshotBudget,
@@ -97,11 +98,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub rules: Option<PathBuf>,
 
-    /// Owner-controlled private storage root (requires --private-generation).
-    #[arg(long, requires = "private_generation", conflicts_with_all = ["db", "db_store", "public_release"])]
+    /// Owner-controlled private storage root.
+    #[arg(long, conflicts_with_all = ["db", "db_store", "public_release"])]
     pub private_db_root: Option<PathBuf>,
 
-    /// Immutable private generation to verify before serving.
+    /// Immutable private generation to verify before serving (defaults to active pointer).
     #[arg(long, requires = "private_db_root")]
     pub private_generation: Option<String>,
 
@@ -189,6 +190,10 @@ pub struct CoordinatorResponse {
     pub status: CoordinatorVerdict,
     pub report: Option<ScanReport>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_freshness: Option<bool>,
 }
 
 /// Verify database generation before accepting scan requests.
@@ -202,10 +207,11 @@ pub fn verify_startup_database(args: &ServeArgs) -> Result<(), String> {
     }
 
     if let Some(ref root) = args.private_db_root {
-        let generation = args
-            .private_generation
-            .as_deref()
-            .ok_or("Missing --private-generation for private storage root")?;
+        let generation = match args.private_generation.as_deref() {
+            Some(g) => g.to_string(),
+            None => private_store::resolve_generation(root, "current")
+                .map_err(|e| format!("Cannot resolve active private generation: {e}"))?,
+        };
         match private_store::incomplete(root) {
             Ok(entries) if !entries.is_empty() => {
                 return Err(format!(
@@ -218,7 +224,7 @@ pub fn verify_startup_database(args: &ServeArgs) -> Result<(), String> {
                 return Err(format!("Private database recovery inspection failed: {e}"));
             }
         }
-        private_store::load(root, generation)
+        private_store::load(root, &generation)
             .map_err(|e| format!("Private database verification failed: {e}"))?;
         tracing::info!("Private generation '{}' verified successfully", generation);
     } else if let Some(ref release) = args.public_release {
@@ -807,6 +813,8 @@ fn send_busy_response(mut stream: UnixStream, reason: &str) {
         status: CoordinatorVerdict::Busy,
         report: None,
         error: Some(reason.into()),
+        database_generation: None,
+        degraded_freshness: None,
     };
     let _ = send_framed_response(&mut stream, &resp);
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -824,6 +832,8 @@ fn send_unauthorized_response(mut stream: UnixStream, reason: &str) {
         status: CoordinatorVerdict::Error,
         report: None,
         error: Some(reason.into()),
+        database_generation: None,
+        degraded_freshness: None,
     };
     let _ = send_framed_response(&mut stream, &resp);
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -841,9 +851,17 @@ fn handle_client_connection(
     worker_config: &SupervisedWorkerConfig,
     client_timeout_secs: u64,
     shared_state: &Arc<(Mutex<CoordinatorState>, Condvar)>,
+    db_manager: Option<&Arc<DatabaseManager>>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(client_timeout_secs);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    // Pin active database handle for the entire duration of this scan
+    let pinned_handle = db_manager.map(|dm| dm.pin_active());
+    let (database_generation, degraded_freshness) = match (pinned_handle.as_ref(), db_manager) {
+        (Some(ph), Some(dm)) => (Some(ph.generation().to_string()), Some(dm.is_degraded())),
+        _ => (None, None),
+    };
 
     let (request, raw_fd) = match recv_fd_request(&mut stream, deadline) {
         Ok(pair) => pair,
@@ -852,6 +870,8 @@ fn handle_client_connection(
                 status: CoordinatorVerdict::Error,
                 report: None,
                 error: Some(e),
+                database_generation,
+                degraded_freshness,
             };
             let _ = send_framed_response(&mut stream, &resp);
             return;
@@ -868,6 +888,8 @@ fn handle_client_connection(
             status: CoordinatorVerdict::Error,
             report: None,
             error: Some("Invalid descriptor: fstat failed".into()),
+            database_generation,
+            degraded_freshness,
         };
         let _ = send_framed_response(&mut stream, &resp);
         return;
@@ -881,6 +903,8 @@ fn handle_client_connection(
             status: CoordinatorVerdict::Error,
             report: None,
             error: Some("Invalid descriptor: not a regular file".into()),
+            database_generation,
+            degraded_freshness,
         };
         let _ = send_framed_response(&mut stream, &resp);
         return;
@@ -909,6 +933,8 @@ fn handle_client_connection(
             status: CoordinatorVerdict::Error,
             report: Some(report),
             error: Some(msg),
+            database_generation,
+            degraded_freshness,
         };
         let _ = send_framed_response(&mut stream, &resp);
         return;
@@ -926,6 +952,8 @@ fn handle_client_connection(
                 status: CoordinatorVerdict::Error,
                 report: Some(report),
                 error: Some(msg),
+                database_generation,
+                degraded_freshness,
             };
             let _ = send_framed_response(&mut stream, &resp);
             return;
@@ -938,6 +966,8 @@ fn handle_client_connection(
                 status: CoordinatorVerdict::Busy,
                 report: None,
                 error: Some(msg),
+                database_generation,
+                degraded_freshness,
             };
             let _ = send_framed_response(&mut stream, &resp);
             return;
@@ -955,6 +985,8 @@ fn handle_client_connection(
                 status: CoordinatorVerdict::Error,
                 report: Some(report),
                 error: Some(e),
+                database_generation,
+                degraded_freshness,
             };
             let _ = send_framed_response(&mut stream, &resp);
             return;
@@ -963,6 +995,9 @@ fn handle_client_connection(
 
     let target_name = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
     let mut effective_config = worker_config.clone();
+    if let Some(ref ph) = pinned_handle {
+        effective_config.private_generation = Some(ph.generation().to_string());
+    }
     #[cfg(debug_assertions)]
     if let Some(action) = request.test_worker_action {
         effective_config.test_worker_action = Some(action);
@@ -993,6 +1028,8 @@ fn handle_client_connection(
                 status: verdict,
                 report: Some(report),
                 error: None,
+                database_generation,
+                degraded_freshness,
             }
         }
         Err(e) => {
@@ -1001,6 +1038,8 @@ fn handle_client_connection(
                 status: CoordinatorVerdict::Error,
                 report: Some(report),
                 error: Some(e),
+                database_generation,
+                degraded_freshness,
             }
         }
     };
@@ -1071,11 +1110,28 @@ pub fn serve(args: ServeArgs) -> i32 {
         Condvar::new(),
     ));
 
+    let db_manager = if let Some(ref root) = args.private_db_root {
+        let mgr = match DatabaseManager::new(root.clone(), args.private_generation.clone()) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                eprintln!("Coordinator database startup error: {e}");
+                return 3;
+            }
+        };
+        if let Err(e) = mgr.start_monitor() {
+            tracing::warn!("Coordinator monitor setup warning: {e}");
+        }
+        Some(mgr)
+    } else {
+        None
+    };
+
     let mut worker_handles = Vec::with_capacity(args.max_workers);
     for _ in 0..args.max_workers {
         let state_clone = Arc::clone(&shared_state);
         let worker_cfg = worker_config.clone();
         let client_timeout = args.client_timeout_secs;
+        let db_mgr_clone = db_manager.clone();
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*state_clone;
             loop {
@@ -1092,7 +1148,13 @@ pub fn serve(args: ServeArgs) -> i32 {
                     stream
                 };
 
-                handle_client_connection(stream, &worker_cfg, client_timeout, &state_clone);
+                handle_client_connection(
+                    stream,
+                    &worker_cfg,
+                    client_timeout,
+                    &state_clone,
+                    db_mgr_clone.as_ref(),
+                );
 
                 {
                     let mut guard = lock.lock().unwrap();
@@ -1186,6 +1248,10 @@ pub fn serve(args: ServeArgs) -> i32 {
 
     for handle in worker_handles {
         let _ = handle.join();
+    }
+
+    if let Some(ref mgr) = db_manager {
+        mgr.stop_monitor();
     }
 
     cleanup_socket(&socket_path);

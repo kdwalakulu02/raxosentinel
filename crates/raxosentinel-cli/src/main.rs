@@ -296,11 +296,11 @@ struct ScanArgs {
     #[arg(long, requires = "public_release")]
     public_state: Option<PathBuf>,
 
-    /// Owner-controlled private storage root (requires --private-generation).
-    #[arg(long, requires = "private_generation", conflicts_with_all = ["db", "db_store"])]
+    /// Owner-controlled private storage root.
+    #[arg(long, conflicts_with_all = ["db", "db_store"])]
     private_db_root: Option<PathBuf>,
 
-    /// Immutable private generation to verify before scanning.
+    /// Immutable private generation to verify before scanning (defaults to active pointer).
     #[arg(long, requires = "private_db_root")]
     private_generation: Option<String>,
 
@@ -480,12 +480,21 @@ fn run_scan(args: ScanArgs) -> i32 {
                 return 3;
             }
         }
-        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(
-            root,
-            args.private_generation
-                .as_deref()
-                .expect("clap requires generation"),
-        ) {
+        let gen = match args.private_generation.as_deref() {
+            Some(g) => g.to_string(),
+            None => {
+                match raxosentinel_signatures::rsidb::malwarebazaar::private_store::resolve_generation(
+                    root, "current",
+                ) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("Error resolving active private generation: {e}");
+                        return 3;
+                    }
+                }
+            }
+        };
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(root, &gen) {
             Ok(index) => db.attach_rsidb(Arc::new(index)),
             Err(e) => {
                 eprintln!("Error: private database rejected: {e}");
@@ -664,6 +673,9 @@ mod supervised {
         3
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod hot_reload;
 
 #[cfg(target_os = "linux")]
 mod coordinator;
