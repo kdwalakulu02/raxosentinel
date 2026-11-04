@@ -27,7 +27,6 @@ pub struct SupervisedWorkerConfig {
     pub public_key: Option<PathBuf>,
     pub public_approval_key: Option<PathBuf>,
     pub public_state: Option<PathBuf>,
-    #[cfg(debug_assertions)]
     pub test_worker_action: Option<String>,
 }
 
@@ -236,7 +235,6 @@ fn run_inner(args: &ScanArgs) -> Result<ScanReport, String> {
         public_key: args.public_key.clone(),
         public_approval_key: args.public_approval_key.clone(),
         public_state: args.public_state.clone(),
-        #[cfg(debug_assertions)]
         test_worker_action: None,
     };
     execute_worker_on_snapshot(file, &args.target, &config)
@@ -292,11 +290,15 @@ pub fn execute_worker_on_snapshot(
         return Err("Worker request exceeds argument limit".into());
     }
     command.env_clear();
-    #[cfg(debug_assertions)]
-    if let Some(ref action) = config.test_worker_action {
-        command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
-    } else if let Some(action) = std::env::var_os("RAXOSENTINEL_TEST_WORKER_ACTION") {
-        command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
+    let allow_test = cfg!(debug_assertions)
+        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    if allow_test {
+        command.env("RAXOSENTINEL_ALLOW_TEST_ACTIONS", "1");
+        if let Some(ref action) = config.test_worker_action {
+            command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
+        } else if let Some(action) = std::env::var_os("RAXOSENTINEL_TEST_WORKER_ACTION") {
+            command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
+        }
     }
     command
         .stdin(Stdio::from(snapshot))

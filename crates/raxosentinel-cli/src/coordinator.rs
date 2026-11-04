@@ -62,6 +62,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 1)]
     pub max_workers: usize,
 
+    /// Maximum number of RSIDB generations kept resident in memory simultaneously (default: 2)
+    #[arg(long, default_value_t = 2)]
+    pub max_resident_generations: usize,
+
     /// Maximum number of queued/pending requests while a scan is active (default: 1)
     #[arg(long, default_value_t = 1)]
     pub max_pending: usize,
@@ -156,7 +160,6 @@ pub struct ClientArgs {
     #[arg(long)]
     pub max_depth: Option<usize>,
 
-    #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     pub test_worker_action: Option<String>,
 }
@@ -167,7 +170,6 @@ pub struct ScanRequest {
     pub max_size: Option<u64>,
     pub timeout: Option<u64>,
     pub max_depth: Option<usize>,
-    #[cfg(debug_assertions)]
     pub test_worker_action: Option<String>,
 }
 
@@ -194,6 +196,12 @@ pub struct CoordinatorResponse {
     pub database_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_freshness: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_load_time_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_switch_latency_micros: Option<u64>,
 }
 
 /// Verify database generation before accepting scan requests.
@@ -815,6 +823,9 @@ fn send_busy_response(mut stream: UnixStream, reason: &str) {
         error: Some(reason.into()),
         database_generation: None,
         degraded_freshness: None,
+        pending_generation: None,
+        reload_load_time_ms: None,
+        reload_switch_latency_micros: None,
     };
     let _ = send_framed_response(&mut stream, &resp);
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -834,6 +845,9 @@ fn send_unauthorized_response(mut stream: UnixStream, reason: &str) {
         error: Some(reason.into()),
         database_generation: None,
         degraded_freshness: None,
+        pending_generation: None,
+        reload_load_time_ms: None,
+        reload_switch_latency_micros: None,
     };
     let _ = send_framed_response(&mut stream, &resp);
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -858,21 +872,46 @@ fn handle_client_connection(
 
     // Pin active database handle for the entire duration of this scan
     let pinned_handle = db_manager.map(|dm| dm.pin_active());
-    let (database_generation, degraded_freshness) = match (pinned_handle.as_ref(), db_manager) {
-        (Some(ph), Some(dm)) => (Some(ph.generation().to_string()), Some(dm.is_degraded())),
-        _ => (None, None),
+    let (
+        database_generation,
+        degraded_freshness,
+        pending_generation,
+        reload_load_time_ms,
+        reload_switch_latency_micros,
+    ) = match (pinned_handle.as_ref(), db_manager) {
+        (Some(ph), Some(dm)) => {
+            let latest = dm.reload_history().last().cloned();
+            (
+                Some(ph.generation().to_string()),
+                Some(dm.is_degraded()),
+                dm.pending_generation(),
+                latest.as_ref().map(|m| m.load_time_ms),
+                latest.as_ref().map(|m| m.switch_latency_micros),
+            )
+        }
+        _ => (None, None, None, None, None),
+    };
+
+    let make_resp = |status: CoordinatorVerdict,
+                     report: Option<ScanReport>,
+                     error: Option<String>|
+     -> CoordinatorResponse {
+        CoordinatorResponse {
+            status,
+            report,
+            error,
+            database_generation: database_generation.clone(),
+            degraded_freshness,
+            pending_generation: pending_generation.clone(),
+            reload_load_time_ms,
+            reload_switch_latency_micros,
+        }
     };
 
     let (request, raw_fd) = match recv_fd_request(&mut stream, deadline) {
         Ok(pair) => pair,
         Err(e) => {
-            let resp = CoordinatorResponse {
-                status: CoordinatorVerdict::Error,
-                report: None,
-                error: Some(e),
-                database_generation,
-                degraded_freshness,
-            };
+            let resp = make_resp(CoordinatorVerdict::Error, None, Some(e));
             let _ = send_framed_response(&mut stream, &resp);
             return;
         }
@@ -884,13 +923,11 @@ fn handle_client_connection(
         unsafe {
             libc::close(raw_fd);
         }
-        let resp = CoordinatorResponse {
-            status: CoordinatorVerdict::Error,
-            report: None,
-            error: Some("Invalid descriptor: fstat failed".into()),
-            database_generation,
-            degraded_freshness,
-        };
+        let resp = make_resp(
+            CoordinatorVerdict::Error,
+            None,
+            Some("Invalid descriptor: fstat failed".into()),
+        );
         let _ = send_framed_response(&mut stream, &resp);
         return;
     }
@@ -899,13 +936,11 @@ fn handle_client_connection(
         unsafe {
             libc::close(raw_fd);
         }
-        let resp = CoordinatorResponse {
-            status: CoordinatorVerdict::Error,
-            report: None,
-            error: Some("Invalid descriptor: not a regular file".into()),
-            database_generation,
-            degraded_freshness,
-        };
+        let resp = make_resp(
+            CoordinatorVerdict::Error,
+            None,
+            Some("Invalid descriptor: not a regular file".into()),
+        );
         let _ = send_framed_response(&mut stream, &resp);
         return;
     }
@@ -929,13 +964,7 @@ fn handle_client_connection(
             file_size, max_size
         );
         let report = error_report(&target_path, msg.clone());
-        let resp = CoordinatorResponse {
-            status: CoordinatorVerdict::Error,
-            report: Some(report),
-            error: Some(msg),
-            database_generation,
-            degraded_freshness,
-        };
+        let resp = make_resp(CoordinatorVerdict::Error, Some(report), Some(msg));
         let _ = send_framed_response(&mut stream, &resp);
         return;
     }
@@ -948,13 +977,7 @@ fn handle_client_connection(
             }
             let target_path = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
             let report = error_report(&target_path, msg.clone());
-            let resp = CoordinatorResponse {
-                status: CoordinatorVerdict::Error,
-                report: Some(report),
-                error: Some(msg),
-                database_generation,
-                degraded_freshness,
-            };
+            let resp = make_resp(CoordinatorVerdict::Error, Some(report), Some(msg));
             let _ = send_framed_response(&mut stream, &resp);
             return;
         }
@@ -962,13 +985,7 @@ fn handle_client_connection(
             unsafe {
                 libc::close(raw_fd);
             }
-            let resp = CoordinatorResponse {
-                status: CoordinatorVerdict::Busy,
-                report: None,
-                error: Some(msg),
-                database_generation,
-                degraded_freshness,
-            };
+            let resp = make_resp(CoordinatorVerdict::Busy, None, Some(msg));
             let _ = send_framed_response(&mut stream, &resp);
             return;
         }
@@ -981,13 +998,7 @@ fn handle_client_connection(
         Err(e) => {
             let target_path = PathBuf::from(request.file_name.unwrap_or_else(|| "target".into()));
             let report = error_report(&target_path, e.clone());
-            let resp = CoordinatorResponse {
-                status: CoordinatorVerdict::Error,
-                report: Some(report),
-                error: Some(e),
-                database_generation,
-                degraded_freshness,
-            };
+            let resp = make_resp(CoordinatorVerdict::Error, Some(report), Some(e));
             let _ = send_framed_response(&mut stream, &resp);
             return;
         }
@@ -998,9 +1009,12 @@ fn handle_client_connection(
     if let Some(ref ph) = pinned_handle {
         effective_config.private_generation = Some(ph.generation().to_string());
     }
-    #[cfg(debug_assertions)]
-    if let Some(action) = request.test_worker_action {
-        effective_config.test_worker_action = Some(action);
+    let allow_test = cfg!(debug_assertions)
+        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    if allow_test {
+        if let Some(action) = request.test_worker_action {
+            effective_config.test_worker_action = Some(action);
+        }
     }
     if let Some(ms) = request.max_size {
         effective_config.max_size =
@@ -1024,23 +1038,11 @@ fn handle_client_connection(
                 ScanStatus::Unsupported => CoordinatorVerdict::Unscanned,
                 ScanStatus::Failed => CoordinatorVerdict::Error,
             };
-            CoordinatorResponse {
-                status: verdict,
-                report: Some(report),
-                error: None,
-                database_generation,
-                degraded_freshness,
-            }
+            make_resp(verdict, Some(report), None)
         }
         Err(e) => {
             let report = error_report(&target_name, e.clone());
-            CoordinatorResponse {
-                status: CoordinatorVerdict::Error,
-                report: Some(report),
-                error: Some(e),
-                database_generation,
-                degraded_freshness,
-            }
+            make_resp(CoordinatorVerdict::Error, Some(report), Some(e))
         }
     };
 
@@ -1093,7 +1095,6 @@ pub fn serve(args: ServeArgs) -> i32 {
         public_key: args.public_key.clone(),
         public_approval_key: args.public_approval_key.clone(),
         public_state: args.public_state.clone(),
-        #[cfg(debug_assertions)]
         test_worker_action: None,
     };
 
@@ -1111,7 +1112,11 @@ pub fn serve(args: ServeArgs) -> i32 {
     ));
 
     let db_manager = if let Some(ref root) = args.private_db_root {
-        let mgr = match DatabaseManager::new(root.clone(), args.private_generation.clone()) {
+        let mgr = match DatabaseManager::new_with_budget(
+            root.clone(),
+            args.private_generation.clone(),
+            args.max_resident_generations,
+        ) {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 eprintln!("Coordinator database startup error: {e}");
@@ -1304,7 +1309,6 @@ pub fn client(args: ClientArgs) -> i32 {
         max_size: args.max_size,
         timeout: args.timeout,
         max_depth: args.max_depth,
-        #[cfg(debug_assertions)]
         test_worker_action: args
             .test_worker_action
             .or_else(|| std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION").ok()),

@@ -365,7 +365,6 @@ fn run_scan(args: ScanArgs) -> i32 {
                 max_size: args.max_size,
                 timeout: args.timeout,
                 max_depth: args.max_depth,
-                #[cfg(debug_assertions)]
                 test_worker_action: std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION").ok(),
             };
             return coordinator::client(client_args);
@@ -377,8 +376,9 @@ fn run_scan(args: ScanArgs) -> i32 {
         }
     }
 
-    #[cfg(debug_assertions)]
-    if args.worker_internal {
+    let allow_test = cfg!(debug_assertions)
+        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    if allow_test && args.worker_internal {
         if let Ok(action) = std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION") {
             match action.as_str() {
                 "descendant" => {
@@ -390,6 +390,11 @@ fn run_scan(args: ScanArgs) -> i32 {
                     return 3;
                 }
                 "delay" => std::thread::sleep(std::time::Duration::from_millis(500)),
+                act if act.starts_with("delay:") => {
+                    if let Ok(ms) = act["delay:".len()..].parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                }
                 "hang" => loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 },

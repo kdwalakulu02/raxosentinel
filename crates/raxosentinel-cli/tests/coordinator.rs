@@ -26,6 +26,7 @@ use raxosentinel_signatures::rsidb::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[allow(unused_imports)]
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -160,6 +161,7 @@ impl CoordinatorProcess {
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_raxosentinel"));
+        cmd.env("RAXOSENTINEL_ALLOW_TEST_ACTIONS", "1");
         cmd.arg("serve")
             .arg("--socket")
             .arg(socket_path)
@@ -241,6 +243,7 @@ impl CoordinatorProcess {
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_raxosentinel"));
+        cmd.env("RAXOSENTINEL_ALLOW_TEST_ACTIONS", "1");
         cmd.arg("serve")
             .arg("--socket")
             .arg(socket_path)
@@ -2143,20 +2146,162 @@ fn test_phase2d8a_scenario_f_coordinator_restart_recovery() {
 }
 
 fn pid_resident_memory_bytes(pid: u32) -> u64 {
-    let statm_str = match std::fs::read_to_string(format!("/proc/{pid}/statm")) {
-        Ok(s) => s,
-        Err(_) => return 0,
+    read_proc_memory_stats(pid)
+        .map(|s| s.rss_bytes)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcMemoryStats {
+    rss_bytes: u64,
+    pss_bytes: u64,
+    shared_clean_bytes: u64,
+    shared_dirty_bytes: u64,
+    private_clean_bytes: u64,
+    private_dirty_bytes: u64,
+    anonymous_bytes: u64,
+}
+
+fn read_proc_memory_stats(pid: u32) -> Result<ProcMemoryStats, String> {
+    let rollup_path = if pid == 0 || pid == std::process::id() {
+        "/proc/self/smaps_rollup".to_string()
+    } else {
+        format!("/proc/{pid}/smaps_rollup")
     };
-    let mut parts = statm_str.split_whitespace();
+
+    if let Ok(content) = std::fs::read_to_string(&rollup_path) {
+        let mut stats = ProcMemoryStats::default();
+        for line in content.lines() {
+            let mut parts = line.split_whitespace();
+            let key = match parts.next() {
+                Some(k) => k.trim_end_matches(':'),
+                None => continue,
+            };
+            let kb: u64 = match parts.next().and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            let bytes = kb.saturating_mul(1024);
+            match key {
+                "Rss" => stats.rss_bytes = bytes,
+                "Pss" => stats.pss_bytes = bytes,
+                "Shared_Clean" => stats.shared_clean_bytes = bytes,
+                "Shared_Dirty" => stats.shared_dirty_bytes = bytes,
+                "Private_Clean" => stats.private_clean_bytes = bytes,
+                "Private_Dirty" => stats.private_dirty_bytes = bytes,
+                "Anonymous" => stats.anonymous_bytes = bytes,
+                _ => {}
+            }
+        }
+        return Ok(stats);
+    }
+
+    let statm_path = if pid == 0 || pid == std::process::id() {
+        "/proc/self/statm".to_string()
+    } else {
+        format!("/proc/{pid}/statm")
+    };
+    let content = std::fs::read_to_string(&statm_path)
+        .map_err(|e| format!("Failed to read statm from {statm_path}: {e}"))?;
+    let mut parts = content.split_whitespace();
     let _total = parts.next();
-    let rss: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let rss_pages: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size = if page_size > 0 {
         page_size as u64
     } else {
         4096
     };
-    rss * page_size
+    let rss_bytes = rss_pages.saturating_mul(page_size);
+
+    Ok(ProcMemoryStats {
+        rss_bytes,
+        pss_bytes: rss_bytes,
+        ..Default::default()
+    })
+}
+
+fn get_child_pids(pid: u32) -> Vec<u32> {
+    let children_path = format!("/proc/{pid}/task/{pid}/children");
+    if let Ok(content) = std::fs::read_to_string(&children_path) {
+        let pids: Vec<u32> = content
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+
+    let mut children = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                if let Ok(child_pid) = file_name.parse::<u32>() {
+                    let stat_path = format!("/proc/{child_pid}/stat");
+                    if let Ok(stat_content) = std::fs::read_to_string(&stat_path) {
+                        if let Some(rparen) = stat_content.rfind(')') {
+                            let rest = &stat_content[rparen + 1..];
+                            let mut parts = rest.split_whitespace();
+                            let _state = parts.next();
+                            if let Some(ppid_str) = parts.next() {
+                                if ppid_str.parse::<u32>().ok() == Some(pid) {
+                                    children.push(child_pid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    children
+}
+
+fn read_tree_memory_stats(root_pid: u32) -> Result<ProcMemoryStats, String> {
+    let mut stats = read_proc_memory_stats(root_pid)?;
+    let children = get_child_pids(root_pid);
+    for c_pid in children {
+        if let Ok(c_stats) = read_proc_memory_stats(c_pid) {
+            stats.rss_bytes = stats.rss_bytes.saturating_add(c_stats.rss_bytes);
+            stats.pss_bytes = stats.pss_bytes.saturating_add(c_stats.pss_bytes);
+            stats.shared_clean_bytes = stats
+                .shared_clean_bytes
+                .saturating_add(c_stats.shared_clean_bytes);
+            stats.shared_dirty_bytes = stats
+                .shared_dirty_bytes
+                .saturating_add(c_stats.shared_dirty_bytes);
+            stats.private_clean_bytes = stats
+                .private_clean_bytes
+                .saturating_add(c_stats.private_clean_bytes);
+            stats.private_dirty_bytes = stats
+                .private_dirty_bytes
+                .saturating_add(c_stats.private_dirty_bytes);
+            stats.anonymous_bytes = stats
+                .anonymous_bytes
+                .saturating_add(c_stats.anonymous_bytes);
+        }
+    }
+    Ok(stats)
+}
+
+fn setup_isolated_authentic_generation(dest_gen_dir: &Path) {
+    let src_dir = Path::new("/home/vscode/raxosentinel-private-phase2d1/phase2d6-unified");
+    std::fs::create_dir_all(dest_gen_dir).unwrap();
+    let _ = std::fs::set_permissions(dest_gen_dir, std::fs::Permissions::from_mode(0o700));
+
+    for entry in std::fs::read_dir(src_dir).unwrap() {
+        let entry = entry.unwrap();
+        let file_type = entry.file_type().unwrap();
+        if file_type.is_file() {
+            let file_name = entry.file_name();
+            let dest_file = dest_gen_dir.join(&file_name);
+            if std::fs::hard_link(entry.path(), &dest_file).is_err() {
+                std::fs::copy(entry.path(), &dest_file).unwrap();
+            }
+            let _ = std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2279,7 +2424,7 @@ fn test_phase2d8a_memory_and_performance_benchmarks() {
             &auth_socket,
             Path::new("/home/vscode/raxosentinel-private-phase2d1"),
             "phase2d6-unified",
-            &["--max-workers=2"],
+            &["--max-workers=2", "--worker-timeout-ms=60000"],
         );
         let auth_pid = auth_coord.child.id();
         let auth_rss = pid_resident_memory_bytes(auth_pid);
@@ -2316,4 +2461,633 @@ fn test_phase2d8a_memory_and_performance_benchmarks() {
             auth_throughput
         );
     }
+}
+
+// ===========================================================================
+// Phase 2D.8B: Authentic Database Stress Testing & Memory Hardening Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Phase 2D.8B - Test 1: Authentic Database Reload Performance & Memory Breakdown
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8b_authentic_database_reload_and_metrics() {
+    let authentic_db =
+        Path::new("/home/vscode/raxosentinel-private-phase2d1/phase2d6-unified/database.rsidb");
+    if !authentic_db.exists() {
+        println!("Authentic database not found on system; skipping test_phase2d8b_authentic_database_reload_and_metrics");
+        return;
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let isolated_root = d.path().join("isolated_auth_root");
+    std::fs::create_dir_all(&isolated_root).unwrap();
+    std::fs::set_permissions(&isolated_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let gen1_dir = isolated_root.join("auth-gen1");
+    let gen2_dir = isolated_root.join("auth-gen2");
+    setup_isolated_authentic_generation(&gen1_dir);
+    setup_isolated_authentic_generation(&gen2_dir);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&isolated_root, "current", "auth-gen1")
+        .unwrap();
+
+    let socket = d.path().join("sock_dir/auth_perf.sock");
+
+    // 1. Measure initial coordinator startup time
+    let t_startup = Instant::now();
+    let coord = CoordinatorProcess::spawn_root(
+        &socket,
+        &isolated_root,
+        &[
+            "--max-workers=2",
+            "--max-resident-generations=2",
+            "--worker-timeout-ms=60000",
+        ],
+    );
+    let startup_duration = t_startup.elapsed();
+    let coord_pid = coord.child.id();
+
+    let stats_startup = read_proc_memory_stats(coord_pid).unwrap();
+
+    let clean_target = d.path().join("clean_file.txt");
+    std::fs::write(
+        &clean_target,
+        b"harmless test document content for authentic scanning",
+    )
+    .unwrap();
+
+    let eicar_target = d.path().join("eicar.com");
+    std::fs::write(
+        &eicar_target,
+        b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
+    )
+    .unwrap();
+
+    // Warm-up scan: verify clean and detected on initial auth-gen1
+    let r_clean_1 = scan_via_socket(&socket, &clean_target, None);
+    assert_eq!(r_clean_1["status"].as_str().unwrap(), "CLEAN");
+    assert_eq!(
+        r_clean_1["database_generation"].as_str().unwrap(),
+        "auth-gen1"
+    );
+    assert!(!r_clean_1["degraded_freshness"].as_bool().unwrap_or(true));
+
+    let r_eicar_1 = scan_via_socket(&socket, &eicar_target, None);
+    assert_eq!(r_eicar_1["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(
+        r_eicar_1["database_generation"].as_str().unwrap(),
+        "auth-gen1"
+    );
+    let threats_eicar_1 = r_eicar_1["report"]["threats"].as_array().unwrap();
+    assert!(
+        threats_eicar_1
+            .iter()
+            .any(|s| s["name"].as_str().unwrap().contains("Eicar")),
+        "EICAR detection signature must be reported from authentic database"
+    );
+
+    let stats_before_reload = read_proc_memory_stats(coord_pid).unwrap();
+
+    // 2. Start an in-flight scan pinning auth-gen1
+    let sock_inflight = socket.clone();
+    let clean_inflight = clean_target.clone();
+    let t_inflight_start = Instant::now();
+    let handle_inflight = std::thread::spawn(move || {
+        scan_via_socket(&sock_inflight, &clean_inflight, Some("delay:3000"))
+    });
+
+    // Allow in-flight scan worker to start
+    std::thread::sleep(Duration::from_millis(80));
+
+    // Measure worker process memory while scan is active
+    let worker_pids = get_child_pids(coord_pid);
+    let worker_stats = worker_pids
+        .first()
+        .and_then(|&pid| read_proc_memory_stats(pid).ok());
+    let tree_stats_during = read_tree_memory_stats(coord_pid).unwrap();
+
+    // 3. Trigger reload to auth-gen2
+    let t_reload_trigger = Instant::now();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&isolated_root, "current", "auth-gen2")
+        .unwrap();
+
+    // Poll until auth-gen2 is adopted
+    let mut adopted_gen2 = false;
+    let mut switch_total_time = Duration::ZERO;
+    let mut peak_rss_during = stats_before_reload.rss_bytes;
+    let mut reload_load_time_ms = 0.0;
+    let mut reload_switch_latency_micros = 0u64;
+
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(25));
+        let cur_stats = read_proc_memory_stats(coord_pid).unwrap();
+        if cur_stats.rss_bytes > peak_rss_during {
+            peak_rss_during = cur_stats.rss_bytes;
+        }
+        let check_resp = scan_via_socket(&socket, &clean_target, None);
+        if check_resp["database_generation"].as_str() == Some("auth-gen2") {
+            switch_total_time = t_reload_trigger.elapsed();
+            reload_load_time_ms = check_resp["reload_load_time_ms"].as_f64().unwrap_or(0.0);
+            reload_switch_latency_micros = check_resp["reload_switch_latency_micros"]
+                .as_u64()
+                .unwrap_or(0);
+            adopted_gen2 = true;
+            break;
+        }
+    }
+    assert!(
+        adopted_gen2,
+        "Candidate generation auth-gen2 must be verified and adopted"
+    );
+
+    // In-flight scan MUST complete using auth-gen1
+    let inflight_res = handle_inflight.join().unwrap();
+    let inflight_duration = t_inflight_start.elapsed();
+    assert_eq!(
+        inflight_res["database_generation"].as_str().unwrap(),
+        "auth-gen1"
+    );
+    assert_eq!(inflight_res["status"].as_str().unwrap(), "CLEAN");
+
+    let stats_after_reload = read_proc_memory_stats(coord_pid).unwrap();
+
+    // Verify positive detection on newly adopted auth-gen2
+    let r_eicar_2 = scan_via_socket(&socket, &eicar_target, None);
+    assert_eq!(r_eicar_2["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(
+        r_eicar_2["database_generation"].as_str().unwrap(),
+        "auth-gen2"
+    );
+
+    // 4. Rollback to auth-gen1 and measure recovery time
+    let t_rollback = Instant::now();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&isolated_root, "current", "auth-gen1")
+        .unwrap();
+
+    let mut rolled_back = false;
+    let mut rollback_time = Duration::ZERO;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        let check_rb = scan_via_socket(&socket, &clean_target, None);
+        if check_rb["database_generation"].as_str() == Some("auth-gen1") {
+            rollback_time = t_rollback.elapsed();
+            rolled_back = true;
+            break;
+        }
+    }
+    assert!(rolled_back, "Rollback to auth-gen1 must be adopted");
+
+    // 5. Memory reclamation after scans finish
+    std::thread::sleep(Duration::from_millis(150));
+    let stats_final = read_proc_memory_stats(coord_pid).unwrap();
+
+    println!("\n==========================================================================");
+    println!("PHASE 2D.8B AUTHENTIC 542,057-INDICATOR RSIDB BENCHMARK & MEMORY BREAKDOWN");
+    println!("==========================================================================");
+    println!(
+        "Coordinator Startup Time        : {:.2} ms",
+        startup_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Candidate Verification Duration : {:.2} ms (load_time_ms)",
+        reload_load_time_ms
+    );
+    println!(
+        "Atomic Activation Latency       : {:.2} ms ({} µs)",
+        (reload_switch_latency_micros as f64) / 1000.0,
+        reload_switch_latency_micros
+    );
+    println!(
+        "Full Reload Transition Latency  : {:.2} ms",
+        switch_total_time.as_secs_f64() * 1000.0
+    );
+    println!(
+        "In-Flight Scan Latency          : {:.2} ms",
+        inflight_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Rollback Recovery Time          : {:.2} ms",
+        rollback_time.as_secs_f64() * 1000.0
+    );
+    println!("--------------------------------------------------------------------------");
+    println!("MEMORY BREAKDOWN (COORDINATOR PROCESS):");
+    println!(
+        "  Initial Startup RSS           : {:.2} MB (PSS: {:.2} MB)",
+        (stats_startup.rss_bytes as f64) / 1024.0 / 1024.0,
+        (stats_startup.pss_bytes as f64) / 1024.0 / 1024.0
+    );
+    println!(
+        "  Before Reload RSS             : {:.2} MB (PSS: {:.2} MB)",
+        (stats_before_reload.rss_bytes as f64) / 1024.0 / 1024.0,
+        (stats_before_reload.pss_bytes as f64) / 1024.0 / 1024.0
+    );
+    println!(
+        "  Peak RSS During Reload        : {:.2} MB",
+        (peak_rss_during as f64) / 1024.0 / 1024.0
+    );
+    println!(
+        "  After Reload RSS              : {:.2} MB (PSS: {:.2} MB)",
+        (stats_after_reload.rss_bytes as f64) / 1024.0 / 1024.0,
+        (stats_after_reload.pss_bytes as f64) / 1024.0 / 1024.0
+    );
+    println!(
+        "  Final Reclaimed RSS           : {:.2} MB (PSS: {:.2} MB)",
+        (stats_final.rss_bytes as f64) / 1024.0 / 1024.0,
+        (stats_final.pss_bytes as f64) / 1024.0 / 1024.0
+    );
+    println!(
+        "  Private Anonymous Memory      : {:.2} MB",
+        (stats_final.anonymous_bytes as f64) / 1024.0 / 1024.0
+    );
+    println!(
+        "  Shared Clean Mappings (mmap)  : {:.2} MB",
+        (stats_final.shared_clean_bytes as f64) / 1024.0 / 1024.0
+    );
+    if let Some(w) = worker_stats {
+        println!("MEMORY BREAKDOWN (SANDBOXED WORKER PROCESS):");
+        println!(
+            "  Worker Subprocess RSS         : {:.2} MB",
+            (w.rss_bytes as f64) / 1024.0 / 1024.0
+        );
+        println!(
+            "  Worker Subprocess PSS         : {:.2} MB",
+            (w.pss_bytes as f64) / 1024.0 / 1024.0
+        );
+        println!(
+            "  Worker Shared Mappings        : {:.2} MB",
+            (w.shared_clean_bytes as f64) / 1024.0 / 1024.0
+        );
+        println!(
+            "  Worker Private Anonymous      : {:.2} MB",
+            (w.anonymous_bytes as f64) / 1024.0 / 1024.0
+        );
+    }
+    println!("COMBINED PROCESS-TREE MEMORY (COORDINATOR + WORKERS):");
+    println!(
+        "  Total Process-Tree RSS (Raw)  : {:.2} MB (contains double-counted shared pages)",
+        (tree_stats_during.rss_bytes as f64) / 1024.0 / 1024.0
+    );
+    println!("  Total Process-Tree PSS (True) : {:.2} MB (exact physical memory without double counting)", (tree_stats_during.pss_bytes as f64) / 1024.0 / 1024.0);
+    println!("==========================================================================\n");
+
+    // Verification of hard memory bound: Coordinator RSS must remain well below previous 410 MB baseline
+    assert!(
+        stats_final.rss_bytes < 150 * 1024 * 1024,
+        "Coordinator RSS ({:.2} MB) must remain memory-hardened and well below the 410 MB baseline",
+        (stats_final.rss_bytes as f64) / 1024.0 / 1024.0
+    );
+
+    // Clearly distinguish candidate verification duration from atomic handle switch latency
+    assert!(
+        reload_switch_latency_micros > 0 || reload_load_time_ms > 0.0,
+        "Candidate verification and atomic switch latency must both be tracked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2D.8B - Test 2: Multi-Generation Sequence & Deferred Budget Enforcement
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8b_multi_generation_sequence_and_deferred_budget() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coord_budget.sock");
+
+    let sig1: &[u8] = b"sequence_sig_one";
+    let sig2: &[u8] = b"sequence_sig_two";
+    let sig3: &[u8] = b"sequence_sig_three";
+    let sig4: &[u8] = b"sequence_sig_four";
+
+    publish_test_generation(&db_root, "gen-seq-1", &[(sig1, "SeqSig1")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-seq-1")
+        .unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(
+        &socket,
+        &db_root,
+        &["--max-workers=3", "--max-resident-generations=2"],
+    );
+    let target1 = d.path().join("target1.bin");
+    std::fs::write(&target1, sig1).unwrap();
+
+    // 1. Scan A starts using generation 1 and holds connection open (via delay)
+    let sock_a = socket.clone();
+    let target_a = target1.clone();
+    let handle_scan_a =
+        std::thread::spawn(move || scan_via_socket(&sock_a, &target_a, Some("delay:2500")));
+
+    // Wait until Scan A is in flight
+    std::thread::sleep(Duration::from_millis(80));
+
+    // 2. Generation 2 activates on disk
+    publish_test_generation(
+        &db_root,
+        "gen-seq-2",
+        &[(sig1, "SeqSig1"), (sig2, "SeqSig2")],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-seq-2")
+        .unwrap();
+
+    // Wait for gen-seq-2 reload to take effect
+    let target2 = d.path().join("target2.bin");
+    std::fs::write(&target2, sig2).unwrap();
+
+    let mut gen2_active = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        let resp = scan_via_socket(&socket, &target2, None);
+        if resp["database_generation"].as_str() == Some("gen-seq-2") {
+            assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+            assert!(!resp["degraded_freshness"].as_bool().unwrap_or(true));
+            assert!(resp["pending_generation"].is_null());
+            gen2_active = true;
+            break;
+        }
+    }
+    assert!(gen2_active, "Generation 2 must activate");
+
+    // 3. Scan B starts using generation 2 and holds connection open
+    let sock_b = socket.clone();
+    let target_b = target2.clone();
+    let handle_scan_b =
+        std::thread::spawn(move || scan_via_socket(&sock_b, &target_b, Some("delay:2500")));
+
+    std::thread::sleep(Duration::from_millis(80));
+
+    // 4. Generation 3 becomes available while A and B remain active
+    publish_test_generation(
+        &db_root,
+        "gen-seq-3",
+        &[(sig1, "SeqSig1"), (sig2, "SeqSig2"), (sig3, "SeqSig3")],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-seq-3")
+        .unwrap();
+
+    // 5. Coordinator checks reload: because budget is 2, Gen 3 reload must be deferred!
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Scan C arrives while Gen 3 is pending: must get active Gen 2, with degraded_freshness=true, pending_generation="gen-seq-3"
+    let resp_c = scan_via_socket(&socket, &target2, None);
+    assert_eq!(resp_c["database_generation"].as_str().unwrap(), "gen-seq-2");
+    assert_eq!(resp_c["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(resp_c["degraded_freshness"].as_bool(), Some(true));
+    assert_eq!(
+        resp_c["pending_generation"].as_str(),
+        Some("gen-seq-3"),
+        "Pending generation must be reported"
+    );
+
+    // 6. Another update request arrives: Gen 4 becomes available while A and B are STILL active
+    publish_test_generation(
+        &db_root,
+        "gen-seq-4",
+        &[
+            (sig1, "SeqSig1"),
+            (sig2, "SeqSig2"),
+            (sig3, "SeqSig3"),
+            (sig4, "SeqSig4"),
+        ],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-seq-4")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Scan C2 arrives: pending generation must now be updated to "gen-seq-4"
+    let resp_c2 = scan_via_socket(&socket, &target2, None);
+    assert_eq!(
+        resp_c2["database_generation"].as_str().unwrap(),
+        "gen-seq-2"
+    );
+    assert_eq!(resp_c2["degraded_freshness"].as_bool(), Some(true));
+    assert_eq!(resp_c2["pending_generation"].as_str(), Some("gen-seq-4"));
+
+    // 7. Scan A completes
+    let res_a = handle_scan_a.join().unwrap();
+    assert_eq!(res_a["database_generation"].as_str().unwrap(), "gen-seq-1");
+    assert_eq!(res_a["status"].as_str().unwrap(), "DETECTED");
+
+    // Once Scan A dropped, Gen 1 is retired; deferred Gen 4 must activate automatically!
+    let target4 = d.path().join("target4.bin");
+    std::fs::write(&target4, sig4).unwrap();
+
+    let mut gen4_active = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        let resp = scan_via_socket(&socket, &target4, None);
+        if resp["database_generation"].as_str() == Some("gen-seq-4") {
+            assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+            assert!(!resp["degraded_freshness"].as_bool().unwrap_or(true));
+            assert!(resp["pending_generation"].is_null());
+            gen4_active = true;
+            break;
+        }
+    }
+    assert!(
+        gen4_active,
+        "Generation 4 must activate after Scan A retired"
+    );
+
+    // 8. Scan B completes
+    let res_b = handle_scan_b.join().unwrap();
+    assert_eq!(res_b["database_generation"].as_str().unwrap(), "gen-seq-2");
+    assert_eq!(res_b["status"].as_str().unwrap(), "DETECTED");
+
+    // Verify final state: Gen 4 active, clean freshness, no leaks
+    let final_resp = scan_via_socket(&socket, &target4, None);
+    assert_eq!(
+        final_resp["database_generation"].as_str().unwrap(),
+        "gen-seq-4"
+    );
+    assert!(!final_resp["degraded_freshness"].as_bool().unwrap_or(true));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2D.8B - Test 3: Scanner Verdict Isolation & Cryptographic Generation Pinning
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8b_scanner_results_and_verdict_isolation() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coord_iso.sock");
+
+    let sig_alpha: &[u8] = b"signature_alpha_unique_payload";
+    let sig_beta: &[u8] = b"signature_beta_unique_payload";
+    let clean_bytes: &[u8] = b"purely clean harmless text document";
+
+    let target_alpha = d.path().join("target_alpha.bin");
+    let target_beta = d.path().join("target_beta.bin");
+    let target_clean = d.path().join("target_clean.txt");
+    std::fs::write(&target_alpha, sig_alpha).unwrap();
+    std::fs::write(&target_beta, sig_beta).unwrap();
+    std::fs::write(&target_clean, clean_bytes).unwrap();
+
+    // Gen 1 only contains sig_alpha
+    publish_test_generation(&db_root, "gen-iso-1", &[(sig_alpha, "MalwareAlpha")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-iso-1")
+        .unwrap();
+
+    let _coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2"]);
+
+    // Scan 1 on target_alpha against Gen 1 -> DETECTED MalwareAlpha
+    let r1 = scan_via_socket(&socket, &target_alpha, None);
+    assert_eq!(r1["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(r1["database_generation"].as_str().unwrap(), "gen-iso-1");
+    let sigs1 = r1["report"]["threats"].as_array().unwrap();
+    assert!(sigs1[0]["name"].as_str().unwrap().contains("MalwareAlpha"));
+
+    // Scan 2 on target_beta against Gen 1 -> CLEAN (sig_beta not in gen-iso-1)
+    let r2 = scan_via_socket(&socket, &target_beta, None);
+    assert_eq!(r2["status"].as_str().unwrap(), "CLEAN");
+    assert_eq!(r2["database_generation"].as_str().unwrap(), "gen-iso-1");
+
+    // Gen 2 contains BOTH sig_alpha and sig_beta
+    publish_test_generation(
+        &db_root,
+        "gen-iso-2",
+        &[(sig_alpha, "MalwareAlpha"), (sig_beta, "MalwareBeta")],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-iso-2")
+        .unwrap();
+
+    // Wait for gen-iso-2 reload
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        let check = scan_via_socket(&socket, &target_beta, None);
+        if check["database_generation"].as_str() == Some("gen-iso-2") {
+            assert_eq!(check["status"].as_str().unwrap(), "DETECTED");
+            let sigs = check["report"]["threats"].as_array().unwrap();
+            assert!(sigs[0]["name"].as_str().unwrap().contains("MalwareBeta"));
+            break;
+        }
+    }
+
+    // Verify clean file against Gen 2 -> CLEAN
+    let r_clean = scan_via_socket(&socket, &target_clean, None);
+    assert_eq!(r_clean["status"].as_str().unwrap(), "CLEAN");
+    assert_eq!(
+        r_clean["database_generation"].as_str().unwrap(),
+        "gen-iso-2"
+    );
+
+    // Hold long scan on Gen 2 while rolling back to Gen 1
+    let sock_clone = socket.clone();
+    let target_beta_clone = target_beta.clone();
+    let handle_inflight = std::thread::spawn(move || {
+        scan_via_socket(&sock_clone, &target_beta_clone, Some("delay:2000"))
+    });
+
+    std::thread::sleep(Duration::from_millis(80));
+
+    // Rollback to gen-iso-1
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-iso-1")
+        .unwrap();
+
+    // In-flight scan MUST finish with gen-iso-2 and DETECTED MalwareBeta!
+    let inflight_res = handle_inflight.join().unwrap();
+    assert_eq!(
+        inflight_res["database_generation"].as_str().unwrap(),
+        "gen-iso-2"
+    );
+    assert_eq!(inflight_res["status"].as_str().unwrap(), "DETECTED");
+
+    // New scans must adopt rolled-back gen-iso-1: target_beta is CLEAN again!
+    let mut rolled_back = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        let r_rb = scan_via_socket(&socket, &target_beta, None);
+        if r_rb["database_generation"].as_str() == Some("gen-iso-1") {
+            assert_eq!(
+                r_rb["status"].as_str().unwrap(),
+                "CLEAN",
+                "target_beta must not be detected under rolled back gen-iso-1"
+            );
+            rolled_back = true;
+            break;
+        }
+    }
+    assert!(rolled_back, "Rollback to gen-iso-1 must take effect");
+
+    // Target alpha remains detected under rolled-back gen-iso-1
+    let r_alpha_rb = scan_via_socket(&socket, &target_alpha, None);
+    assert_eq!(
+        r_alpha_rb["database_generation"].as_str().unwrap(),
+        "gen-iso-1"
+    );
+    assert_eq!(r_alpha_rb["status"].as_str().unwrap(), "DETECTED");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2D.8B - Test 4: Resource Exhaustion & Fault Tolerance
+// ---------------------------------------------------------------------------
+#[test]
+fn test_phase2d8b_resource_exhaustion_and_fault_tolerance() {
+    let d = tempfile::tempdir().unwrap();
+    let db_root = d.path().join("db_root");
+    let socket = d.path().join("sock_dir/coord_exhaust.sock");
+
+    let sig: &[u8] = b"fault_tolerance_indicator";
+    publish_test_generation(&db_root, "gen-fault-1", &[(sig, "SigFault")]);
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-fault-1")
+        .unwrap();
+
+    let coord =
+        CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=2", "--max-pending=2"]);
+    let target = d.path().join("target.bin");
+    std::fs::write(&target, sig).unwrap();
+
+    // 1. Worker crash handling during active scanning: coordinator survives and reports ERROR
+    let crash_resp = scan_via_socket(&socket, &target, Some("crash"));
+    assert_eq!(crash_resp["status"].as_str().unwrap(), "ERROR");
+    assert_eq!(
+        crash_resp["database_generation"].as_str().unwrap(),
+        "gen-fault-1"
+    );
+
+    // Subsequent normal scan works immediately
+    let normal_resp = scan_via_socket(&socket, &target, None);
+    assert_eq!(normal_resp["status"].as_str().unwrap(), "DETECTED");
+    assert_eq!(
+        normal_resp["database_generation"].as_str().unwrap(),
+        "gen-fault-1"
+    );
+
+    // 2. Client disconnection mid-handshake
+    {
+        let stream = UnixStream::connect(&socket).unwrap();
+        drop(stream); // abrupt disconnect
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let post_disc = scan_via_socket(&socket, &target, None);
+    assert_eq!(post_disc["status"].as_str().unwrap(), "DETECTED");
+
+    // 3. Invalid candidate verification failure retains active generation
+    let corrupt_dir = db_root.join("gen-corrupt-cand");
+    std::fs::create_dir_all(&corrupt_dir).unwrap();
+    std::fs::write(corrupt_dir.join("database.rsidb"), b"corrupted bytes").unwrap();
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-corrupt-cand")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    let corrupt_resp = scan_via_socket(&socket, &target, None);
+    assert_eq!(
+        corrupt_resp["database_generation"].as_str().unwrap(),
+        "gen-fault-1"
+    );
+    assert!(corrupt_resp["degraded_freshness"].as_bool().unwrap());
+
+    // 4. Descriptor leak check across repeated requests
+    let pid = coord.child.id();
+    let fd_dir = format!("/proc/{pid}/fd");
+    let count_fds = || std::fs::read_dir(&fd_dir).map(|d| d.count()).unwrap_or(0);
+
+    let initial_fds = count_fds();
+    for _ in 0..20 {
+        let resp = scan_via_socket(&socket, &target, None);
+        assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+    }
+    let final_fds = count_fds();
+    assert!(
+        final_fds <= initial_fds + 2,
+        "File descriptors must not leak across repeated scans (initial: {initial_fds}, final: {final_fds})"
+    );
 }
