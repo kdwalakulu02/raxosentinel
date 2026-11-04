@@ -19,32 +19,13 @@
 use super::error::DatabaseError;
 use super::format::{HashAlgorithm, RsidbHeader};
 use super::traits::RsidbIndex;
-use memmap2::Mmap;
-use std::fs::File;
 use std::path::Path;
 
-enum Storage {
-    Mmap(Mmap),
-    Buffer(Vec<u8>),
-}
-
-impl Storage {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Mmap(m) => m,
-            Self::Buffer(b) => b,
-        }
-    }
-}
-
-/// Memory-mapped sorted binary index for RSIDB.
-///
-/// Maps the database file directly into memory and performs O(log N) binary searches
-/// over flat, contiguous record slices. Minimizes heap memory usage and delivers near-instant
-/// startup times with zero deserialization overhead.
+/// Validated sorted index backed by owned bytes. The historical type name is retained
+/// for API compatibility; file-backed mappings are not used because external writes
+/// or truncation cannot be ruled out for arbitrary input paths.
 pub struct MmapSortedIndex {
-    storage: Storage,
+    storage: Vec<u8>,
     header: RsidbHeader,
     offsets: [usize; 3],
     name_offsets: Vec<(usize, usize)>,
@@ -52,25 +33,16 @@ pub struct MmapSortedIndex {
 }
 
 impl MmapSortedIndex {
-    /// Opens and validates a memory-mapped RSIDB index from a file path.
+    /// Reads and validates an owned sorted index from a file.
     pub fn from_file(path: &Path) -> Result<Self, DatabaseError> {
-        let file = File::open(path).map_err(|e| {
-            DatabaseError::Io(format!("Failed to open database {}: {}", path.display(), e))
+        let bytes = std::fs::read(path).map_err(|e| {
+            DatabaseError::Io(format!("Failed to read database {}: {}", path.display(), e))
         })?;
-        let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| {
-                DatabaseError::Io(format!("Failed to mmap database {}: {}", path.display(), e))
-            })?
-        };
-        Self::from_storage(Storage::Mmap(mmap))
+        Self::from_bytes(bytes)
     }
 
-    /// Loads and validates a sorted index from an in-memory byte buffer.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, DatabaseError> {
-        Self::from_storage(Storage::Buffer(bytes))
-    }
-
-    fn from_storage(storage: Storage) -> Result<Self, DatabaseError> {
+    /// Loads and validates an index from an owned byte buffer.
+    pub fn from_bytes(storage: Vec<u8>) -> Result<Self, DatabaseError> {
         let layout = super::layout::validate(storage.as_slice())?;
         Ok(Self {
             storage,

@@ -1,0 +1,42 @@
+# Private MalwareBazaar generations (Linux)
+
+The private workflow requires a Linux kernel with `openat2` and `renameat2(RENAME_NOREPLACE)`, a mounted `/proc`, and a filesystem that supports directory fsync and atomic same-filesystem directory rename. Failures are reported; no weaker fallback is used. Use an owner-controlled storage root outside the checkout, mode 0700. All generation directories are 0700, files 0600. The root must be an absolute path with no symlink components or `..`. The owning account and root are trusted; this does not protect against their compromise or coordinated replacement of both evidence and database. A local digest is not an upstream signature and does not prove malware classification or redistribution rights.
+
+Create the root securely before use, for example `install -d -m 700 /home/USER/raxosentinel-private` in a trusted parent. Acquire metadata only with `cargo run --release -p raxosentinel-cli --bin malwarebazaar_import -- /home/USER/raxosentinel-private GENERATION`. This requires `RAXO_ABUSECH_AUTH_KEY`. Each generation name consists of letters, digits, `_` or `-`, and cannot overwrite an existing one. The importer writes and synchronizes both files in a staging directory, synchronizes that directory, publishes it with a no-replace directory rename, and synchronizes the root. A root-sync error after rename means publication may be visible but durability is uncertain; inspect it rather than overwrite it.
+
+Scan with `cargo run --release -p raxosentinel-cli --bin raxosentinel -- scan FILE --private-db-root /home/USER/raxosentinel-private --private-generation GENERATION`. The scan rejects missing, invalid or mismatched evidence and does not fall back. Each load validates the database and evidence before handing the same owned buffer to the scanner. The scanner is a one-shot process and has no private-generation hot reload. An already returned index remains usable if a later load fails. Private generations are never updated in place by this workflow.
+
+`--db` and `--db-store` are explicitly legacy/test release workflows; they warn that acquisition evidence is unverified. The historical `Mmap*Index` constructors now read into owned memory because arbitrary paths cannot guarantee immutable backing files; use the private workflow for acquired intelligence. Legacy format parsing remains supported, but it does not confer verified acquisition.
+
+The scanner reports `.staging-*` leftovers, which are never loaded as generations or automatically removed. A crash can leave an ambiguous staging directory; investigate its owner, contents and active processes before manually removing it. Do not delete unknown files. The importer cleans up the staging files it created on ordinary pre-publication failures. Synthetic fixtures in tests are not genuine intelligence. Never publish raw responses or private databases.
+
+For repeated warm-cache measurements of a generation: `cargo run --release -p raxosentinel-cli --bin private_generation_benchmark -- /home/USER/raxosentinel-private GENERATION 21`. To migrate a preserved Phase 2D.1 pair, pass its database path as the optional final argument; the tool verifies the old pair and uses the original evidence and acquisition timestamp. Migration reads a trusted owner-controlled source, and keeps the original pair. It does not authenticate the source beyond the original local integrity linkage.
+
+Read-only source inspection of legacy, multi-source, and history generations is available with:
+
+```
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db sources --root /home/USER/raxosentinel-private --generation GENERATION
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db indicator --root /home/USER/raxosentinel-private --generation GENERATION SHA256_HEX
+```
+
+Both commands validate the database and evidence before returning source information. Supported source identities come from fixed adapters; provenance status means local consistency only and is not a provider signature. Missing or corrupt evidence is an error.
+
+
+The multi-source core stores a versioned registry and source associations next to the scanner database; strict loading re-derives them from each source's evidence. Conflicting sizes quarantine the hash from scanning. Published generations are immutable. To migrate a verified single-source generation or merge generations whose source IDs do not overlap:
+
+```
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db merge-private --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db remove-private-source --root /home/USER/raxosentinel-private --input GENERATION --output NEW_GENERATION --source malwarebazaar
+```
+
+The production adapter currently supports MalwareBazaar only. Synthetic adapters are compiled only into unit tests and are labelled synthetic; no other provider is authenticated or supported. Merging v1 and v2 generations combines distinct acquisitions for each source and deduplicates the same acquisition ID. The Rust `private_store::multi::history::inspect` API validates and returns acquisition history and associations. Local evidence consistency is not a provider signature.
+
+
+For a limited recent-results source, refresh is additive: absence from the newer response does not withdraw a prior observation. Both original responses remain in the new generation, with acquisition IDs, timestamps, digests and per-acquisition statistics. Conflicting sizes are quarantined. The input and replacement generations are never mutated.
+
+```
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db refresh-private-source --root /home/USER/raxosentinel-private --input OLD --replacement NEW_ACQUISITION --output REFRESHED --source malwarebazaar
+cargo run --release -p raxosentinel-cli --bin raxosentinel -- db compare-private --root /home/USER/raxosentinel-private --before OLD --after REFRESHED
+```
+
+Acquisition timestamps and local evidence digests are not provider-issued attestations. History generations support verified inspection, refresh, removal and merging. New acquisition publications include a random 128-bit event nonce, so identical responses in the same second can be distinguished; legacy acquisitions without a nonce retain their prior IDs and cannot be retroactively distinguished. Do not interpret a recent 100-record response as an authoritative full snapshot.

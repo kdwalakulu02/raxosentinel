@@ -24,8 +24,10 @@ pub mod in_memory;
 pub mod ingest;
 pub mod layout;
 pub mod lifecycle;
+pub mod malwarebazaar;
 pub mod mmap_compact_dir;
 pub mod mmap_sorted;
+pub mod public_release;
 pub mod traits;
 
 #[cfg(test)]

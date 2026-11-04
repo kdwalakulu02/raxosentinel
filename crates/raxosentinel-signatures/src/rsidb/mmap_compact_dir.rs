@@ -19,32 +19,13 @@
 use super::error::DatabaseError;
 use super::format::{HashAlgorithm, RsidbHeader};
 use super::traits::RsidbIndex;
-use memmap2::Mmap;
-use std::fs::File;
 use std::path::Path;
 
-enum Storage {
-    Mmap(Mmap),
-    Buffer(Vec<u8>),
-}
-
-impl Storage {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Mmap(m) => m,
-            Self::Buffer(b) => b,
-        }
-    }
-}
-
-/// Optimized memory-mapped index utilizing a compact two-level prefix directory.
-///
-/// Combines the zero-copy and low-memory benefits of memory mapping with O(1) prefix table
-/// dispatch. A 16-bit prefix directory (65,536 buckets) narrows the search range to typically
-/// 1-3 candidate records, eliminating logarithmic binary search hops across disk pages.
+/// Validated sorted index backed by owned bytes. The historical type name is retained
+/// for API compatibility; file-backed mappings are not used because external writes
+/// or truncation cannot be ruled out for arbitrary input paths.
 pub struct MmapCompactDirIndex {
-    storage: Storage,
+    storage: Vec<u8>,
     header: RsidbHeader,
     record_offsets: [usize; 3],
     dir_offsets: [Option<usize>; 3],
@@ -53,25 +34,16 @@ pub struct MmapCompactDirIndex {
 }
 
 impl MmapCompactDirIndex {
-    /// Opens and validates a compact-directory memory-mapped index from a file path.
+    /// Reads and validates an owned compact-directory index from a file.
     pub fn from_file(path: &Path) -> Result<Self, DatabaseError> {
-        let file = File::open(path).map_err(|e| {
-            DatabaseError::Io(format!("Failed to open database {}: {}", path.display(), e))
+        let bytes = std::fs::read(path).map_err(|e| {
+            DatabaseError::Io(format!("Failed to read database {}: {}", path.display(), e))
         })?;
-        let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| {
-                DatabaseError::Io(format!("Failed to mmap database {}: {}", path.display(), e))
-            })?
-        };
-        Self::from_storage(Storage::Mmap(mmap))
+        Self::from_bytes(bytes)
     }
 
-    /// Loads and validates a compact-directory index from an in-memory byte buffer.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, DatabaseError> {
-        Self::from_storage(Storage::Buffer(bytes))
-    }
-
-    fn from_storage(storage: Storage) -> Result<Self, DatabaseError> {
+    /// Loads and validates an index from an owned byte buffer.
+    pub fn from_bytes(storage: Vec<u8>) -> Result<Self, DatabaseError> {
         let layout = super::layout::validate(storage.as_slice())?;
         Ok(Self {
             storage,

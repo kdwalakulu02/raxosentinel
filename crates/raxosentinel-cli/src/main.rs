@@ -65,6 +65,68 @@ enum Commands {
 enum DbCommand {
     /// Fully validate an RSIDB file and print its statistics
     Verify { path: PathBuf },
+    /// Initialize trusted local sequence state for the public release prototype.
+    InitPublicState {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Merge verified private generations into a new generation.
+    MergePrivate {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, required = true)]
+        input: Vec<String>,
+        #[arg(long)]
+        output: String,
+    },
+    /// Publish a new private generation without a selected source.
+    RemovePrivateSource {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        source: String,
+    },
+    /// Refresh one source using another verified private generation.
+    RefreshPrivateSource {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        replacement: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        source: String,
+    },
+    /// Compare two verified private generations.
+    ComparePrivate {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        before: String,
+        #[arg(long)]
+        after: String,
+    },
+    /// List the evidence-validated source for a private generation.
+    Sources {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        generation: String,
+    },
+    /// Inspect a SHA-256 claim in a private generation.
+    Indicator {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        generation: String,
+        sha256: String,
+    },
     /// Generate an offline Ed25519 keypair for release signing
     Keygen {
         #[arg(long)]
@@ -101,7 +163,7 @@ enum DbCommand {
         /// Explicitly authorized source identifier (repeatable; authorizes ingestion)
         #[arg(long = "allow-source")]
         allowed_sources: Vec<String>,
-        /// Explicitly certified genuine intelligence provider (repeatable; certifies authenticity)
+        /// Legacy source assertion (does not establish authenticity)
         #[arg(long = "verify-genuine-source")]
         verified_genuine_sources: Vec<String>,
         /// Permit all sources (development testing mode only)
@@ -169,9 +231,30 @@ struct ScanArgs {
     #[arg(long)]
     memory: bool,
 
-    /// RSIDB database file (validated before scanning). Env: RAXOSENTINEL_DB
-    #[arg(long, env = "RAXOSENTINEL_DB", conflicts_with = "db_store")]
+    /// Explicit unverified legacy/test RSIDB file. Env: RAXOSENTINEL_DB
+    #[arg(long, env = "RAXOSENTINEL_DB", conflicts_with_all = ["db_store", "private_db_root"]) ]
     db: Option<PathBuf>,
+
+    /// Owner-controlled signed public-release prototype directory.
+    #[arg(long, requires_all = ["public_key", "public_approval_key", "public_state"], conflicts_with_all = ["db", "db_store", "private_db_root"])]
+    public_release: Option<PathBuf>,
+    /// Explicitly trusted Ed25519 public key for public-release verification.
+    #[arg(long, requires = "public_release")]
+    public_key: Option<PathBuf>,
+    /// Independently trusted reviewer's Ed25519 public key.
+    #[arg(long, requires = "public_release")]
+    public_approval_key: Option<PathBuf>,
+    /// Owner-controlled trusted rollback state directory.
+    #[arg(long, requires = "public_release")]
+    public_state: Option<PathBuf>,
+
+    /// Owner-controlled private storage root (requires --private-generation).
+    #[arg(long, requires = "private_generation", conflicts_with_all = ["db", "db_store"])]
+    private_db_root: Option<PathBuf>,
+
+    /// Immutable private generation to verify before scanning.
+    #[arg(long, requires = "private_db_root")]
+    private_generation: Option<String>,
 
     /// RSIDB store directory managed by `db install` (uses current, falls back to previous)
     #[arg(long, env = "RAXOSENTINEL_DB_STORE")]
@@ -207,7 +290,7 @@ fn run_scan(args: ScanArgs) -> i32 {
         limits.max_file_size = max_sz;
     }
     if let Some(to) = args.timeout {
-        limits.max_scan_duration_ms = to * 1000;
+        limits.max_scan_duration_ms = to.saturating_mul(1000);
     }
     if let Some(depth) = args.max_depth {
         limits.max_email_depth = depth;
@@ -226,7 +309,62 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     // A configured database that fails validation is a hard error: never scan "without" it.
-    if let Some(ref p) = args.db {
+    if let Some(ref release) = args.public_release {
+        let key_path = args.public_key.as_ref().expect("clap requires public key");
+        let reviewer_path = args
+            .public_approval_key
+            .as_ref()
+            .expect("clap requires approval key");
+        let state = args
+            .public_state
+            .as_ref()
+            .expect("clap requires public state");
+        match crypto::load_verifying_key_from_file(key_path)
+            .map_err(|e| e.to_string())
+            .and_then(|key| {
+                raxosentinel_signatures::rsidb::public_release::local::load(
+                    release,
+                    state,
+                    key,
+                    crypto::load_verifying_key_from_file(reviewer_path)
+                        .map_err(|e| e.to_string())?,
+                    env!("CARGO_PKG_VERSION"),
+                )
+            }) {
+            Ok(index) => db.attach_rsidb(Arc::new(index)),
+            Err(e) => {
+                eprintln!("Error: signed public release rejected: {e}");
+                return 3;
+            }
+        }
+    } else if let Some(ref root) = args.private_db_root {
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::incomplete(root) {
+            Ok(entries) if !entries.is_empty() => eprintln!(
+                "Warning: incomplete private staging entries require inspection: {}",
+                entries.join(", ")
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error: private database recovery inspection failed: {e}");
+                return 3;
+            }
+        }
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(
+            root,
+            args.private_generation
+                .as_deref()
+                .expect("clap requires generation"),
+        ) {
+            Ok(index) => db.attach_rsidb(Arc::new(index)),
+            Err(e) => {
+                eprintln!("Error: private database rejected: {e}");
+                return 3;
+            }
+        }
+    } else if let Some(ref p) = args.db {
+        eprintln!(
+            "Warning: loading legacy/test database without acquisition evidence verification"
+        );
         match MmapCompactDirIndex::from_file(p) {
             Ok(index) => db.attach_rsidb(Arc::new(index)),
             Err(e) => {
@@ -235,6 +373,7 @@ fn run_scan(args: ScanArgs) -> i32 {
             }
         }
     } else if let Some(ref store) = args.db_store {
+        eprintln!("Warning: legacy release store does not verify private acquisition evidence");
         match DbStore::new(store).open_active() {
             Ok(active) => {
                 if active.fell_back {
@@ -457,19 +596,40 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
         )
     };
 
-    let max = tracker.limits().max_file_size;
-    let mut data = Vec::with_capacity(metadata.len().min(max) as usize);
-    let read_res =
-        File::open(path).and_then(|f| f.take(max.saturating_add(1)).read_to_end(&mut data));
-    if let Err(e) = read_res {
-        return fail(
-            tracker,
-            metadata.len(),
-            format!("Failed to read file: {}", e),
-        );
-    }
-    if let Err(e) = tracker.record_bytes_read(data.len()) {
-        return fail(tracker, data.len() as u64, e.to_string());
+    let mut data = Vec::new();
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => return fail(tracker, metadata.len(), format!("Failed to open file: {e}")),
+    };
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if let Err(e) = tracker.check_timeout() {
+            return fail(tracker, data.len() as u64, e.to_string());
+        }
+        let n = match file.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                return fail(
+                    tracker,
+                    data.len() as u64,
+                    format!("Failed to read file: {e}"),
+                )
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if let Err(e) = tracker.record_bytes_read(n) {
+            return fail(tracker, data.len() as u64 + n as u64, e.to_string());
+        }
+        if data.try_reserve(n).is_err() {
+            return fail(
+                tracker,
+                data.len() as u64,
+                "Cannot allocate scan buffer".into(),
+            );
+        }
+        data.extend_from_slice(&chunk[..n]);
     }
 
     let scanner = EmailScanner::new(db);
@@ -485,6 +645,111 @@ fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker)
 
 fn run_db(cmd: DbCommand) -> i32 {
     match cmd {
+        DbCommand::InitPublicState { root } => match raxosentinel_signatures::rsidb::public_release::local::initialize(&root) {
+            Ok(()) => { println!("Public release prototype state initialized"); 0 },
+            Err(e) => { eprintln!("Error: cannot initialize public release state: {e}"); 3 }
+        },
+        DbCommand::MergePrivate {
+            root,
+            input,
+            output,
+        } => {
+            let inputs: Vec<_> = input.iter().map(String::as_str).collect();
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::merge(
+                &root, &inputs, &output,
+            ) {
+                Ok(()) => {
+                    println!("Private generation published");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private merge failed: {e}");
+                    3
+                }
+            }
+        }
+        DbCommand::RemovePrivateSource {
+            root,
+            input,
+            output,
+            source,
+        } => {
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::remove_source(
+                &root, &input, &output, &source,
+            ) {
+                Ok(()) => {
+                    println!("Private generation published");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private source removal failed: {e}");
+                    3
+                }
+            }
+        }
+        DbCommand::RefreshPrivateSource { root, input, replacement, output, source } => {
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::refresh_source(&root, &input, &replacement, &output, &source) {
+                Ok(()) => { println!("Private generation published"); 0 },
+                Err(e) => { eprintln!("Error: private source refresh failed: {e}"); 3 }
+            }
+        }
+        DbCommand::ComparePrivate { root, before, after } => match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::history::compare(&root, &before, &after) {
+            Ok(report) => { println!("{}", serde_json::to_string_pretty(&report).expect("comparison serialization")); 0 },
+            Err(e) => { eprintln!("Error: private generation comparison failed: {e}"); 3 }
+        },
+        DbCommand::Sources { root, generation } => {
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::history::inspect(
+                &root,
+                &generation,
+            ) {
+                Ok((registry, _)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&registry).expect("source serialization")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private database rejected: {e}");
+                    3
+                }
+            }
+        }
+        DbCommand::Indicator {
+            root,
+            generation,
+            sha256,
+        } => {
+            if sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+                eprintln!("Error: SHA-256 must be 64 hexadecimal digits");
+                return 2;
+            }
+            match raxosentinel_signatures::rsidb::malwarebazaar::private_store::multi::history::inspect(
+                &root,
+                &generation,
+            ) {
+                Ok((_, associations)) => {
+                    let found: Vec<_> = associations.indicators
+                        .into_iter()
+                        .filter(|claim| claim.sha256.eq_ignore_ascii_case(&sha256))
+                        .map(|claim| {
+                            let mut value = serde_json::to_value(&claim).expect("claim serialization");
+                            value["quarantine_reason"] = if claim.quarantined { serde_json::json!("conflicting file sizes") } else { serde_json::Value::Null };
+                            value
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&found).expect("claim serialization")
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: private database rejected: {e}");
+                    3
+                }
+            }
+        }
         DbCommand::Verify { path } => {
             let t = std::time::Instant::now();
             match MmapCompactDirIndex::from_file(&path) {
@@ -747,10 +1012,14 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
             println!("{}", report.safety_disclaimer);
         }
         ScanStatus::Infected => {
-            println!("Overall Status   : [ INFECTED ]");
+            println!("Overall Status   : [ DETECTED ]");
             println!("Summary          : {}", report.status_description);
             println!();
-            println!("Detected Threats ({}):", report.threats.len());
+            if report.threats.is_empty() {
+                println!("Detections are listed in sub-target reports.");
+            } else {
+                println!("Detected Threats ({}):", report.threats.len());
+            }
             for (idx, t) in report.threats.iter().enumerate() {
                 println!(
                     "  [{}] {} | Category: {} | Severity: {} | Type: {}",
@@ -768,14 +1037,14 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
             }
         }
         ScanStatus::Unsupported => {
-            println!("Overall Status   : [ UNSUPPORTED ]");
+            println!("Overall Status   : [ UNSCANNED ]");
             println!("Summary          : {}", report.status_description);
             if let Some(ref err) = report.error {
                 println!("Details          : {}", err);
             }
         }
         ScanStatus::Failed => {
-            println!("Overall Status   : [ FAILED ]");
+            println!("Overall Status   : [ ERROR ]");
             println!("Summary          : {}", report.status_description);
             if let Some(ref err) = report.error {
                 println!("Error Details    : {}", err);
@@ -787,29 +1056,25 @@ fn print_human_report(report: &ScanReport, memory: Option<&MemoryUsage>) {
         println!(
             "--------------------------------------------------------------------------------"
         );
-        println!(
-            "Extracted Email Attachments / Parts ({}):",
-            report.sub_targets.len()
-        );
-        for (idx, sub) in report.sub_targets.iter().enumerate() {
-            let name = sub.target.file_name.as_deref().unwrap_or("unnamed");
-            println!(
-                "  [{}] Attachment: {} ({} bytes, Type: {}) -> Status: {}",
-                idx + 1,
-                name,
-                sub.target.file_size_bytes,
-                sub.target.detected_mime,
-                sub.status
-            );
-            if !sub.threats.is_empty() {
-                for t in &sub.threats {
+        println!("Extracted sub-targets ({}):", report.sub_targets.len());
+        fn print_subtargets(subs: &[ScanReport], depth: usize) {
+            let indent = "  ".repeat(depth.min(32));
+            for sub in subs {
+                let name = sub.target.file_name.as_deref().unwrap_or("unnamed");
+                println!(
+                    "{}- {} ({} bytes, Type: {}) -> Status: {}",
+                    indent, name, sub.target.file_size_bytes, sub.target.detected_mime, sub.status
+                );
+                for threat in &sub.threats {
                     println!(
-                        "      - Threat: {} [{}] ({})",
-                        t.name, t.severity, t.category
+                        "{}  Threat: {} [{}] ({})",
+                        indent, threat.name, threat.severity, threat.category
                     );
                 }
+                print_subtargets(&sub.sub_targets, depth + 1);
             }
         }
+        print_subtargets(&report.sub_targets, 1);
     }
 
     println!("================================================================================");

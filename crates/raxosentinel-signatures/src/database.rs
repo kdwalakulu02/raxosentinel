@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
+const MAX_REPORTED_PATTERN_OFFSETS: usize = 32;
+
 /// Compiled signature matching engine containing hash tables and pattern automata.
 pub struct SignatureDatabase {
     hash_rules: HashMap<String, HashRule>,
@@ -152,6 +154,25 @@ impl SignatureDatabase {
             .map(|r| r.to_threat())
     }
 
+    fn record_pattern_match(
+        threats: &mut Vec<Threat>,
+        counts: &mut [usize],
+        index: usize,
+        rule: &PatternRule,
+        offset: usize,
+    ) {
+        let count = &mut counts[index];
+        if *count < MAX_REPORTED_PATTERN_OFFSETS {
+            threats.push(rule.to_threat(offset));
+            *count += 1;
+        } else if *count == MAX_REPORTED_PATTERN_OFFSETS {
+            let mut notice = rule.to_threat(offset);
+            notice.matched_by = "additional pattern offsets omitted".into();
+            threats.push(notice);
+            *count += 1;
+        }
+    }
+
     /// Scans an in-memory byte slice against all compiled byte-pattern rules.
     pub fn match_bytes(&self, data: &[u8]) -> Vec<Threat> {
         let mut threats = Vec::new();
@@ -160,6 +181,7 @@ impl SignatureDatabase {
             None => return threats,
         };
 
+        let mut counts = vec![0usize; self.pattern_rules.len()];
         for mat in ac.find_iter(data) {
             let rule_idx = mat.pattern().as_usize();
             let rule = &self.pattern_rules[rule_idx];
@@ -177,7 +199,7 @@ impl SignatureDatabase {
                 }
             }
 
-            threats.push(rule.to_threat(start_offset));
+            Self::record_pattern_match(&mut threats, &mut counts, rule_idx, rule, start_offset);
         }
 
         Self::deduplicate_threats(threats)
@@ -197,15 +219,21 @@ impl SignatureDatabase {
         };
 
         let chunk_size = tracker.limits().buffer_size;
+        if chunk_size == 0 || chunk_size > 16 * 1024 * 1024 {
+            return Err(ScanError::Internal("Invalid stream buffer size".into()));
+        }
         let overlap_size = self.max_pattern_len.saturating_sub(1);
 
         let mut read_buf = vec![0u8; chunk_size];
         let mut carry_buf = Vec::with_capacity(overlap_size);
         let mut stream_offset: usize = 0;
+        let mut counts = vec![0usize; self.pattern_rules.len()];
 
         loop {
+            tracker.check_timeout()?;
             let n = reader.read(&mut read_buf)?;
             if n == 0 {
+                tracker.check_timeout()?;
                 break;
             }
 
@@ -237,7 +265,13 @@ impl SignatureDatabase {
                         }
                     }
 
-                    threats.push(rule.to_threat(abs_offset));
+                    Self::record_pattern_match(
+                        &mut threats,
+                        &mut counts,
+                        rule_idx,
+                        rule,
+                        abs_offset,
+                    );
                 }
 
                 // Update carry buffer for next iteration
@@ -264,7 +298,7 @@ impl SignatureDatabase {
                     }
                 }
 
-                threats.push(rule.to_threat(abs_offset));
+                Self::record_pattern_match(&mut threats, &mut counts, rule_idx, rule, abs_offset);
             }
 
             carry_buf.clear();

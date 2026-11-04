@@ -11,3 +11,9 @@ raw referefce/
 *.private
 *.signing_key
 *.sec
+
+# Private imported intelligence and provenance evidence
+*.rsidb
+*.rsidb.evidence
+*.evidence.tmp
+**/.raxosentinel-private-*

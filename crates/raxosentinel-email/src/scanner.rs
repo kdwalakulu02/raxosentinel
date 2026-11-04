@@ -66,27 +66,28 @@ impl<'a> EmailScanner<'a> {
 
         tracker.check_file_size(metadata.len())?;
         use std::io::Read;
-        let max_sz = tracker.limits().max_file_size;
         let mut file = std::fs::File::open(path).map_err(|e| ScanError::IoWithPath {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let mut bytes = Vec::with_capacity(metadata.len().min(max_sz) as usize);
-        file.by_ref()
-            .take(max_sz.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|e| ScanError::IoWithPath {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            tracker.check_timeout()?;
+            let n = file.read(&mut chunk).map_err(|e| ScanError::IoWithPath {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-        if bytes.len() as u64 > max_sz {
-            return Err(ScanError::FileSizeLimitExceeded {
-                limit: max_sz,
-                actual: bytes.len() as u64,
-            });
+            if n == 0 {
+                break;
+            }
+            tracker.record_bytes_read(n)?;
+            bytes
+                .try_reserve(n)
+                .map_err(|_| ScanError::Internal("Cannot allocate email buffer".into()))?;
+            bytes.extend_from_slice(&chunk[..n]);
         }
 
-        tracker.record_bytes_read(bytes.len())?;
         self.scan_internal(&bytes, path.to_str(), tracker, 0)
     }
 
@@ -722,12 +723,40 @@ impl<'a> EmailScanner<'a> {
                 }
             }
 
-            // Never trust declared sizes: hard cap actual decompressed output.
-            let mut buf = Vec::with_capacity(declared.min(cap).min(1 << 20) as usize);
-            if let Err(e) = (&mut file)
-                .take(cap.saturating_add(1))
-                .read_to_end(&mut buf)
-            {
+            // Check the deadline between bounded decompression reads.
+            let remaining_budget = tracker
+                .limits()
+                .max_total_extracted_bytes
+                .saturating_sub(tracker.total_extracted_bytes());
+            let output_limit = cap.min(declared.saturating_add(remaining_budget));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            let mut extraction_error = None;
+            loop {
+                tracker.check_timeout()?;
+                let remaining = output_limit
+                    .saturating_add(1)
+                    .saturating_sub(buf.len() as u64);
+                if remaining == 0 {
+                    break;
+                }
+                let limit = remaining.min(chunk.len() as u64) as usize;
+                match file.read(&mut chunk[..limit]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf.try_reserve(n).is_err() {
+                            extraction_error = Some("allocation failed".to_string());
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) => {
+                        extraction_error = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = extraction_error {
                 raise(
                     &mut issue,
                     ScanStatus::Failed,
@@ -735,11 +764,11 @@ impl<'a> EmailScanner<'a> {
                 );
                 continue;
             }
-            if buf.len() as u64 > cap {
+            if buf.len() as u64 > output_limit {
                 raise(
                     &mut issue,
                     ScanStatus::Failed,
-                    format!("ZIP member {} exceeds size limit", label),
+                    format!("ZIP member {} exceeds extraction budget", label),
                 );
                 continue;
             }
@@ -780,7 +809,11 @@ enum ContainerKind {
 /// Content-based container classification, with fallback to declared metadata
 /// for truncated or incomplete containers that cannot be safely inspected.
 fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) -> ContainerKind {
-    if data.starts_with(b"PK\x03\x04") || data.starts_with(b"PK\x05\x06") {
+    if data.starts_with(b"PK\x03\x04")
+        || data.starts_with(b"PK\x05\x06")
+        || filename.to_ascii_lowercase().ends_with(".zip")
+        || declared_mime.is_some_and(|m| m.eq_ignore_ascii_case("application/zip"))
+    {
         ContainerKind::Zip
     } else if is_tar_header(data) || is_tar_claim(data, filename, declared_mime) {
         ContainerKind::Unsupported("TAR")

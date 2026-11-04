@@ -149,19 +149,19 @@ fn main() {
     );
 
     // Benchmark 2: Memory-Mapped Sorted Index
-    println!("\n--- Evaluating Architecture 2: Memory-Mapped Sorted Binary Index ---");
+    println!("\n--- Evaluating Architecture 2: Owned Sorted Binary Index ---");
     let metrics_mmap_sorted = benchmark_index(
-        "Memory-Mapped Sorted Binary Index",
+        "Owned Sorted Binary Index",
         size_plain,
         build_time_plain_ms,
         || MmapSortedIndex::from_file(&plain_sorted_path).unwrap(),
         &queries,
     );
 
-    // Benchmark 3: Memory-Mapped Compact Directory Index
-    println!("\n--- Evaluating Architecture 3: Memory-Mapped Compact Directory Index ---");
+    // Benchmark 3: Owned Compact Directory Index
+    println!("\n--- Evaluating Architecture 3: Owned Compact Directory Index ---");
     let metrics_compact_dir = benchmark_index(
-        "Mmap Compact Directory Index",
+        "Owned Compact Directory Index",
         size_dir,
         build_time_dir_ms,
         || MmapCompactDirIndex::from_file(&compact_dir_path).unwrap(),
@@ -268,13 +268,9 @@ fn generate_markdown_report(results: &[ArchitectureMetrics], total_records: usiz
     ));
     out.push_str("- **Query Dataset**: 20,000 pre-hashed queries (10,000 true positive hits + 10,000 size-mismatch misses)\n");
     out.push_str("- **Verification**: 100% detection accuracy verified on all implementations (0 false positives, 0 false negatives)\n");
-    out.push_str(
-        "- **Hardware**: Intel Core i5-12450H (12 vCPUs), 15.6 GiB RAM, Linux 6.17 x86_64\n",
-    );
-    out.push_str("- **Compiler**: rustc 1.99.1 (release profile: `opt-level = 3`)\n\n");
 
-    out.push_str("## 1. Rust Architecture Comparison: In-Memory vs Mmap Sorted vs Mmap Compact Directory\n\n");
-    out.push_str("| Implementation Architecture | Storage Size | Build Time | Startup / Map Time | Steady Warm RSS | RSS Delta | 20k Query Batch | Throughput (QPS) | p50 Latency | p95 Latency | p99 Latency | Detection Parity |\n");
+    out.push_str("## 1. Rust Architecture Comparison: In-Memory vs Owned Sorted vs Owned Compact Directory\n\n");
+    out.push_str("| Implementation Architecture | Storage Size | Build Time | Startup / Load Time | Steady Warm RSS | RSS Delta | 20k Query Batch | Throughput (QPS) | p50 Latency | p95 Latency | p99 Latency | Detection Parity |\n");
     out.push_str(
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n",
     );
@@ -300,31 +296,7 @@ fn generate_markdown_report(results: &[ArchitectureMetrics], total_records: usiz
         ));
     }
 
-    out.push_str(
-        "\n## 2. Comparative Analysis: Python Experiment vs Native Rust Implementations\n\n",
-    );
-    out.push_str(
-        "The Python reference experiment demonstrated a severe memory-versus-speed tradeoff:\n",
-    );
-    out.push_str("- Python `text-dict` achieved fast lookups (7.19 ms for 20k queries) but consumed **67.66 MiB RSS** and took **295 ms** to parse.\n");
-    out.push_str("- Python `mmap-index` reduced memory to **22.28 MiB RSS** and loaded in **46 ms**, but its binary searches took **175.37 ms** (~24x slower than in-memory dict).\n\n");
-    out.push_str("### How Native Rust Resolves the Tradeoff:\n\n");
-    out.push_str("1. **Zero-Copy Memory Mapping (`MmapSortedIndex`)**:\n");
-    out.push_str("   - Rust eliminates Python object overhead entirely. Startup drops from 46 ms to **< 0.1 ms**.\n");
-    out.push_str("   - Resident process memory growth is practically negligible (OS demand-pages records on access).\n");
-    out.push_str("   - Even standard binary search in Rust executes 20,000 queries in a fraction of the Python time.\n\n");
-    out.push_str("2. **Compact Prefix Directory (`MmapCompactDirIndex`)**:\n");
-    out.push_str("   - By precomputing a 16-bit prefix directory (65,536 buckets, adding only ~256 KiB to the binary file), Rust reduces the search range from 100,000 records to an average of **1.5 candidate records** per query.\n");
-    out.push_str("   - Lookups achieve **near-instant O(1) performance** directly within mapped memory, matching or exceeding in-memory hash table throughput without copying records into heap RAM!\n");
-    out.push_str("   - This delivers the best of both worlds: **< 1 ms startup**, **negligible RAM overhead**, and **million+ lookups per second**.\n\n");
-
-    out.push_str("## 3. Recommended Implementation Architecture for Phase 2\n\n");
-    out.push_str("> [!TIP]\n");
-    out.push_str("> **Recommendation: `MmapCompactDirIndex`**\n");
-    out.push_str("> For production RaxoSentinel mail pipeline integration, `MmapCompactDirIndex` is the unequivocally superior architecture:\n");
-    out.push_str("> - It avoids memory spikes on cold start or worker restarts.\n");
-    out.push_str("> - Multiple scanning worker threads share the exact same physical memory pages via OS page cache.\n");
-    out.push_str("> - Database updates can be staged and activated atomically via symlink / rename without process restarts.\n");
+    out.push_str("\nIndex constructors use owned buffers; these measurements do not describe memory mapping. Results are local to this synthetic benchmark and should not be treated as production capacity.\n");
 
     out
 }

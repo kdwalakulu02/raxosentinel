@@ -73,7 +73,7 @@ impl HashAlgorithm {
     }
 }
 
-/// 88-byte fixed little-endian header of RSIDB files.
+/// 92-byte fixed little-endian header of RSIDB files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsidbHeader {
     pub magic: [u8; 8],
