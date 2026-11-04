@@ -198,10 +198,33 @@ enum DbCommand {
         #[arg(long)]
         allow_unsigned: bool,
     },
+    /// Automated intelligence updates (check, apply, status)
+    Update {
+        /// Owner-controlled private storage root
+        #[arg(long, env = "RAXOSENTINEL_PRIVATE_ROOT")]
+        root: Option<PathBuf>,
+        /// Check whether new intelligence is available without applying
+        #[arg(long)]
+        check: bool,
+        /// Apply updates and atomically activate the new generation
+        #[arg(long)]
+        apply: bool,
+        /// Show status of configured intelligence sources and last update
+        #[arg(long)]
+        status: bool,
+        /// Force update even if sources report unchanged
+        #[arg(long)]
+        force: bool,
+        /// Path to ClamAV unpacked directory
+        #[arg(long)]
+        clamav_unpack: Option<PathBuf>,
+    },
     /// Re-activate the previous (last known-good) database
     Rollback {
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
+        #[arg(long, env = "RAXOSENTINEL_PRIVATE_ROOT")]
+        root: Option<PathBuf>,
     },
 }
 
@@ -1216,14 +1239,109 @@ fn run_db(cmd: DbCommand) -> i32 {
                 }
             }
         }
-        DbCommand::Rollback { store } => match DbStore::new(store).rollback() {
-            Ok(r) => {
-                println!("rolled back to {}", r);
+        DbCommand::Update {
+            root,
+            check,
+            apply,
+            status,
+            force,
+            clamav_unpack,
+        } => {
+            let root_path = root.unwrap_or_else(|| {
+                PathBuf::from("/home/vscode/raxosentinel-private-phase2d1")
+            });
+            let clam_path = clamav_unpack.unwrap_or_else(|| {
+                PathBuf::from("/home/vscode/clamav-unpack")
+            });
+
+            let mut engine = raxosentinel_signatures::rsidb::updater::UpdateEngine::new(&root_path)
+                .with_provider(Box::new(
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::new(&clam_path),
+                ));
+
+            let mb_fixture = root_path.join("phase2d4-refreshed-final/acq-7009a4d2894c668fe056658b41674308fdeec5a21f315897717eaf1bb4d9175e.json");
+            let mb_provider = if mb_fixture.exists() {
+                raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::with_fixture(mb_fixture)
+            } else {
+                raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::new()
+            };
+            engine = engine.with_provider(Box::new(mb_provider));
+
+            if status || (!check && !apply) {
+                let st = raxosentinel_signatures::rsidb::updater::UpdateStatus::load(&root_path);
+                print!("{}", st.format_display());
+                return 0;
+            }
+
+            if check {
+                println!("Checking configured intelligence providers for updates...");
+                match engine.check_all() {
+                    Ok(results) => {
+                        for (id, res) in results {
+                            println!("  [{}] available={}: {}", id, res.available, res.details);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Update check failed: {}", e);
+                        return 1;
+                    }
+                }
+            }
+
+            if apply {
+                println!("Applying intelligence updates (force={})...", force);
+                match engine.apply_update(force) {
+                    Ok(Some(summary)) => {
+                        println!("Update successful!");
+                        println!("  Activated generation   : {}", summary.generation);
+                        println!("  Total unique indicators: {}", summary.total_indicators);
+                        println!("  New records added      : {}", summary.new_records);
+                        println!("  Removed records        : {}", summary.removed_records);
+                        println!("  Deduplicated records   : {}", summary.deduplicated_records);
+                        println!("  Verification status    : {}", summary.verification_result);
+                        println!("  Duration               : {} ms", summary.duration_ms);
+                        0
+                    }
+                    Ok(None) => {
+                        println!("No updates available from any configured intelligence source (database unchanged).");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Update failed: {}", e);
+                        1
+                    }
+                }
+            } else {
                 0
             }
-            Err(e) => {
-                eprintln!("Rollback failed: {}", e);
-                3
+        }
+        DbCommand::Rollback { store, root } => {
+            if let Some(store_path) = store {
+                match DbStore::new(store_path).rollback() {
+                    Ok(r) => {
+                        println!("rolled back to {}", r);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Rollback failed: {}", e);
+                        3
+                    }
+                }
+            } else {
+                let root_path = root.unwrap_or_else(|| {
+                    PathBuf::from("/home/vscode/raxosentinel-private-phase2d1")
+                });
+                let engine = raxosentinel_signatures::rsidb::updater::UpdateEngine::new(&root_path);
+                match engine.rollback() {
+                    Ok(gen) => {
+                        println!("Successfully rolled back active generation to '{}'", gen);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Rollback failed: {}", e);
+                        1
+                    }
+                }
             }
         },
     }
