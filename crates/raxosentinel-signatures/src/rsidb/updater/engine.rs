@@ -343,40 +343,44 @@ impl UpdateEngine {
         let mut previous_total_count = 0usize;
 
         if let Some(ref cur_gen) = active_gen {
-            if let Ok((reg, assoc)) = unified::inspect(&self.root, cur_gen) {
-                previous_total_count = assoc.indicators.len();
-                for s in reg.sources {
-                    existing_sources.insert(s.id.clone(), s);
+            let (reg, assoc) = unified::inspect(&self.root, cur_gen).map_err(|e| {
+                UpdateError::DatabaseVerificationFailed(
+                    cur_gen.clone(),
+                    format!("Failed to load baseline active generation: {e}"),
+                )
+            })?;
+            previous_total_count = assoc.indicators.len();
+            for s in reg.sources {
+                existing_sources.insert(s.id.clone(), s);
+            }
+            for ind in assoc.indicators {
+                let alg = match ind.alg.as_str() {
+                    "md5" => HashAlgorithm::Md5,
+                    "sha1" => HashAlgorithm::Sha1,
+                    "sha256" => HashAlgorithm::Sha256,
+                    _ => continue,
+                };
+                let digest = match hex::decode(&ind.hash) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let rkey: RecordKey = (alg, digest, ind.size, ind.name.clone());
+                let mut claim_set = BTreeSet::new();
+                for c in ind.claims {
+                    claim_set.insert(c);
                 }
-                for ind in assoc.indicators {
-                    let alg = match ind.alg.as_str() {
-                        "md5" => HashAlgorithm::Md5,
-                        "sha1" => HashAlgorithm::Sha1,
-                        "sha256" => HashAlgorithm::Sha256,
-                        _ => continue,
-                    };
-                    let digest = match hex::decode(&ind.hash) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    let rkey: RecordKey = (alg, digest, ind.size, ind.name.clone());
-                    let mut claim_set = BTreeSet::new();
-                    for c in ind.claims {
-                        claim_set.insert(c);
-                    }
-                    existing_claims_by_record.insert(rkey, claim_set);
-                }
+                existing_claims_by_record.insert(rkey, claim_set);
+            }
 
-                // Preserve existing evidence files from previous generation directory
-                let cur_gen_dir = self.root.join(cur_gen);
-                if let Ok(entries) = fs::read_dir(&cur_gen_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
-                            if fname.starts_with("evidence-") || fname.starts_with("acq-") {
-                                if let Ok(bytes) = fs::read(&path) {
-                                    existing_evidence.insert(fname.to_string(), bytes);
-                                }
+            // Preserve existing evidence files from previous generation directory
+            let cur_gen_dir = self.root.join(cur_gen);
+            if let Ok(entries) = fs::read_dir(&cur_gen_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+                        if fname.starts_with("evidence-") || fname.starts_with("acq-") {
+                            if let Ok(bytes) = fs::read(&path) {
+                                existing_evidence.insert(fname.to_string(), bytes);
                             }
                         }
                     }

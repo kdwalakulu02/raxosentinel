@@ -56,8 +56,14 @@ impl ClamAvProvider {
         if daily_info.exists() {
             if let Ok(v) = fs::read_to_string(daily_info) {
                 for line in v.lines() {
-                    if line.starts_with("Version:") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("ClamAV-VDB:") {
+                        let parts: Vec<&str> = trimmed.split(':').collect();
+                        if parts.len() >= 3 && !parts[2].is_empty() {
+                            return format!("daily-{}", parts[2]);
+                        }
+                    } else if trimmed.starts_with("Version:") {
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
                         if parts.len() >= 2 {
                             return format!("daily-{}", parts[1]);
                         }

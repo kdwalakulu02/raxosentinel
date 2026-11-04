@@ -84,7 +84,144 @@ impl UpdateStatus {
             }
         }
 
+        status.bootstrap_from_generation(root);
         status
+    }
+
+    /// Attempt to bootstrap source statuses and metrics from the active generation's registry and evidence.
+    pub fn bootstrap_from_generation(&mut self, root: &Path) {
+        let active_gen = match self.current_generation.as_deref() {
+            Some(g) => g,
+            None => return,
+        };
+
+        let gen_dir = root.join(active_gen);
+        let reg_file = gen_dir.join("registry.json");
+        if !reg_file.exists() {
+            return;
+        }
+
+        let reg_bytes = match fs::read(&reg_file) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let reg_json: serde_json::Value = match serde_json::from_slice(&reg_bytes) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+
+        let sources_arr = match reg_json["sources"].as_array() {
+            Some(a) => a,
+            None => return,
+        };
+
+        for s in sources_arr {
+            let id = match s["id"].as_str() {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let name = s["name"].as_str().unwrap_or(&id).to_string();
+            let count = s["indicator_count"].as_u64().unwrap_or(0) as usize;
+            let timestamp = s["acquired_unix_seconds"].as_u64().unwrap_or(0);
+            let ev_file = s["evidence_file"].as_str().unwrap_or("");
+
+            let needs_bootstrap = match self.sources.get(&id) {
+                Some(existing) => {
+                    existing.indicator_count == 0 && existing.source_version.is_empty()
+                }
+                None => true,
+            };
+
+            if needs_bootstrap {
+                let mut version = String::new();
+                if !ev_file.is_empty() {
+                    let ev_path = gen_dir.join(ev_file);
+                    if let Ok(ev_bytes) = fs::read(&ev_path) {
+                        if let Ok(ev_json) = serde_json::from_slice::<serde_json::Value>(&ev_bytes)
+                        {
+                            if id == "clamav" {
+                                if let Some(files) = ev_json["cvd_files"].as_array() {
+                                    for f in files {
+                                        if f["file"].as_str() == Some("daily.cvd") {
+                                            if let Some(v) = f["version"].as_u64() {
+                                                version = format!("daily-{}", v);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if id == "malwarebazaar" {
+                                if let Some(acqs) = ev_json["acquisitions"].as_array() {
+                                    if let Some(last_acq) = acqs.last() {
+                                        if let Some(acq_id) = last_acq["id"].as_str() {
+                                            let acq_file =
+                                                gen_dir.join(format!("acq-{}.json", acq_id));
+                                            if let Ok(acq_bytes) = fs::read(&acq_file) {
+                                                if let Ok(acq_json) =
+                                                    serde_json::from_slice::<serde_json::Value>(
+                                                        &acq_bytes,
+                                                    )
+                                                {
+                                                    if let Some(data) =
+                                                        acq_json["data"].as_array().or_else(|| {
+                                                            acq_json["indicators"].as_array()
+                                                        })
+                                                    {
+                                                        if let Some(first) = data.first() {
+                                                            if let Some(h) = first["sha256_hash"]
+                                                                .as_str()
+                                                                .or_else(|| {
+                                                                    first["sha256"].as_str()
+                                                                })
+                                                            {
+                                                                version = h.to_string();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if version.is_empty() {
+                                                version = acq_id.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let src = self
+                    .sources
+                    .entry(id.clone())
+                    .or_insert_with(|| SourceStatus {
+                        id: id.clone(),
+                        name: name.clone(),
+                        ..Default::default()
+                    });
+                src.indicator_count = count;
+                src.last_import_timestamp = timestamp;
+                src.last_check_timestamp = timestamp;
+                src.source_version = version;
+            }
+        }
+
+        if self.last_summary.is_none() {
+            let total = reg_json["total_indicators"].as_u64().unwrap_or(0) as usize;
+            if total > 0 {
+                self.last_summary = Some(UpdateSummary {
+                    generation: active_gen.to_string(),
+                    total_indicators: total,
+                    new_records: 0,
+                    removed_records: 0,
+                    deduplicated_records: 0,
+                    rejected_records: 0,
+                    verification_result: "PASS".to_string(),
+                    duration_ms: 0,
+                });
+            }
+        }
     }
 
     /// Atomically persist status into the private store root.
