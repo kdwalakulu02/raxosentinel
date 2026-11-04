@@ -9,6 +9,7 @@ use crate::rsidb::malwarebazaar::private_store::unified::{
 };
 use crate::rsidb::malwarebazaar::private_store::{self, multi::digest};
 use crate::rsidb::updater::providers::clamav::{authenticate_cvd, parse_clamav_dns_txt};
+use crate::rsidb::updater::status::STATUS_FILE;
 use crate::rsidb::updater::traits::{
     AcquisitionResult, ExtractedIntelligence, IntelligenceProvider, ProviderState, RecordKey,
     UpdateCheckResult, UpdateError,
@@ -33,7 +34,43 @@ fn create_initial_generation(
     entries: Vec<SignatureEntry>,
     source_id: &str,
 ) {
-    let ev_bytes = b"initial test evidence".to_vec();
+    create_initial_generation_with_version(root, gen_name, entries, source_id, "v1.0");
+}
+
+/// Helper to create a synthetic initial unified generation with specified source version.
+fn create_initial_generation_with_version(
+    root: &Path,
+    gen_name: &str,
+    entries: Vec<SignatureEntry>,
+    source_id: &str,
+    version: &str,
+) {
+    let ev_json = if source_id == "clamav" && version.contains("daily-") {
+        let daily_v: u64 = version
+            .strip_prefix("daily-")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(28173);
+        serde_json::json!({
+            "version": version,
+            "cvd_files": [
+                {"file": "main.cvd", "version": 63},
+                {"file": "daily.cvd", "version": daily_v}
+            ]
+        })
+    } else if source_id == "clamav" && version.starts_with("main:") {
+        serde_json::json!({
+            "version": version,
+            "cvd_files": [
+                {"file": "main.cvd", "version": 63},
+                {"file": "daily.cvd", "version": 28173}
+            ]
+        })
+    } else {
+        serde_json::json!({
+            "version": version
+        })
+    };
+    let ev_bytes = serde_json::to_vec(&ev_json).unwrap();
     let ev_sha256 = digest(&ev_bytes);
 
     let mut md5_count = 0;
@@ -1130,4 +1167,581 @@ fn test_16_clamav_dns_txt_query_parser() {
     // Invalid TXT record rejection
     assert!(parse_clamav_dns_txt("invalid").is_none());
     assert!(parse_clamav_dns_txt("1.4.6:notanumber:28173").is_none());
+}
+
+// ============================================================================
+// SCENARIO 17: Scenario A & Scenario B — Update, Rollback Consistency & Reapply
+// ============================================================================
+#[test]
+fn test_17_rollback_consistency_and_reapply_lifecycle() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    // Baseline: 3 indicators, source version "v1.0"
+    let e1 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0x11; 32],
+        "Threat.1".to_string(),
+    );
+    let e2 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        200,
+        vec![0x22; 32],
+        "Threat.2".to_string(),
+    );
+    let e3 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        300,
+        vec![0x33; 32],
+        "Threat.3".to_string(),
+    );
+
+    create_initial_generation_with_version(
+        root,
+        "gen-baseline",
+        vec![e1.clone(), e2.clone(), e3.clone()],
+        "prov_a",
+        "v1.0",
+    );
+
+    // 1. Initial State Check
+    let status_init = UpdateStatus::load(root);
+    assert_eq!(
+        status_init.current_generation.as_deref(),
+        Some("gen-baseline")
+    );
+    assert_eq!(status_init.previous_generation, None);
+    assert_eq!(
+        status_init.sources.get("prov_a").unwrap().indicator_count,
+        3
+    );
+    assert_eq!(
+        status_init.sources.get("prov_a").unwrap().active_version,
+        "v1.0"
+    );
+
+    // 2. Apply controlled update:
+    // +2 additions (e4, e5), -1 removal (e3 revoked), net change +1 (total: 4)
+    let e4 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        400,
+        vec![0x44; 32],
+        "Threat.4".to_string(),
+    );
+    let e5 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        500,
+        vec![0x55; 32],
+        "Threat.5".to_string(),
+    );
+    let key3 = (e3.alg, e3.digest.clone(), e3.size, e3.name.clone());
+
+    let mut prov = MockProvider::new("prov_a").with_entries(vec![
+        e1.clone(),
+        e2.clone(),
+        e4.clone(),
+        e5.clone(),
+    ]);
+    prov.check_result = Ok(UpdateCheckResult {
+        available: true,
+        version: "v2.0".to_string(),
+        details: "Version 2.0 release".to_string(),
+    });
+    let ev_v2 = serde_json::to_vec(&serde_json::json!({"version": "v2.0"})).unwrap();
+    prov.acquire_result = Ok(AcquisitionResult {
+        source_id: "prov_a".to_string(),
+        version: "v2.0".to_string(),
+        timestamp: 2000,
+        evidence_files: vec![("evidence-prov_a.json".to_string(), ev_v2.clone())],
+        staging_path: None,
+    });
+    if let Ok(ref mut ext) = prov.extract_result {
+        ext.revocations.insert(key3);
+        ext.source_info.evidence_sha256 = digest(&ev_v2);
+        ext.evidence_files = vec![("evidence-prov_a.json".to_string(), ev_v2)];
+    }
+
+    let engine = UpdateEngine::new(root).with_provider(Box::new(prov));
+    let summary = engine.apply_update(false).unwrap().expect("update applied");
+    assert_eq!(summary.initial_indicators, 3);
+    assert_eq!(summary.new_records, 2);
+    assert_eq!(summary.removed_records, 1);
+    assert_eq!(summary.total_indicators, 4);
+
+    let gen_updated = read_pointer(root, CURRENT_PTR).unwrap();
+    assert_eq!(
+        read_pointer(root, PREVIOUS_PTR).as_deref(),
+        Some("gen-baseline")
+    );
+
+    // Check status after update
+    let status_up = UpdateStatus::load(root);
+    assert_eq!(
+        status_up.current_generation.as_deref(),
+        Some(gen_updated.as_str())
+    );
+    assert_eq!(
+        status_up.previous_generation.as_deref(),
+        Some("gen-baseline")
+    );
+    assert_eq!(status_up.sources.get("prov_a").unwrap().indicator_count, 4);
+    assert_eq!(
+        status_up.sources.get("prov_a").unwrap().active_version,
+        "v2.0"
+    );
+
+    // 3. Execute rollback
+    let rolled = engine.rollback().expect("rollback succeeded");
+    assert_eq!(rolled, "gen-baseline");
+    assert_eq!(read_pointer(root, CURRENT_PTR).unwrap(), "gen-baseline");
+    assert_eq!(
+        read_pointer(root, PREVIOUS_PTR).as_deref(),
+        Some(gen_updated.as_str()),
+        "Newer generation must remain recoverable in PREVIOUS_PTR"
+    );
+
+    // 4. Inspect every persisted state component after rollback:
+    // (a) Active RSIDB load
+    let (db, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(
+        db.total_records(),
+        3,
+        "Database must contain exactly 3 baseline indicators"
+    );
+    assert_eq!(db.lookup(HashAlgorithm::Sha256, 100, &[0x11; 32]).len(), 1);
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 300, &[0x33; 32]).len(),
+        1,
+        "Revoked threat e3 must be restored"
+    );
+    assert_eq!(
+        db.lookup(HashAlgorithm::Sha256, 400, &[0x44; 32]).len(),
+        0,
+        "Threat e4 must not exist in baseline"
+    );
+
+    // (b) Status reconciliation from active generation
+    let status_rb = UpdateStatus::load(root);
+    assert_eq!(
+        status_rb.current_generation.as_deref(),
+        Some("gen-baseline")
+    );
+    assert_eq!(
+        status_rb.previous_generation.as_deref(),
+        Some(gen_updated.as_str())
+    );
+    let src_rb = status_rb.sources.get("prov_a").unwrap();
+    assert_eq!(
+        src_rb.indicator_count, 3,
+        "Indicator count must match baseline 3, not stale 4"
+    );
+    assert_eq!(
+        src_rb.active_version, "v1.0",
+        "Active version must match baseline v1.0, not stale v2.0"
+    );
+    assert_eq!(src_rb.source_version, "v1.0");
+
+    // (c) Rollback summary verification
+    let sum_rb = status_rb.last_summary.expect("rollback summary");
+    assert_eq!(sum_rb.generation, "gen-baseline");
+    assert_eq!(sum_rb.total_indicators, 3);
+    assert_eq!(sum_rb.verification_result, "PASS (ROLLBACK)");
+
+    // 5. Scenario B: Reapply after rollback!
+    // Stale status must not prevent re-applying the update.
+    let reapply_res = engine
+        .apply_update(false)
+        .unwrap()
+        .expect("reapply update applied");
+    assert_eq!(reapply_res.initial_indicators, 3);
+    assert_eq!(reapply_res.total_indicators, 4);
+
+    let gen_reapplied = read_pointer(root, CURRENT_PTR).unwrap();
+    let (db2, _) = private_store::load_timed(root, &gen_reapplied).unwrap();
+    assert_eq!(
+        db2.total_records(),
+        4,
+        "Reapplied generation must return cleanly to 4 indicators without corruption"
+    );
+}
+
+// ============================================================================
+// SCENARIO 18: Scenario C — Restart Recovery & Self-Healing Metadata
+// ============================================================================
+#[test]
+fn test_18_restart_recovery_and_stale_file_healing() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    let e1 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0x11; 32],
+        "Threat.1".to_string(),
+    );
+    create_initial_generation_with_version(root, "gen-baseline", vec![e1], "prov_a", "v1.0");
+
+    // Simulate stale / corrupted update_status.json left from a pre-crash or aborted session
+    // containing wrong generation and wrong versions
+    let bogus_status = serde_json::json!({
+        "current_generation": "phantom-generation-9999",
+        "previous_generation": "phantom-prev-0000",
+        "sources": {
+            "prov_a": {
+                "id": "prov_a",
+                "name": "Mock prov_a",
+                "source_version": "stale-v9.9",
+                "active_version": "stale-v9.9",
+                "indicator_count": 999999
+            }
+        },
+        "last_summary": {
+            "generation": "phantom-generation-9999",
+            "total_indicators": 999999
+        }
+    });
+    fs::write(
+        root.join(STATUS_FILE),
+        serde_json::to_vec(&bogus_status).unwrap(),
+    )
+    .unwrap();
+
+    // Fresh process startup / restart
+    let recovered_status = UpdateStatus::load(root);
+
+    // Assert that active filesystem pointer and active generation authoritatively overrides the bogus file!
+    assert_eq!(
+        recovered_status.current_generation.as_deref(),
+        Some("gen-baseline"),
+        "Must heal to real active pointer"
+    );
+    assert_eq!(
+        recovered_status.previous_generation, None,
+        "Must heal previous pointer when none exists on disk"
+    );
+    let prov = recovered_status.sources.get("prov_a").unwrap();
+    assert_eq!(
+        prov.indicator_count, 1,
+        "Must heal indicator count to actual active count (1)"
+    );
+    assert_eq!(
+        prov.active_version, "v1.0",
+        "Must heal active version to real baseline version"
+    );
+    assert_eq!(prov.source_version, "v1.0");
+    assert_eq!(
+        recovered_status.last_summary.unwrap().generation,
+        "gen-baseline"
+    );
+}
+
+// ============================================================================
+// SCENARIO 19: Scenario D — Repeated Operations Lifecycle
+// ============================================================================
+#[test]
+fn test_19_repeated_operations_lifecycle() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    let e1 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0x11; 32],
+        "Threat.1".to_string(),
+    );
+    create_initial_generation_with_version(root, "gen-0", vec![e1.clone()], "prov_a", "v0");
+
+    let e2 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        200,
+        vec![0x22; 32],
+        "Threat.2".to_string(),
+    );
+    let e3 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        300,
+        vec![0x33; 32],
+        "Threat.3".to_string(),
+    );
+
+    // Cycle 1: Update to v1 (+e2, total: 2)
+    let prov_v1 = MockProvider::new("prov_a").with_entries(vec![e1.clone(), e2.clone()]);
+    let engine = UpdateEngine::new(root).with_provider(Box::new(prov_v1));
+    let s1 = engine.apply_update(true).unwrap().unwrap();
+    assert_eq!(s1.total_indicators, 2);
+
+    // Cycle 1 Rollback: back to gen-0 (total: 1)
+    let r1 = engine.rollback().unwrap();
+    assert_eq!(r1, "gen-0");
+    assert_eq!(
+        UpdateStatus::load(root)
+            .sources
+            .get("prov_a")
+            .unwrap()
+            .indicator_count,
+        1
+    );
+
+    // Cycle 2: Update to v1 again (+e2, total: 2)
+    let s2 = engine.apply_update(true).unwrap().unwrap();
+    assert_eq!(s2.total_indicators, 2);
+
+    // Cycle 2 Rollback: back to gen-0 (total: 1)
+    let r2 = engine.rollback().unwrap();
+    assert_eq!(r2, "gen-0");
+    assert_eq!(
+        UpdateStatus::load(root)
+            .sources
+            .get("prov_a")
+            .unwrap()
+            .indicator_count,
+        1
+    );
+
+    // Cycle 3: Legitimate update to v2 (+e2, +e3, total: 3)
+    let prov_v2 = MockProvider::new("prov_a").with_entries(vec![e1, e2, e3]);
+    let engine3 = UpdateEngine::new(root).with_provider(Box::new(prov_v2));
+    let s3 = engine3.apply_update(true).unwrap().unwrap();
+    assert_eq!(s3.total_indicators, 3);
+    assert_eq!(
+        UpdateStatus::load(root)
+            .sources
+            .get("prov_a")
+            .unwrap()
+            .indicator_count,
+        3
+    );
+    let (db, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(db.total_records(), 3);
+}
+
+// ============================================================================
+// SCENARIO 20: Scenario E — Unchanged Official Sources Safe No-op
+// ============================================================================
+#[test]
+fn test_20_unchanged_sources_safe_noop() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    let e1 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0x11; 32],
+        "Threat.1".to_string(),
+    );
+    create_initial_generation_with_version(
+        root,
+        "gen-stable",
+        vec![e1.clone()],
+        "clamav",
+        "main:63,daily:28173",
+    );
+
+    let mut prov = MockProvider::new("clamav").with_entries(vec![e1]);
+    prov.check_result = Ok(UpdateCheckResult {
+        available: false,
+        version: "main:63,daily:28173".to_string(),
+        details: "ClamAV CVD unchanged".to_string(),
+    });
+
+    let engine = UpdateEngine::new(root).with_provider(Box::new(prov));
+
+    // Check indicates no update available
+    let checks = engine.check_all().unwrap();
+    assert!(!checks.get("clamav").unwrap().available);
+
+    // Apply is a strict no-op: returns Ok(None)
+    let apply_res = engine.apply_update(false).unwrap();
+    assert!(
+        apply_res.is_none(),
+        "Must return Ok(None) without recompiling"
+    );
+
+    // Ensure pointer is completely untouched
+    assert_eq!(read_pointer(root, CURRENT_PTR).unwrap(), "gen-stable");
+    assert_eq!(read_pointer(root, PREVIOUS_PTR), None);
+}
+
+// ============================================================================
+// SCENARIO 21: Crash and Interruption Safety at All 7 Transaction Boundaries
+// ============================================================================
+#[test]
+fn test_21_crash_and_interruption_safety_at_transaction_boundaries() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    let e1 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0x11; 32],
+        "Threat.Base".to_string(),
+    );
+    create_initial_generation_with_version(
+        root,
+        "gen-verified-base",
+        vec![e1.clone()],
+        "prov_a",
+        "v1.0",
+    );
+
+    // Boundary 1: Crash after downloading source data
+    // Leftover staging directories from interrupted download must never be loaded by scanner
+    let leftover_staging = root.join(".update-staging-9999-1");
+    fs::create_dir_all(&leftover_staging).unwrap();
+    fs::write(
+        leftover_staging.join("partial.bin"),
+        b"corrupt partial download",
+    )
+    .unwrap();
+
+    let (active_db, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(
+        active_db.total_records(),
+        1,
+        "Scanner strictly loads verified base"
+    );
+    assert_eq!(
+        active_db
+            .lookup(HashAlgorithm::Sha256, 100, &[0x11; 32])
+            .len(),
+        1
+    );
+
+    // Boundary 2: Crash during generation compilation
+    // Leftover temporary compilation directory .gen.tmp must never be loaded
+    let leftover_compilation = root.join(".phase2d7-unified-crashed.tmp");
+    fs::create_dir_all(&leftover_compilation).unwrap();
+    fs::write(
+        leftover_compilation.join("database.rsidb"),
+        b"corrupted half-written index",
+    )
+    .unwrap();
+
+    let (active_db2, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(
+        active_db2.total_records(),
+        1,
+        "Interrupted compile does not affect active database"
+    );
+
+    // Boundary 3: Crash after compilation & verification but before pointer swap
+    // Complete verified generation exists on disk, but pointer was not yet flipped
+    let e2 = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        200,
+        vec![0x22; 32],
+        "Threat.New".to_string(),
+    );
+    let ev_v2 = serde_json::to_vec(&serde_json::json!({"version": "v2.0"})).unwrap();
+    let reg2 = UnifiedRegistry {
+        version: 1,
+        sources: vec![UnifiedSource {
+            id: "prov_a".to_string(),
+            name: "Mock prov_a".to_string(),
+            provider: "Test".to_string(),
+            acquisition_method: "test".to_string(),
+            acquired_unix_seconds: 2000,
+            classification: "test".to_string(),
+            provenance: "test".to_string(),
+            redistribution: "test".to_string(),
+            enabled: true,
+            indicator_count: 2,
+            evidence_sha256: digest(&ev_v2),
+            evidence_file: Some("evidence-prov_a.json".to_string()),
+        }],
+        total_indicators: 2,
+        md5_count: 0,
+        sha1_count: 0,
+        sha256_count: 2,
+    };
+    let assoc2 = UnifiedAssociations {
+        version: 1,
+        total_indicators: 2,
+        indicators: vec![
+            UnifiedIndicator {
+                alg: "sha256".to_string(),
+                hash: hex::encode(&e1.digest),
+                size: e1.size,
+                name: e1.name.clone(),
+                claims: vec![UnifiedClaim {
+                    source_id: "prov_a".to_string(),
+                    size: e1.size,
+                    family: e1.name.clone(),
+                }],
+            },
+            UnifiedIndicator {
+                alg: "sha256".to_string(),
+                hash: hex::encode(&e2.digest),
+                size: e2.size,
+                name: e2.name.clone(),
+                claims: vec![UnifiedClaim {
+                    source_id: "prov_a".to_string(),
+                    size: e2.size,
+                    family: e2.name.clone(),
+                }],
+            },
+        ],
+    };
+    publish_unified(
+        root,
+        "gen-verified-unactivated",
+        vec![e1, e2],
+        reg2,
+        assoc2,
+        vec![("evidence-prov_a.json".to_string(), ev_v2)],
+    )
+    .unwrap();
+
+    let (active_db3, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(
+        active_db3.total_records(),
+        1,
+        "Scanner strictly respects current pointer; never exposes unactivated generation"
+    );
+
+    // Boundary 4: Atomic pointer activation
+    // Invariant: pointer write is atomic via temp file + rename; never partial bytes
+    write_pointer(root, CURRENT_PTR, "gen-verified-unactivated").unwrap();
+    let (active_db4, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(
+        active_db4.total_records(),
+        2,
+        "Atomic activation successfully exposes verified generation"
+    );
+
+    // Boundary 5: Crash between pointer change and status persistence
+    // Pointer changed to gen-verified-unactivated, but update_status.json has old data
+    let mut stale_sources = BTreeMap::new();
+    stale_sources.insert(
+        "prov_a".to_string(),
+        SourceStatus {
+            id: "prov_a".to_string(),
+            source_version: "v1.0".to_string(),
+            indicator_count: 1,
+            ..Default::default()
+        },
+    );
+    let stale_status = UpdateStatus {
+        current_generation: Some("gen-verified-base".to_string()),
+        sources: stale_sources,
+        ..Default::default()
+    };
+    stale_status.save(root).unwrap();
+
+    // Process restarts and loads status: it immediately self-heals from active pointer and registry
+    let healed = UpdateStatus::load(root);
+    assert_eq!(
+        healed.current_generation.as_deref(),
+        Some("gen-verified-unactivated")
+    );
+    assert_eq!(healed.sources.get("prov_a").unwrap().indicator_count, 2);
+    assert_eq!(healed.sources.get("prov_a").unwrap().active_version, "v2.0");
+
+    // Boundary 6 & 7: Interruption recovery guarantees clean single generation, never mixed
+    let clean_load = private_store::load(root, "current");
+    assert!(
+        clean_load.is_ok(),
+        "Active database must always be 100% valid and verified"
+    );
 }

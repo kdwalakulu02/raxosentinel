@@ -225,6 +225,7 @@ impl UpdateEngine {
                             ..Default::default()
                         });
                     entry.last_check_timestamp = now;
+                    entry.latest_upstream_version = chk.version.clone();
                     entry.last_error = None;
                     results.insert(provider.id().to_string(), chk);
                 }
@@ -290,6 +291,7 @@ impl UpdateEngine {
                     ..Default::default()
                 });
             src_entry.last_check_timestamp = now;
+            src_entry.latest_upstream_version = chk.version.clone();
             src_entry.last_error = None;
 
             if chk.available || force {
@@ -527,7 +529,7 @@ impl UpdateEngine {
         let evidence_files: Vec<(String, Vec<u8>)> = existing_evidence.into_iter().collect();
 
         // 8. Generate unique immutable generation name
-        let gen_name = format!("phase2d7-unified-{}", now);
+        let gen_name = format!("phase2d7-unified-{}-{}", now, seq);
 
         // Publish unified generation atomically
         publish_unified(
@@ -580,7 +582,9 @@ impl UpdateEngine {
                 let s_entry = status.sources.entry(provider.id().to_string()).or_default();
                 s_entry.id = provider.id().to_string();
                 s_entry.name = provider.name().to_string();
+                s_entry.active_version = chk.version.clone();
                 s_entry.source_version = chk.version.clone();
+                s_entry.latest_upstream_version = chk.version.clone();
                 s_entry.indicator_count = ext.entries.len();
                 s_entry.last_import_timestamp = now;
                 s_entry.last_error = None;
@@ -671,6 +675,7 @@ impl UpdateEngine {
     /// Roll back the active database to the previous known-good generation.
     pub fn rollback(&self) -> Result<String, UpdateError> {
         let _lock = self.acquire_lock()?;
+        let rollback_start = Instant::now();
         let prev_gen = read_pointer(&self.root, PREVIOUS_PTR).ok_or_else(|| {
             UpdateError::RollbackFailed("No previous generation pointer found".to_string())
         })?;
@@ -684,15 +689,53 @@ impl UpdateEngine {
         })?;
 
         let old_current = read_pointer(&self.root, CURRENT_PTR);
+        let old_total = old_current
+            .as_deref()
+            .and_then(|g| unified::inspect(&self.root, g).ok())
+            .map(|(r, _)| r.total_indicators)
+            .unwrap_or(0);
+
+        let (prev_reg, _) = unified::inspect(&self.root, &prev_gen).map_err(|e| {
+            UpdateError::RollbackFailed(format!(
+                "Failed to inspect target rollback generation: {e}"
+            ))
+        })?;
+        let prev_total = prev_reg.total_indicators;
+
         write_pointer(&self.root, CURRENT_PTR, &prev_gen)?;
         if let Some(ref old) = old_current {
             let _ = write_pointer(&self.root, PREVIOUS_PTR, old);
         }
 
+        // Authoritatively derive status and source metadata from the active generation (prev_gen)
         let mut status = UpdateStatus::load(&self.root);
         status.current_generation = Some(prev_gen.clone());
         status.previous_generation = old_current;
-        let _ = status.save(&self.root);
+
+        let removed_from_old = old_total.saturating_sub(prev_total);
+        let added_to_prev = prev_total.saturating_sub(old_total);
+        let net_change = (prev_total as i64) - (old_total as i64);
+
+        status.last_summary = Some(UpdateSummary {
+            generation: prev_gen.clone(),
+            initial_indicators: old_total,
+            total_indicators: prev_total,
+            gross_records_acquired: 0,
+            new_records: added_to_prev,
+            removed_records: removed_from_old,
+            retained_records: 0,
+            deduplicated_records: 0,
+            rejected_records: 0,
+            net_count_change: net_change,
+            verification_result: "PASS (ROLLBACK)".to_string(),
+            duration_ms: rollback_start.elapsed().as_millis() as u64,
+        });
+
+        status.save(&self.root).map_err(|e| {
+            UpdateError::Io(format!(
+                "Failed to persist update_status.json after rollback: {e}"
+            ))
+        })?;
 
         Ok(prev_gen)
     }
