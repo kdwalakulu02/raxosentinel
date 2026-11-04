@@ -21,7 +21,7 @@ use raxosentinel_core::{
     MemoryUsage, ResourceLimits, ResourceTracker, ScanReport, ScanStatus, TargetMetadata,
 };
 use raxosentinel_email::EmailScanner;
-use raxosentinel_filetypes::{detect_file_type, FileCategory};
+use raxosentinel_filetypes::{detect_file_type, detect_type, FileCategory};
 use raxosentinel_signatures::rsidb::crypto;
 use raxosentinel_signatures::rsidb::ingest::{BuildProfile, IngestPipeline, SourceManifest};
 use raxosentinel_signatures::rsidb::lifecycle::DbStore;
@@ -56,6 +56,10 @@ struct Cli {
 enum Commands {
     /// Scan a target file or email message
     Scan(ScanArgs),
+    /// Run persistent local scanner coordinator service
+    Serve(coordinator::ServeArgs),
+    /// Submit a file to a running scanner service via Unix socket
+    Client(coordinator::ClientArgs),
     /// RSIDB database management (verify, build, install, rollback)
     #[command(subcommand)]
     Db(DbCommand),
@@ -194,15 +198,59 @@ enum DbCommand {
         #[arg(long)]
         allow_unsigned: bool,
     },
+    /// Automated intelligence updates (check, apply, status)
+    Update {
+        /// Owner-controlled private storage root
+        #[arg(long, env = "RAXOSENTINEL_PRIVATE_ROOT")]
+        root: Option<PathBuf>,
+        /// Check whether new intelligence is available without applying
+        #[arg(long)]
+        check: bool,
+        /// Apply updates and atomically activate the new generation
+        #[arg(long)]
+        apply: bool,
+        /// Show status of configured intelligence sources and last update
+        #[arg(long)]
+        status: bool,
+        /// Force update even if sources report unchanged
+        #[arg(long)]
+        force: bool,
+        /// Path to ClamAV unpacked directory (controlled fixtures or manual extraction)
+        #[arg(long)]
+        clamav_unpack: Option<PathBuf>,
+        /// Path to directory containing official ClamAV CVD archives (main.cvd, daily.cvd)
+        #[arg(long)]
+        clamav_cvd_dir: Option<PathBuf>,
+        /// Automatically fetch official ClamAV updates via FreshClam
+        #[arg(long)]
+        freshclam: bool,
+    },
     /// Re-activate the previous (last known-good) database
     Rollback {
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
+        #[arg(long, env = "RAXOSENTINEL_PRIVATE_ROOT")]
+        root: Option<PathBuf>,
     },
 }
 
 #[derive(Args, Debug)]
 struct ScanArgs {
+    /// Run the scan in a supervised Linux worker process.
+    #[arg(long)]
+    supervised: bool,
+
+    /// Worker address-space limit in bytes (default 1 GiB).
+    #[arg(long, default_value_t = 1_073_741_824u64)]
+    worker_memory: u64,
+
+    /// Parent-enforced worker deadline in milliseconds (default 10 seconds).
+    #[arg(long, default_value_t = 10_000u64)]
+    worker_timeout_ms: u64,
+
+    #[arg(long, hide = true)]
+    worker_internal: bool,
+
     /// Target file path to scan
     #[arg(value_name = "FILE_PATH")]
     target: PathBuf,
@@ -248,17 +296,21 @@ struct ScanArgs {
     #[arg(long, requires = "public_release")]
     public_state: Option<PathBuf>,
 
-    /// Owner-controlled private storage root (requires --private-generation).
-    #[arg(long, requires = "private_generation", conflicts_with_all = ["db", "db_store"])]
+    /// Owner-controlled private storage root.
+    #[arg(long, conflicts_with_all = ["db", "db_store"])]
     private_db_root: Option<PathBuf>,
 
-    /// Immutable private generation to verify before scanning.
+    /// Immutable private generation to verify before scanning (defaults to active pointer).
     #[arg(long, requires = "private_db_root")]
     private_generation: Option<String>,
 
     /// RSIDB store directory managed by `db install` (uses current, falls back to previous)
     #[arg(long, env = "RAXOSENTINEL_DB_STORE")]
     db_store: Option<PathBuf>,
+
+    /// Connect to a persistent scanner coordinator service over Unix socket
+    #[arg(long, env = "RAXOSENTINEL_SOCKET")]
+    socket: Option<PathBuf>,
 }
 
 fn main() {
@@ -280,11 +332,95 @@ fn main() {
             let exit_code = run_scan(args);
             process::exit(exit_code);
         }
+        Commands::Serve(args) => {
+            #[cfg(target_os = "linux")]
+            process::exit(coordinator::serve(args));
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("Coordinator service requires Linux");
+                process::exit(3);
+            }
+        }
+        Commands::Client(args) => {
+            #[cfg(target_os = "linux")]
+            process::exit(coordinator::client(args));
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("Coordinator client requires Linux");
+                process::exit(3);
+            }
+        }
         Commands::Db(cmd) => process::exit(run_db(cmd)),
     }
 }
 
 fn run_scan(args: ScanArgs) -> i32 {
+    if let Some(ref sock) = args.socket {
+        #[cfg(target_os = "linux")]
+        {
+            let client_args = coordinator::ClientArgs {
+                socket: sock.clone(),
+                target: args.target,
+                json: args.json,
+                max_size: args.max_size,
+                timeout: args.timeout,
+                max_depth: args.max_depth,
+                test_worker_action: std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION").ok(),
+            };
+            return coordinator::client(client_args);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("Coordinator client requires Linux");
+            return 3;
+        }
+    }
+
+    let allow_test = cfg!(debug_assertions)
+        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    if allow_test && args.worker_internal {
+        if let Ok(action) = std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION") {
+            match action.as_str() {
+                "descendant" => {
+                    let mut child = std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .spawn()
+                        .unwrap();
+                    let _ = child.wait();
+                    return 3;
+                }
+                "delay" => std::thread::sleep(std::time::Duration::from_millis(500)),
+                act if act.starts_with("delay:") => {
+                    if let Ok(ms) = act["delay:".len()..].parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                }
+                "hang" => loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                },
+                "crash" => {
+                    unsafe {
+                        libc::raise(libc::SIGKILL);
+                    }
+                    return 3;
+                }
+                "malformed" => {
+                    println!("not a scan report");
+                    return 0;
+                }
+                "oversized" => {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&vec![b'x'; 2 * 1024 * 1024 + 1]);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+    }
+    if args.supervised {
+        return supervised::run(&args);
+    }
+
     let mut limits = ResourceLimits::default();
     if let Some(max_sz) = args.max_size {
         limits.max_file_size = max_sz;
@@ -349,12 +485,21 @@ fn run_scan(args: ScanArgs) -> i32 {
                 return 3;
             }
         }
-        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(
-            root,
-            args.private_generation
-                .as_deref()
-                .expect("clap requires generation"),
-        ) {
+        let gen = match args.private_generation.as_deref() {
+            Some(g) => g.to_string(),
+            None => {
+                match raxosentinel_signatures::rsidb::malwarebazaar::private_store::resolve_generation(
+                    root, "current",
+                ) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("Error resolving active private generation: {e}");
+                        return 3;
+                    }
+                }
+            }
+        };
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(root, &gen) {
             Ok(index) => db.attach_rsidb(Arc::new(index)),
             Err(e) => {
                 eprintln!("Error: private database rejected: {e}");
@@ -396,8 +541,27 @@ fn run_scan(args: ScanArgs) -> i32 {
         }
     }
 
+    if args.worker_internal {
+        #[cfg(target_os = "linux")]
+        if let Err(e) = supervised::restrict_worker_filesystem() {
+            eprintln!("Worker filesystem isolation failed: {e}");
+            return 3;
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION").as_deref() == Ok("probe")
+            && (File::open(&args.target).is_ok()
+                || File::open(args.target.with_file_name("secret")).is_ok())
+        {
+            eprintln!("Worker unexpectedly accessed original target");
+            return 3;
+        }
+    }
     let mut tracker = ResourceTracker::new(limits);
-    let report = scan_path(&args.target, &db, &mut tracker);
+    let report = if args.worker_internal {
+        scan_descriptor(&args.target, &db, &mut tracker)
+    } else {
+        scan_path(&args.target, &db, &mut tracker)
+    };
 
     let mem_usage = if args.memory {
         Some(MemoryUsage::capture())
@@ -418,6 +582,141 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     report.status.exit_code()
+}
+
+fn scan_descriptor(
+    path: &Path,
+    db: &SignatureDatabase,
+    tracker: &mut ResourceTracker,
+) -> ScanReport {
+    let fail = |message: String| {
+        ScanReport::new(
+            TargetMetadata {
+                path: Some(path.display().to_string()),
+                file_name: path.file_name().map(|v| v.to_string_lossy().into_owned()),
+                file_size_bytes: 0,
+                sha256: String::new(),
+                detected_mime: "application/unknown".into(),
+                declared_mime: None,
+            },
+            ScanStatus::Failed,
+            Vec::new(),
+            Vec::new(),
+            0,
+            Some(message),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // fd 0 is supplied by the supervisor and must be a regular file.
+        if unsafe { libc::fstat(0, stat.as_mut_ptr()) } != 0 {
+            return fail("Invalid worker input descriptor".into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return fail("Worker input descriptor is not a regular file".into());
+        }
+    }
+    let mut input = std::io::stdin().lock();
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => return fail(format!("Read failed: {e}")),
+        };
+        if n == 0 {
+            break;
+        }
+        if let Err(e) = tracker.record_bytes_read(n) {
+            return fail(e.to_string());
+        }
+        if data.try_reserve(n).is_err() {
+            return fail("Cannot allocate scan buffer".into());
+        }
+        data.extend_from_slice(&chunk[..n]);
+    }
+    let file_type = detect_type(&data[..data.len().min(8192)]);
+    let is_email = file_type.category == FileCategory::Email
+        || file_type.mime_type == "message/rfc822"
+        || path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("eml") || e.eq_ignore_ascii_case("msg"))
+            .unwrap_or(false);
+    let scanner = EmailScanner::new(db);
+    let result = if is_email {
+        tracker.reset_bytes_read();
+        scanner.scan_bytes(&data, path.to_str(), tracker)
+    } else {
+        scanner.scan_object(
+            &data,
+            &path
+                .file_name()
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            None,
+            tracker,
+            0,
+        )
+    };
+    match result {
+        Ok(mut report) => {
+            report.target.path = Some(path.display().to_string());
+            report
+        }
+        Err(e) => fail(format!("Scan failed: {e}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod supervised;
+#[cfg(not(target_os = "linux"))]
+mod supervised {
+    pub fn run(_: &super::ScanArgs) -> i32 {
+        eprintln!("Supervised scanning requires Linux");
+        3
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub mod hot_reload;
+
+#[cfg(target_os = "linux")]
+mod coordinator;
+#[cfg(not(target_os = "linux"))]
+mod coordinator {
+    use clap::Args;
+    use std::path::PathBuf;
+
+    #[derive(Args, Debug, Clone)]
+    pub struct ServeArgs {
+        #[arg(long)]
+        pub socket: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        pub max_workers: usize,
+        #[arg(long, default_value_t = 1)]
+        pub max_pending: usize,
+        #[arg(long, default_value_t = 209_715_200u64)]
+        pub max_total_snapshot_bytes: u64,
+        #[arg(long, default_value_t = 5)]
+        pub client_timeout_secs: u64,
+    }
+
+    #[derive(Args, Debug, Clone)]
+    pub struct ClientArgs {
+        #[arg(long)]
+        pub socket: PathBuf,
+        pub target: PathBuf,
+        #[arg(long)]
+        pub json: bool,
+        #[arg(long)]
+        pub max_size: Option<u64>,
+        #[arg(long)]
+        pub timeout: Option<u64>,
+        #[arg(long)]
+        pub max_depth: Option<usize>,
+    }
 }
 
 fn scan_path(path: &Path, db: &SignatureDatabase, tracker: &mut ResourceTracker) -> ScanReport {
@@ -963,14 +1262,136 @@ fn run_db(cmd: DbCommand) -> i32 {
                 }
             }
         }
-        DbCommand::Rollback { store } => match DbStore::new(store).rollback() {
-            Ok(r) => {
-                println!("rolled back to {}", r);
+        DbCommand::Update {
+            root,
+            check,
+            apply,
+            status,
+            force,
+            clamav_unpack,
+            clamav_cvd_dir,
+            freshclam,
+        } => {
+            let root_path = root.unwrap_or_else(|| {
+                PathBuf::from("/home/vscode/raxosentinel-private-phase2d1")
+            });
+
+            let clam_provider = if let Some(ref cvd_dir) = clamav_cvd_dir {
+                if freshclam {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_freshclam(cvd_dir)
+                } else {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir(cvd_dir)
+                }
+            } else if let Some(ref unpack) = clamav_unpack {
+                raxosentinel_signatures::rsidb::updater::ClamAvProvider::new(unpack)
+            } else {
+                let root_cvd = root_path.join("clamav-cvd");
+                if root_cvd.exists() {
+                    if freshclam {
+                        raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_freshclam(root_cvd)
+                    } else {
+                        raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir(root_cvd)
+                    }
+                } else if Path::new("/home/vscode/clamav-cvd").exists() {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir("/home/vscode/clamav-cvd")
+                } else if Path::new("/var/lib/clamav/daily.cvd").exists() {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::with_cvd_dir("/var/lib/clamav")
+                } else {
+                    raxosentinel_signatures::rsidb::updater::ClamAvProvider::new("/home/vscode/clamav-unpack")
+                }
+            };
+
+            let mut engine = raxosentinel_signatures::rsidb::updater::UpdateEngine::new(&root_path)
+                .with_provider(Box::new(clam_provider));
+
+            let mb_fixture = root_path.join("phase2d4-refreshed-final/acq-7009a4d2894c668fe056658b41674308fdeec5a21f315897717eaf1bb4d9175e.json");
+            let mb_provider = if mb_fixture.exists() {
+                raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::with_fixture(mb_fixture)
+            } else {
+                raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::new()
+            };
+            engine = engine.with_provider(Box::new(mb_provider));
+
+            if status || (!check && !apply) {
+                let st = raxosentinel_signatures::rsidb::updater::UpdateStatus::load(&root_path);
+                print!("{}", st.format_display());
+                return 0;
+            }
+
+            if check {
+                println!("Checking configured intelligence providers for updates...");
+                match engine.check_all() {
+                    Ok(results) => {
+                        for (id, res) in results {
+                            println!("  [{}] available={}: {}", id, res.available, res.details);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Update check failed: {}", e);
+                        return 1;
+                    }
+                }
+            }
+
+            if apply {
+                println!("Applying intelligence updates (force={})...", force);
+                match engine.apply_update(force) {
+                    Ok(Some(summary)) => {
+                        println!("Update successful!");
+                        println!("  Activated generation         : {}", summary.generation);
+                        println!("  Initial active indicators    : {}", summary.initial_indicators);
+                        println!("  Gross records acquired       : {}", summary.gross_records_acquired);
+                        println!("  Gross new unique records     : {}", summary.new_records);
+                        println!("  Records removed or revoked   : {}", summary.removed_records);
+                        println!("  Retained via other provider  : {}", summary.retained_records);
+                        println!("  Duplicates deduplicated      : {}", summary.deduplicated_records);
+                        println!("  Rejected / excluded records  : {}", summary.rejected_records);
+                        println!("  Net count change             : {:+}", summary.net_count_change);
+                        println!("  Final active total           : {}", summary.total_indicators);
+                        println!("  Verification status          : {}", summary.verification_result);
+                        println!("  Duration                     : {} ms", summary.duration_ms);
+                        0
+                    }
+                    Ok(None) => {
+                        println!("No updates available from any configured intelligence source (database unchanged).");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Update failed: {}", e);
+                        1
+                    }
+                }
+            } else {
                 0
             }
-            Err(e) => {
-                eprintln!("Rollback failed: {}", e);
-                3
+        }
+        DbCommand::Rollback { store, root } => {
+            if let Some(store_path) = store {
+                match DbStore::new(store_path).rollback() {
+                    Ok(r) => {
+                        println!("rolled back to {}", r);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Rollback failed: {}", e);
+                        3
+                    }
+                }
+            } else {
+                let root_path = root.unwrap_or_else(|| {
+                    PathBuf::from("/home/vscode/raxosentinel-private-phase2d1")
+                });
+                let engine = raxosentinel_signatures::rsidb::updater::UpdateEngine::new(&root_path);
+                match engine.rollback() {
+                    Ok(gen) => {
+                        println!("Successfully rolled back active generation to '{}'", gen);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Rollback failed: {}", e);
+                        1
+                    }
+                }
             }
         },
     }

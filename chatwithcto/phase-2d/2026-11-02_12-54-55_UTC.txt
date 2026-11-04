@@ -1,0 +1,13 @@
+RaxoSentinel Phase 2D live validation handover
+
+Branch phase-2d started at 9eb189d; corrections committed as d4a70a2. No push or merge performed. Debian GNU/Linux 13.7, rustc 1.99.1 and cargo 1.99.1 confirmed. The configured RAXO_ABUSECH_AUTH_KEY was present; its value was not displayed. The complete cargo test --workspace --quiet suite passed after the corrections.
+
+A private authenticated get_recent metadata-only request to the fixed MalwareBazaar endpoint succeeded. The corrected importer validated the response status, record count, SHA-256 format, positive file sizes, family and calendar timestamps and compiled 100 accepted records; 0 were invalid and 0 duplicates. No malware binaries were requested. A local in-memory RSIDB lookup matched all 100 accepted hash/size pairs and a negative lookup missed. The private database is /tmp/raxo-phase2d-corrected.rsidb with mode 0600; the initial pre-correction validation database is also in /tmp. Keep these private; they contain threat intelligence and raw API response metadata.
+
+On this environment, the corrected database was 1,006,151 bytes, of which provenance was 214,682 bytes and the original response was 175,380 bytes. A local debug-build measurement saw in-memory load times of 50.6–118.4 ms and 100,000 successful lookups in 220–357 ms. Peak process RSS was 5,552 KiB, including runtime, input bytes, database, parsed metadata and measurement harness; this is not incremental database memory. These are small-sample local measurements, not production capacity claims.
+
+Importer corrections validate Gregorian date/time ranges including leap years, and report invalid and duplicate records separately. Tests cover valid leap day and invalid calendar/time cases and separate accounting. Existing synthetic importer tests and the full workspace suite pass.
+
+Sidecar evaluation: storing the raw response and selected metadata in the RSIDB adds 214,682 bytes to this database and duplicates much of the response. A separate mode-0600 provenance sidecar, linked by response digest and acquired time in a compact embedded manifest, would reduce database and in-memory provenance overhead while preserving auditability. It was not implemented in this change: atomic creation, cleanup on partial failure, integrity verification, access controls and sidecar lifecycle require design and tests. The remaining database size also includes other format overhead, so moving provenance alone will not eliminate all overhead.
+
+No production infrastructure was touched and no threat intelligence was published. The commit hook reported git-lfs was unavailable after the commit succeeded. The chatwithcto reports are existing untracked owner files and were not committed.

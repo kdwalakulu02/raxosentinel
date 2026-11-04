@@ -1,0 +1,243 @@
+# RaxoSentinel Phase 2D.7B — Genuine Upstream Acquisition & Update Accounting Handover Report
+
+| Metric / Dimension | Specification / Observation |
+|---|---|
+| Phase Milestone | Phase 2D.7B: Genuine Upstream Acquisition & Update Accounting |
+| Git Branch | `phase-3b` |
+| Commit Hash | `d28f604496e18d682e01baf2e23484bdaba03790` |
+| Native Database Target | ONE Canonical RSIDB (`database.rsidb`) |
+| Baseline Active Generation | `phase2d6-unified` (542,057 unique indicators) |
+| Updated Acceptance Generation | `phase2d7-unified-1793771916` (542,058 unique indicators) |
+| Restored Active Generation | `phase2d6-unified` (via `db rollback`) |
+| Real Upstream ClamAV main.cvd | Version **63** (builder: `tomjudge`, sigs: 3,287,027) |
+| Real Upstream ClamAV daily.cvd | Version **28173** (builder: `svc.clamav-publisher`, sigs: 355,841) |
+| Live Upstream Acquisition | Succeeded via official `freshclam` and DNS `current.cvd.clamav.net` |
+| Newer Official Release Available | None (upstream at main:63, daily:28173; exact match with baseline RSIDB) |
+| Genuine Upstream Check Result | Correct no-op reported (`available=false`, zero rebuilds) |
+| Additions Accounting (Gross New) | **2** (`Acceptance.Threat.Sha256.001`, `Acceptance.Threat.Sha256.002`) |
+| Removals Accounting (Revoked) | **1** (`Win.Spyware.Bispy-7` revoked in `daily.fp`) |
+| Retained via Another Provider | **0** (revoked threat was exclusive to ClamAV) |
+| Net Count Change | **+1** (542,058 - 542,057) |
+| Accounting Invariant Invariant | **542,058 = 542,057 + 2 − 1** (`VERIFIED OK`) |
+| Update Pipeline Duration | 18,836 ms (acquire, reconcile, compile, and strict verification) |
+| Workspace Test Suite | 180 passed; 0 failed; 2 ignored |
+| Clippy / Format Invariants | 0 warnings (`-D warnings`); `cargo fmt --all -- --check` clean |
+
+---
+
+## 1. ClamAV Upstream Acquisition & Complete Operational Chain
+
+### 1.1 Complete Operational Chain Inspection
+In Phase 2D.7A, the updater assumed local pre-unpacked files were present in `/home/vscode/clamav-unpack` and did not invoke an approved upstream distribution mechanism. In Phase 2D.7B, the full end-to-end operational chain has been implemented and verified:
+
+```
+Official ClamAV Distribution (database.clamav.net / current.cvd.clamav.net)
+  │
+  ├─► DNS TXT Pre-check: UDP query to current.cvd.clamav.net (main: 63, daily: 28173)
+  │     └─► Rate-limit friendly: zero HTTP load if versions are unchanged
+  │
+  ├─► FreshClam Acquisition: freshclam --config-file=<private_dir>/freshclam.conf --stdout
+  │     └─► Obtains signed main.cvd (89 MB) and daily.cvd (23 MB) into private storage
+  │
+  ├─► Digital Signature Authentication: sigtool -i <cvd_path>
+  │     ├─► Validates ClamAV-VDB header and verifies Cisco Talos RSA digital signature
+  │     └─► Verification OK -> proceeds; Tampered/corrupted -> FAILS CLOSED
+  │
+  ├─► Signature Archive Extraction: sigtool -u <cvd_path>
+  │     └─► Unpacks main/ and daily/ hash tables and exclusion lists to isolated staging
+  │
+  ├─► RSIDB Conversion & Multi-Source Reconciliation
+  │     └─► Merges with MalwareBazaar baseline; filters FP exclusions and invalid syntax
+  │
+  ├─► Strict Post-Build Verification
+  │     └─► Index load, total count equality, spot lookups, benign buffer threat check
+  │
+  └─► Atomic Generation Activation
+        └─► Updates current pointer to immutable generation directory
+```
+
+### 1.2 Actual Observed Upstream ClamAV Versions
+Querying the live official Cisco Talos DNS TXT record at `current.cvd.clamav.net` returned:
+```
+1.4.6:63:28173:1793768400:1:90:49192:339
+```
+- **Recommended ClamAV Engine**: `1.4.6`
+- **Official `main.cvd` Version**: `63`
+- **Official `daily.cvd` Version**: `28173`
+- **Official `bytecode.cvd` Version**: `49192`
+- **Release Build Unix Timestamp**: `1793768400`
+
+Executing `freshclam` and verifying with `sigtool -i`:
+- **`daily.cvd`**: Version 28173, Builder `svc.clamav-publisher`, 355,841 signatures, MD5 `b7c96f586f5f4ada86d0155c27e64f00`, SHA-256 `e1baff030ff150a60c7e76159a350d2bc33acef395a1139f4cac58937ab91e60`, `Verification OK`.
+- **`main.cvd`**: Version 63, Builder `tomjudge`, 3,287,027 signatures, MD5 `9c353a6b32555186a45a61c6441f38c0`, SHA-256 `0b2182d229f46981ec8f535382222f7c9dfdd656b250ad47988b910a8d302365`, `Verification OK`.
+
+---
+
+## 2. Dual Database Independent Tracking & Genuine Provider Behaviour
+
+### 2.1 Independent Tracking of `main.cvd` and `daily.cvd`
+The updater now tracks both databases independently:
+- `ClamAvProvider::detect_local_versions()` returns `(Option<u64>, Option<u64>)` for `main` and `daily`.
+- Composite source version string format: `main:<main_version>,daily:<daily_version>`.
+- Verified in Scenario 15 (`test_15_clamav_dual_database_independent_tracking_and_authentication`):
+  - A change to `daily.cvd` alone triggers reconciliation (`available = true`).
+  - A change to `main.cvd` alone triggers reconciliation (`available = true`).
+  - An unchanged source reports `available = false` and causes **zero** generation rebuilds.
+
+### 2.2 Genuine Upstream Check & Correct No-Op Demonstration
+Executed against baseline RSIDB in private storage:
+```bash
+$ raxosentinel db update --check --root /home/vscode/raxosentinel-test-2d7b
+Checking configured intelligence providers for updates...
+  [clamav] available=false: ClamAV CVD distribution unchanged at main:63,daily:28173 (upstream main: 63, daily: 28173)
+  [malwarebazaar] available=false: MalwareBazaar records unchanged at version d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94
+```
+
+```bash
+$ raxosentinel db update --apply --root /home/vscode/raxosentinel-test-2d7b
+Applying intelligence updates (force=false)...
+No updates available from any configured intelligence source (database unchanged).
+```
+**Finding:** At the time of testing, upstream ClamAV was at `main:63,daily:28173`, matching the active baseline. The updater demonstrated an authentic, verified **no-op**: zero bytes written to disk, zero unneeded generations created, rate-limits completely respected.
+
+---
+
+## 3. Investigation & Resolution of Update Accounting Defect
+
+### 3.1 Defect Root Cause Analysis
+In Phase 2D.7A, an update with 2 additions and 1 removal displayed:
+```
+New records added: 1
+Removed records: 0
+```
+**Root Cause:**
+In `crates/raxosentinel-signatures/src/rsidb/updater/engine.rs`:
+```rust
+// BUGGY IMPLEMENTATION in Phase 2D.7A:
+let new_records = final_count.saturating_sub(previous_total_count);
+let removed_records = previous_total_count.saturating_sub(final_count);
+```
+This conflated **net growth** with **gross additions**, and completely masked removals whenever net growth was positive ($542,058 - 542,057 = 1$, and $542,057 \ominus 542,058 = 0$).
+
+### 3.2 Implemented Set-Theoretic Accounting
+The update engine now enforces strict set-theoretic classification of every indicator key:
+- **Gross new unique records (Additions)**:
+  $$additions = |K_{final} \setminus K_{initial}|$$
+- **Records removed or revoked (Removals)**:
+  $$removals = |K_{initial} \setminus K_{final}|$$
+- **Records retained through another provider**:
+  Keys in $K_{initial} \cap K_{final}$ that were previously claimed by an updating source, but now have no claims from any updating source (supported solely by non-updating sources).
+- **Net count change**:
+  $$\Delta = final\_count - initial\_count = additions - removals$$
+- **Strict Invariant Enforcement**:
+  $$final\_count \equiv initial\_count + additions - removals$$
+  If this invariant is violated by even 1 indicator, the update engine aborts and **fails closed**.
+
+### 3.3 Acceptance Verification with Controlled Fixture
+Executed update using the controlled fixture (with 2 SHA-256 additions in `daily.hsb` and 1 MD5 revocation in `daily.fp`):
+```bash
+$ raxosentinel db update --apply --root /home/vscode/raxosentinel-test-2d7b --clamav-unpack /home/vscode/clamav-unpack-controlled-fixture
+Applying intelligence updates (force=false)...
+Update successful!
+  Activated generation         : phase2d7-unified-1793771916
+  Initial active indicators    : 542057
+  Gross records acquired       : 541992
+  Gross new unique records     : 2
+  Records removed or revoked   : 1
+  Retained via other provider  : 0
+  Duplicates deduplicated      : 3
+  Rejected / excluded records  : 35
+  Net count change             : +1
+  Final active total           : 542058
+  Verification status          : PASS
+  Duration                     : 18836 ms
+```
+
+Status inspection:
+```
+================================================================================
+                   RAXOSENTINEL INTELLIGENCE UPDATE STATUS                      
+================================================================================
+Current RSIDB Generation : phase2d7-unified-1793771916
+Previous Generation      : phase2d6-unified
+Last Update Run (UTC)    : 1793771916
+--------------------------------------------------------------------------------
+LAST UPDATE METRICS:
+  Target Generation            : phase2d7-unified-1793771916
+  Initial Active Indicators    : 542057
+  Gross Records Acquired       : 541992
+  Gross New Unique Records     : 2
+  Records Removed or Revoked   : 1
+  Retained via Other Provider  : 0
+  Duplicates Deduplicated      : 3
+  Rejected / Excluded Records  : 35
+  Net Count Change             : +1
+  Final Active Total           : 542058
+  Verification Status          : PASS
+  Pipeline Duration            : 18836 ms
+  Accounting Invariant Check   : VERIFIED OK (542058 = 542057 + 2 - 1)
+--------------------------------------------------------------------------------
+CONFIGURED INTELLIGENCE SOURCES:
+  Source: ClamAV [clamav]
+    Source Version       : main:63,daily:28174
+    Indicators Tracked   : 541954
+    Last Check (Unix)    : 1793771916
+    Last Import (Unix)   : 1793771916
+  Source: MalwareBazaar [malwarebazaar]
+    Source Version       : d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94
+    Indicators Tracked   : 104
+    Last Check (Unix)    : 1793771916
+    Last Import (Unix)   : 1793652171
+================================================================================
+```
+**Verification:**
+- Gross additions: **2** (correctly identified independently of net change)
+- Removals: **1** (correctly identified independently of net change)
+- Net change: **+1**
+- Accounting invariant: **VERIFIED OK**.
+
+---
+
+## 4. Rollback and Fail-Closed Verification
+
+Executed rollback:
+```bash
+$ raxosentinel db rollback --root /home/vscode/raxosentinel-test-2d7b
+Successfully rolled back active generation to 'phase2d6-unified'
+```
+Status confirmed:
+- `Current RSIDB Generation`: `phase2d6-unified` (542,057 indicators).
+- `Previous Generation`: `phase2d7-unified-1793771916` (542,058 indicators).
+- No indicators lost; rollback performed in < 2 ms.
+
+---
+
+## 5. Scheduler Readiness (systemd)
+
+Validated units in `docs/systemd/`:
+1. **Source Credentials**: Injected via `EnvironmentFile=-/etc/default/raxosentinel-update`.
+2. **Network Access**: `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` allows outbound Cloudflare CDN and Abuse.ch endpoints.
+3. **Storage Isolation**: `ReadWritePaths=/home/vscode/raxosentinel-private-phase2d1 /tmp`, `ProtectSystem=strict`, `ProtectHome=read-only`.
+4. **Advisory Locking**: `libc::flock(LOCK_EX | LOCK_NB)` on `updater.lock` prevents overlapping runs.
+5. **Fail-Closed Safety**: `StagingCleanup` and `UpdateLockGuard` drop handlers release all resources on success or failure. The active generation pointer `current` is swapped only after database verification succeeds.
+6. **Container Environment Note**: Systemd is not running as init (PID 1) in this Codespaces development container (`"systemd" is not running in this container due to its overhead`). Unit syntax was verified via `systemd-analyze verify`. As instructed, units have not been enabled on the production VPS.
+
+---
+
+## 6. Verification and Test Results
+
+- `cargo fmt --all -- --check`: **Clean** (0 formatting differences).
+- `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings**.
+- `cargo test --workspace`: **180 passed; 0 failed; 2 ignored**.
+  - All 16 updater scenarios passed, including:
+    - `test_14_accounting_invariant_and_retained_records`: PASSED
+    - `test_15_clamav_dual_database_independent_tracking_and_authentication`: PASSED
+    - `test_16_clamav_dns_txt_query_parser`: PASSED
+
+---
+
+## 7. Blockers & Next Actions
+
+- **Remaining Blockers**: None.
+- **Production Status**: Baseline active RSIDB remains untouched on `phase2d6-unified`. No production deployment or scheduler activation performed.
+- **Ready for Review**: Phase 2D.7B acceptance complete.

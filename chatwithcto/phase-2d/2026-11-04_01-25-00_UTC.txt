@@ -1,0 +1,196 @@
+# RaxoSentinel Phase 2D.7 — Automated Intelligence Updates Handover Report
+
+| Metric / Dimension | Specification / Observation |
+|---|---|
+| Phase Milestone | Phase 2D.7: Automated Intelligence Update Pipeline |
+| Git Branch | `phase-3b` |
+| Native Database Target | ONE Canonical RSIDB (`database.rsidb`) |
+| Supported Intelligence Sources | ClamAV (`main.cvd`, `daily.cvd`), MalwareBazaar (abuse.ch API / fixtures) |
+| Active Database Baseline | 542,057 unique indicators (`phase2d6-unified`) |
+| Update Pipeline Stages | SOURCE CHECK -> ACQUIRE -> VERIFY -> NORMALIZE -> VALIDATE -> RECONCILE -> BUILD -> VERIFY -> ACTIVATE |
+| Concurrency Control | Non-blocking advisory file lock (`updater.lock` via `libc::flock`) |
+| Replacement Mechanism | Atomic staging (`.staging-*`), `renameat2(RENAME_NOREPLACE)`, pointer swap (`current`) |
+| Rollback Mechanism | Instant atomic pointer reversion (`current` -> `previous`) via `db rollback` |
+| Anomaly Protection | Suspicious reduction threshold (default 20%) rejects mass deletion anomalies |
+| Multi-Source Reconciliation | Claim-based tracking; withdrawal by one source preserves indicator if claimed by another |
+| Unattended Scheduling | Native systemd service (`raxosentinel-update.service`) and jittered timer (`raxosentinel-update.timer`) |
+| Mandatory Test Scenarios | 13 of 13 passed (`rsidb::updater::tests`) |
+| Workspace Test Suite | 177 tests passed; 0 failed; 2 ignored (synthetic scale benchmarks) |
+| Clippy / Formatting | 0 warnings (`-D warnings`); `cargo fmt --all -- --check` clean |
+
+---
+
+## 1. Architectural Directive: ONE Unified RSIDB
+
+RaxoSentinel strictly enforces a single canonical runtime intelligence database: **RSIDB (`database.rsidb`)**.
+
+Third-party intelligence feeds—including ClamAV CVD distributions and MalwareBazaar dumps—are treated strictly as upstream intelligence feeds, never as independent runtime databases, secondary engines, or parallel scanner backends. Every imported indicator is validated, normalized, and unified into the native binary format:
+- MD5 (16 bytes)
+- SHA-1 (20 bytes)
+- SHA-256 (32 bytes)
+- Monotonically sorted with compact 2-byte prefix indexing and cryptographic provenance records.
+
+---
+
+## 2. Implemented Subsystems & Modules
+
+### 2.1 Provider Abstraction Framework (`crates/raxosentinel-signatures/src/rsidb/updater/traits.rs`)
+- Implemented `IntelligenceProvider` trait providing an extensible, source-independent interface:
+  - `check_for_updates(&self, current_state: Option<&ProviderState>) -> Result<UpdateCheckResult, UpdateError>`
+  - `acquire(&self, check: &UpdateCheckResult, staging_dir: &Path) -> Result<AcquisitionResult, UpdateError>`
+  - `extract_and_normalize(&self, acquisition: &AcquisitionResult) -> Result<ExtractedIntelligence, UpdateError>`
+- Implemented `ProviderState`, `UpdateCheckResult`, `AcquisitionResult`, `ExtractedIntelligence`, `NormalizedIndicator`, `RecordKey`, and `UpdateError`.
+- Bytecode safety invariant: Zero ClamAV bytecode signatures or executables are evaluated or executed.
+
+### 2.2 ClamAV Intelligence Provider (`.../providers/clamav.rs`)
+- CVD version tracking via header inspection (`main.cvd`, `daily.cvd`).
+- Hash-based extraction from whole-file `.hdb` and `.hsb` signature sets.
+- Exclusion enforcement: parses official `.fp` and `.sfp` false-positive hash files, and `.ign` / `.ign2` ignored signature names to discard revoked signatures.
+- Raw evidence preservation: captures CVD header metadata, file lists, and SHA-256 evidence digests.
+
+### 2.3 MalwareBazaar Intelligence Provider (`.../providers/malwarebazaar.rs`)
+- API and offline fixture ingestion support.
+- Incremental update tracking: detects when recent-record responses are identical and avoids redundant processing.
+- Multi-algorithm hash normalization and evidence metadata retention.
+
+### 2.4 Unified Update Engine (`crates/raxosentinel-signatures/src/rsidb/updater/engine.rs`)
+Executes the full 9-stage pipeline:
+1. **Advisory Lock Acquisition**: Obtains non-blocking `libc::flock(LOCK_EX | LOCK_NB)` on `updater.lock`. Returns `UpdateError::LockContention` if another updater is active.
+2. **Provider Update Checks**: Queries all active providers. If no updates are available and `--force` is false, exits cleanly without disk writes.
+3. **Acquisition & Upstream Integrity**: Downloads fresh payloads into an isolated staging location. Validates archive integrity.
+4. **Extraction & Exclusions**: Normalizes hashes, extracts file sizes, and applies provider exclusion lists.
+5. **Multi-Source Claim Reconciliation**:
+   - Maintains a claim map: `RecordKey -> BTreeSet<SourceId>`.
+   - Indicators claimed by multiple sources record all attributions.
+   - If Source A drops a signature but Source B still reports it, the signature remains active.
+6. **Mass Deletion Anomaly Review**:
+   - Calculates candidate active count vs current active count.
+   - If a reduction exceeds `anomaly_threshold_pct` (default: 20%), aborts with `UpdateError::SuspiciousReduction` to prevent corrupted upstream feeds from disarming the scanner.
+7. **Isolated Immutable Generation Build**:
+   - Compiles a complete native RSIDB (`database.rsidb`) and unified provenance manifests (`associations.json`, `registry.json`, `evidence-*.json`).
+8. **Strict Binary Verification**:
+   - Validates header magic, binary structure, record sorting, checksums, and representative lookups.
+9. **Atomic Pointer Activation & Rollback Preservation**:
+   - Publishes staging directory to immutable generation (`phase2d7-unified-<timestamp>`) via `renameat2(RENAME_NOREPLACE)`.
+   - Records current generation in `previous` pointer file.
+   - Atomically updates `current` pointer file.
+
+### 2.5 Dynamic Generation Resolution (`private_store.rs` & `unified.rs`)
+- Added `resolve_generation(root, gen)`:
+  - Specifying `--private-generation current` dynamically inspects the active pointer file `current` and transparently loads the active unified generation.
+  - Specifying explicit generation names (e.g., `phase2d6-unified`) continues to work identically for backward compatibility.
+
+### 2.6 CLI Subcommands (`crates/raxosentinel-cli/src/main.rs`)
+- `raxosentinel db update --check [--root <PATH>]`: Non-mutating status check against upstream feeds.
+- `raxosentinel db update --status [--root <PATH>]`: Formatted terminal inspection of current generation, rollback availability, and provider states.
+- `raxosentinel db update --apply [--root <PATH>] [--force]`: Executes the complete update engine pipeline.
+- `raxosentinel db rollback [--root <PATH>]`: Atomically swings `current` to `previous` generation.
+
+### 2.7 Production Unattended Scheduling & Hardening
+- `docs/systemd/raxosentinel-update.service`: Systemd oneshot service with strict Linux sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=true`, `RestrictRealtime=true`).
+- `docs/systemd/raxosentinel-update.timer`: Jittered timer (`OnCalendar=*-*-* 03:00:00 UTC`, `RandomizedDelaySec=1800`, `Persistent=true`).
+- `docs/AUTOMATED_UPDATES.md`: Comprehensive operator and architectural manual.
+
+---
+
+## 3. Mandatory Failure & Recovery Test Scenarios
+
+All 13 required test cases in `rsidb::updater::tests` pass with zero failures:
+
+| Test ID | Scenario Description | Result |
+|---|---|---|
+| `test_01` | Source publishing new indicators triggers update and compiles unified RSIDB | PASS |
+| `test_02` | Unchanged sources report no updates available; skips build cleanly | PASS |
+| `test_03` | Identical indicators from multiple sources are deduplicated into single RSIDB entry | PASS |
+| `test_04` | Revoked signature removed cleanly when permitted within anomaly threshold | PASS |
+| `test_05` | Source A removing indicator still supported by Source B retains indicator in RSIDB | PASS |
+| `test_06` | Corrupted source archive fails closed; active database untouched | PASS |
+| `test_07` | Interrupted or truncated download fails closed | PASS |
+| `test_08` | Interrupted database build fails closed; staging cleaned up | PASS |
+| `test_09` | Two updater processes executing simultaneously handle lock contention safely | PASS |
+| `test_10` | Failure during activation leaves active database completely unchanged | PASS |
+| `test_11` | Successful rollback atomically reverts active generation from `current` to `previous` | PASS |
+| `test_12` | Provider outage or rate limiting returns error without modifying active state | PASS |
+| `test_13` | Suspiciously large reduction (>20%) triggers anomaly review rejection | PASS |
+
+---
+
+## 4. Live Verification Against Private Intelligence Root
+
+Executed live verification on the persistent private store `/home/vscode/raxosentinel-private-phase2d1`:
+
+1. **Provider Update Check (`db update --check`):**
+   ```
+   Checking configured intelligence providers for updates...
+     [clamav] available=true: New ClamAV CVD distribution version available: cvd-41095a86da00
+     [malwarebazaar] available=true: New MalwareBazaar records available (version: d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94)
+   ```
+
+2. **Status Inspection (`db update --status`):**
+   ```
+   ================================================================================
+                      RAXOSENTINEL INTELLIGENCE UPDATE STATUS                      
+   ================================================================================
+   Current RSIDB Generation : phase2d6-unified
+   Previous Generation      : none
+   Last Update Run (UTC)    : never
+   --------------------------------------------------------------------------------
+   CONFIGURED INTELLIGENCE SOURCES:
+     Source: ClamAV [clamav]
+       Source Version       : 
+       Indicators Tracked   : 0
+       Last Check (Unix)    : 1793754046
+       Last Import (Unix)   : 0
+     Source: MalwareBazaar [malwarebazaar]
+       Source Version       : 
+       Indicators Tracked   : 0
+       Last Check (Unix)    : 1793754046
+       Last Import (Unix)   : 0
+   ================================================================================
+   ```
+
+3. **Live Scanner Dynamic Pointer Resolution (`scan --private-generation current`):**
+   ```
+   Target Path      : Cargo.toml
+   File Size        : 1238 bytes
+   Scan Duration    : 39 ms
+   Overall Status   : [ CLEAN ]
+   ```
+   Verified that the scanner successfully resolved `current` -> `phase2d6-unified`, validated evidence and manifests for 542,057 indicators in 39 ms, and executed the scan cleanly.
+
+4. **Rollback Guard Check (`db rollback`):**
+   ```
+   Rollback failed: No previous generation pointer found
+   ```
+   Properly blocked rollback attempt when no prior generation exists.
+
+---
+
+## 5. Resumption & Operator Instructions
+
+To resume or execute automated intelligence tasks in the Codespace:
+
+1. **Inspect status:**
+   ```bash
+   cargo run -p raxosentinel-cli -- db update --status --root /home/vscode/raxosentinel-private-phase2d1
+   ```
+
+2. **Perform dry-run check:**
+   ```bash
+   cargo run -p raxosentinel-cli -- db update --check --root /home/vscode/raxosentinel-private-phase2d1
+   ```
+
+3. **Run automated update:**
+   ```bash
+   cargo run -p raxosentinel-cli -- db update --apply --root /home/vscode/raxosentinel-private-phase2d1
+   ```
+
+4. **Execute rollback if needed:**
+   ```bash
+   cargo run -p raxosentinel-cli -- db rollback --root /home/vscode/raxosentinel-private-phase2d1
+   ```
+
+5. **Run test suite:**
+   ```bash
+   cargo test --workspace
+   ```

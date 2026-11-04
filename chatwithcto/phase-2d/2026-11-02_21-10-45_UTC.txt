@@ -1,0 +1,63 @@
+RaxoSentinel Phase 2D.5 handover — 2026-11-02 UTC
+
+1. Executive summary
+History-aware merging, new acquisition-event identities, synthetic scalability measurements, publication fault coverage and an independent release-approval signature have been implemented. Baseline was phase-2d at dc377f891e39fce33c2a3da39628d809ba29d397; final commit is 3840b219596376de741bf307163222c56e9c8119 on phase-2d. No production service, mail system, public intelligence distribution, remote-update server, production key, push or merge was touched. This remains research/prototype work and is not production-ready.
+
+2. History-aware merge
+The existing merge-private operation now verifies and combines legacy single-source, v1 multi-source and v2 acquisition-history inputs into a new immutable v2 generation. It unions distinct source IDs and acquisition IDs, retains each exact evidence response, rebuilds source associations from evidence, deduplicates operational hashes and quarantines conflicting file sizes. Absence from a recent response does not withdraw prior indicators. The existing descriptor-relative staging, file sync, staged validation, directory sync, no-replace rename and containing-directory sync are retained.
+
+New single-source acquisitions carry a random 128-bit event nonce in the local acquisition manifest. The v2 acquisition ID incorporates that nonce, source ID, timestamp and evidence digest, allowing independently published identical responses in the same second to remain distinct events. Existing manifests without a nonce and existing v2 acquisition IDs remain compatible; events that were already indistinguishable in the old format cannot be retroactively separated. Nonces and local hashes are not provider signatures. Synthetic tests merge mixed v1/v2 histories, preserve two same-second identical acquisitions, retain cross-source associations, and avoid duplicated scanner records.
+
+3. Compatibility
+Baseline cargo test --workspace passed: 113 passed, 0 failed, 0 ignored. After the changes, the previously preserved genuine Phase 2D.4 history loaded and inspected successfully with 104 unique indicators and two acquisitions; no acquisition or evidence was changed. Existing private v1/v2 generations remain supported. The public-release prototype scanner now additionally requires a separately trusted reviewer key, approval.json and approval.sig; prior prototype signed packages without independent approval fail closed and need a fresh review/approval. This is an intentional prototype compatibility change, not a public release.
+
+4. Synthetic release-mode scalability results
+All records below are generated synthetic fixtures, not MalwareBazaar or genuine indicators. One source uses 100-record evidence acquisitions. Each row is one local run. RSIDB compilation is timed separately after fixture parsing, using the same operational records and directory threshold; build/publish additionally includes history construction, staged verification, private-file I/O and synchronization. Verification/load is the complete strict history path. Lookups are 100,000 pre-hashed operations per direction. Refresh and merge include verification and new immutable publication. Results can be affected by host load, caching, filesystem and competing test activity; they are not production capacity claims.
+
+records | RSIDB bytes | registry bytes | associations bytes | evidence bytes
+1,000   | 44,405      | 3,949          | 177,921            | 165,193
+10,000  | 440,405     | 34,463         | 1,788,922          | 1,661,894
+100,000 | 5,186,849   | 340,467        | 17,988,923         | 16,718,895
+
+records | RSIDB compile ms | build/publish ms | strict verify/load ms | positive lookups/s | negative lookups/s | refresh ms | merge ms
+1,000   | 0.530            | 76.056           | 18.362                | 5,574,548          | 9,373,428          | 74.802     | 79.920
+10,000  | 6.683            | 490.781          | 183.357               | 1,765,539          | 2,574,632          | 628.569    | 546.952
+100,000 | 90.460           | 5,793.293        | 2,762.382             | 1,938,276          | 3,067,861          | 13,017.605 | 14,042.650
+
+The test-only reproducible harness is synthetic_history_scale_benchmark, run with RAXO_SYNTH_COUNT=1000, 10000 or 100000 and cargo test --release -p raxosentinel-signatures synthetic_history_scale_benchmark -- --ignored --nocapture. An additional rsidb_scale_benchmark binary measures only synthetic operational RSIDB compilation and structural loading; it does not represent a verified history.
+
+5. Memory and bottlenecks
+A separate 100,000-record full synthetic benchmark run measured 420,800 KiB peak process RSS using OS child-process accounting. That peak includes fixture generation, source evidence, index compilation, validation, refresh, merge, allocator retention and test harness; it is NOT incremental database memory. Incremental database memory was not reliably isolated. The measured association JSON (17,988,923 bytes) exceeded the RSIDB size (5,186,849 bytes), and the full verification/refresh path retains and reprocesses evidence. The former per-record JSON serialize-and-reparse loop was removed: the same source validation now parses each response once while retaining distinct size/family claims. No controlled before/after timing isolates that optimization. The v2 history limit was raised to a maximum of 2,048 total acquisitions, 256 MiB aggregate evidence and 64 MiB registry/association files; these remain finite safety limits, not capacity guarantees. Larger or more diverse datasets require further measured work.
+
+6. Fault and corruption results
+Synthetic tests cover partial writes, file-sync and staging-directory-sync failures, failed rename, existing destination names and a post-rename root-sync failure that reports uncertain durability. The prior valid generation remains usable. Other tests reject missing evidence, damaged registry, damaged associations, corrupted historical acquisition and invalid inputs before scanner use or merge; interrupted staging is reported and left untouched. An integration test confirms a corrupted v2 registry causes an actual scanner database-load error. These are injected failures and process-level checks, not proof of real power-loss durability or coverage of every filesystem failure.
+
+7. Cryptographic trust, licensing and TUF review
+A valid Ed25519 signature demonstrates that the holder of a trusted release-signing key signed the exact canonical manifest; it does not establish the identity or authenticity of unsigned upstream data, malware classification, or legal rights. The prototype now also requires approval.json and a raw 64-byte approval.sig signed by a DISTINCT trusted reviewer key over the exact manifest digest. The public scanner takes --public-approval-key alongside --public-key and rejects missing/forged approval, the same key in both roles, and a re-signed local metadata edit without renewed approval. Signature-only verification is internal and no longer an externally exposed public-release acceptance API. Existing known private MalwareBazaar source is still blocked. There is no claim that two keys alone establish organizational independence: an operator controlling both trust anchors can bypass intended separation, and a reviewer can make a mistaken legal assertion. No cryptographic mechanism can infer legal rights or malware truth from a hash alone.
+
+Proposed process: maintain independently controlled evidence for each source's provider, acquisition, license or written grant, allowed derivatives, redistribution scope, reviewer, date and expiry. A reviewer separate from the release signer checks the exact source/artifact set and signs its manifest digest; any change requires renewed review. The signer signs only that approved release. Reviewer and signer keys must be bootstrapped independently and held outside Codespaces, CI and the repository. Revocation, organizational controls and approval-record governance are not implemented.
+
+TUF separates root, targets, snapshot and timestamp roles, supports delegated trust and signed metadata expiry, and should be evaluated for future secure updates and key rotation: https://theupdateframework.io/docs/metadata/ and https://theupdateframework.io/spec/ . The rust-tuf project describes its implementation as beta and its API as unstable: https://github.com/theupdateframework/rust-tuf . This prototype is not TUF, does not implement key revocation/rotation, threshold trust, remote update, or atomic release activation. Trusted local rollback state, external trust anchors and a trustworthy clock remain required; compromise or reset limits protection. No production keys were generated.
+
+8. Final tests
+cargo fmt --all -- --check: PASS.
+cargo clippy --workspace --all-targets -- -D warnings: PASS.
+cargo test --workspace: PASS, 116 passed, 0 failed, 1 intentionally ignored benchmark, across 20 result groups. The ignored synthetic history benchmark was run separately in release mode at all three requested sizes. Baseline before implementation: 113 passed, 0 failed. Tests use synthetic records and ephemeral in-memory test keys only.
+
+9. Files changed
+crates/raxosentinel-signatures/src/rsidb/malwarebazaar.rs: single-pass validated history parsing.
+crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store.rs: random acquisition event nonce.
+crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/multi.rs and multi/history.rs: history-aware merge, bounded limits, tests, fault injection and synthetic scale harness.
+crates/raxosentinel-signatures/src/rsidb/public_release.rs: separate reviewer approval verification.
+crates/raxosentinel-cli/src/main.rs and tests/private_scanner.rs, tests/public_scanner.rs: explicit reviewer trust, scanner corruption and approval tests.
+crates/raxosentinel-cli/src/bin/rsidb_scale_benchmark.rs: synthetic operational index benchmark.
+docs/private-intelligence.md and docs/public-release-prototype.md: history compatibility and proposed source-approval process.
+
+10. Git and private data
+Commit 3840b219596376de741bf307163222c56e9c8119 on phase-2d. Staged source reviewed for obvious credentials and private response data; no private intelligence or production key was committed. Earlier chatwithcto reports remain untracked and preserved. No push or merge.
+
+11. Unresolved limitations
+The measured 100,000-record fixture is not a production workload. Incremental DB memory and true power-loss durability were not measured. Association JSON and repeated full evidence validation remain substantial; storage, memory and refresh costs need profiling across realistic shapes and sources. Historical acquisitions lacking nonce cannot be retroactively distinguished. The only genuine source adapter remains MalwareBazaar; synthetic adapters are test-only. Independent reviewer approval is a trusted attestation, not proof of actual redistribution rights; relabelled data or compromised/replaced trust anchors require governance and independent review. The public prototype has no TUF interoperability, key rotation/revocation or secure remote update and must not be distributed as production-ready.
+
+12. Next CTO decision
+Decide whether to commission a separate TUF-based update and independently governed source-rights approval phase, together with larger-scale memory/association profiling and filesystem crash testing. Do not approve public intelligence distribution or production deployment on these results alone.

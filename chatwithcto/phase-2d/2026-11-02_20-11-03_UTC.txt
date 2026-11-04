@@ -1,0 +1,49 @@
+RaxoSentinel Phase 2D.3 handover — 2026-11-02 UTC
+
+Status: PARTIAL. The requested multi-source architecture is NOT implemented. The commit adds evidence-validated single-source inspection only. Do not treat this as completion of the directive or as support for independent feeds.
+
+1. Implemented architecture
+The existing Phase 2D.2 private-generation reader is reused. The inspection path opens the database and its evidence relative to the private generation's directory descriptor, validates the exact owned RSIDB bytes and evidence with the existing strict verifier, then derives a source summary and indicator details from that verified response. Existing scanner lookup, private publication and generation format are unchanged. Inspection performs verification once per command and does not add work to scanner lookups.
+
+2. Source registry schema
+There is no durable multi-source registry. The read-only SourceInspection JSON view contains id, name, provider, acquisition_method, acquired_unix_seconds, last_successful_import_unix_seconds, classification, provenance_status, redistribution, enabled and indicator_count. The only supported source is hard-coded as malwarebazaar. Enabled means the source is included in this immutable generation; there is no configurable source status. Timestamps are values recorded in the local manifest, not independently signed attestations. This view is regenerated from existing files and is not a persistent registry.
+
+3. Indicator association
+The inspection view associates each accepted parsed indicator with malwarebazaar after verifying its evidence digest and database correspondence. It reports SHA-256, file size, source ID, acquisition time, upstream first-seen time, upstream family and qualification of classification and redistribution. The provider is not inferred from reporter or family. This is a derived single-source association, not a persisted per-indicator association table and not multi-source attribution.
+
+4. Source addition/removal workflow
+NOT IMPLEMENTED: approved source configuration, adding independent sources, importing or refreshing a selected source, disabling a source, rebuilding a generation without a source, and source-aware removal. Existing Phase 2D.2 acquisition/publishing remains available for its existing single-source workflow. No published generation was edited.
+
+5. Multi-source deduplication
+NOT IMPLEMENTED. The existing importer handles duplicate records within its one response, but there is no cross-source union, association table or conflict detection. Identical hashes from two independent sources cannot currently be represented with correct multi-source attribution. No claim is made for source removal preserving another contributor.
+
+6. Security and provenance
+Inspection requires the existing private root ownership, permissions and no-symlink rules and strict structural, checksum, evidence digest, bounded parsing and record/name correspondence validation. Missing or corrupt evidence causes an error. The source identifier comes from the code's existing fixed MalwareBazaar verification path, not an arbitrary user-provided label. A local digest verifies consistency only; it is not a provider-issued cryptographic signature and does not independently certify authentic acquisition, malware classification, or redistribution permission. The 2D.2 publish API accepts supplied response bytes, so a locally fabricated consistent response is not excluded by cryptographic source authentication; the inspection output explicitly says no provider signature. No new trust assertion is introduced.
+
+7. CLI examples
+  cargo run --release -p raxosentinel-cli --bin raxosentinel -- db sources --root /home/USER/raxosentinel-private --generation GENERATION
+  cargo run --release -p raxosentinel-cli --bin raxosentinel -- db indicator --root /home/USER/raxosentinel-private --generation GENERATION SHA256_HEX
+The commands return JSON and must be used only in a private environment. An absent hash returns an empty list. Malformed hash returns exit 2; failed validation returns exit 3. Results are derived from the single accepted source; no genuine-versus-synthetic determination can be established from these local bytes alone.
+
+8. Compatibility
+Existing Phase 2D.2 generations remain readable without conversion. Existing strict scanner loading and publication are unchanged. Earlier reports remain untracked and preserved. Existing genuine evidence and both earlier database generations remain in the owner-controlled private directory outside the checkout.
+
+9. Tests and measurements
+cargo fmt --all -- --check: PASS.
+cargo clippy --workspace --all-targets -- -D warnings: PASS.
+cargo test --workspace: PASS; 102 passed, 0 failed, 0 ignored across 17 result groups.
+Synthetic tests validate source and indicator inspection, label display, strict scanner detection, and rejection of missing/corrupt evidence. Existing tests cover duplicate/invalid single-source inputs and 2D.2 compatibility. Required multi-source tests for overlapping sources, source-specific conflicts and removal, invalid source identifiers, and tampered multi-source associations are NOT implemented because the required multi-source format and operations do not exist.
+
+Release measurement, genuine retained generation: 100 accepted indicators; 21 warm-cache samples, inspection command including process launch and full evidence verification, private stdout discarded: median 4.187 ms, min 4.043 ms, max 8.929 ms. Reproduce with:
+  cargo build --release -p raxosentinel-cli --bin raxosentinel
+  python3 crates/raxosentinel-cli/benches/private_source_inspection.py target/release/raxosentinel /home/USER/raxosentinel-private GENERATION 21
+This is a small local sample, not a production benchmark. No extra on-disk registry or association data was added, so the existing generation sizes and scanner lookup code are unchanged; no independent before/after lookup throughput measurement was performed. Inspection adds its own startup/verification/parsing cost. No synthetic performance figures are presented.
+
+10. Git
+Branch phase-2d. Commit 9d0acf37ea58629a308736ff54c7b1113f98b402, parent bb30e3837278136fb5b14d76e31e6be7dee7d277. Changes: private_store.rs inspection, CLI source/indicator commands, synthetic scanner integration coverage, documented usage and benchmark script. Staged changes were reviewed for obvious credentials and private intelligence; no raw data or private database was staged. No push or merge; no production infrastructure changes.
+
+11. Remaining limitations
+Phase 2D.3 is incomplete: persistent registry, multiple independent adapters/evidence files, compact source associations, deduplicated multi-source scanner entries, source-specific conflict handling, source updates/removal and their mandatory tests are absent. The locally calculated digest and hard-coded source label do not prove provider authenticity. Source authenticity and redistribution require independently supported evidence/policy. Do not publish private intelligence. No new acquisition or malware binary download was performed.
+
+12. Next CTO decision
+Multi-source requirements remain outstanding and need implementation and security review before this phase can be accepted. Define and validate source-specific acquisition adapters and an evidence-bound multi-source generation representation, including how conflicts in file size affect exact-match scanning; preserve existing private generations during migration.

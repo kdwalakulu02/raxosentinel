@@ -1,0 +1,91 @@
+# RaxoSentinel Phase 3B.3R Remediations — Completion Report
+
+**Date:** 2026-11-03 17:20:27 UTC
+**Baseline:** `phase-3b` commit `1e77ba04a2dbfb4cc9b83ba376ba05d487d7146d`
+**Commit:** `0d2bf2f`
+**Status:** ALL REMEDIATIONS COMPLETE & VERIFIED
+
+---
+
+## 1. Executive Summary
+
+This targeted security remediation pass directly resolves the three vulnerabilities identified in the independent CTO audit:
+
+1. **HIGH-01 (Total Request Monotonic Framing Deadline):** Replaced per-syscall inactivity timeout with a single monotonic request framing deadline in `recv_fd_request`. Drip-feed byte transmissions can no longer keep worker or queue slots alive indefinitely; once the deadline expires, all descriptors are closed, an ERROR response is returned, and worker capacity is released.
+2. **MEDIUM-01 (Global Snapshot Budget Enforcement During Copying):** Introduced `SnapshotBudget` trait and pre-allocation checks into `sealed_snapshot_with_budget`. File growth during copying is checked *before* allocating additional memory into anonymous `memfd` storage. All saturating arithmetic has been eliminated in favor of checked bounds. Oversized growth is rejected, and all reservations are safely freed on error, timeout, crash, or completion.
+3. **MEDIUM-02 (Strict RFC 2046 MIME Boundary-Line Validation):** Replaced unanchored substring search with RFC 2046 boundary-line validation. Delimiter lines are recognized strictly at line beginnings (`\n` or `\r`), followed by optional linear whitespace and valid line terminators. Delimiter strings appearing merely inside ordinary part content are rejected. Nested multiparts are fully validated hierarchically. Truncated or malformed boundaries produce `ScanStatus::Unsupported` (Coordinator `UNSCANNED`) or `Failed` (`ERROR`).
+
+---
+
+## 2. Detailed Root Cause Analysis & Changes
+
+### FIX 1: HIGH-01 — Total Client Request Deadline
+- **Root Cause:** `stream.set_read_timeout(Some(Duration::from_secs(client_timeout_secs)))` set socket option `SO_RCVTIMEO` once. A slow client sending 1 byte every N seconds (where N < timeout) reset the timer on each syscall, holding a coordinator worker thread indefinitely (e.g. up to ~72 hours for 64 KB).
+- **Implementation:**
+  - `recv_fd_request(stream: &mut UnixStream, deadline: Instant)` now takes a monotonic deadline computed at connection admission.
+  - Before `libc::recvmsg` and before each `stream.read` in the framing loops, remaining time is checked:
+    `let remaining = deadline.checked_duration_since(Instant::now())`.
+    If zero or expired, returns `Err("Client request deadline exceeded".into())`.
+  - The socket timeout is updated to `remaining`. If any read returns `WouldBlock` or `TimedOut`, it immediately fails closed, closes all passed file descriptors via `close_all`, and returns the deadline error.
+  - In `handle_client_connection`, failure immediately returns an `ERROR` response and returns, releasing the active worker and pending queue slots.
+
+### FIX 2: MEDIUM-01 — Global Snapshot Budget Enforcement
+- **Root Cause:** Initial reservation in `SnapshotReservation::new` used `fstat` on admission. If the source file grew concurrently during copying, `sealed_snapshot` copied up to `max_size` (50 MB) without checking `max_total_snapshot_bytes`. Afterwards, `reservation.update` used `saturating_add`, which concealed that the global memory budget was exceeded.
+- **Implementation:**
+  - Defined `pub trait SnapshotBudget` with `ensure_capacity(&mut self, new_total: u64) -> Result<(), String>` and `finalize(&mut self, final_total: u64)`.
+  - Implemented `SnapshotBudget` for `SnapshotReservation` using checked arithmetic (`checked_add`, `checked_sub`).
+  - Implemented `sealed_snapshot_with_budget` in `crates/raxosentinel-cli/src/supervised.rs`. In every read chunk loop, before copying bytes into `memfd`, `budget.ensure_capacity(new_total)?` is invoked. If the file grows beyond the coordinator snapshot budget, the copy immediately aborts before memory allocation.
+  - `Drop` for `SnapshotReservation` decrements `in_flight_snapshot_bytes` and notifies the condvar, ensuring recovery on all failure paths.
+
+### FIX 3: MEDIUM-02 — Strict RFC 2046 MIME Boundary Validation
+- **Root Cause:** `validate_mime_boundaries` used `bytes_contains(raw_bytes, close_delim.as_bytes())`, an unanchored substring search. If ordinary body text or an attachment contained `--boundary--` anywhere, it was accepted as a valid closing boundary even if truncated or corrupted.
+- **Implementation:**
+  - Implemented `find_boundary_lines(raw_bytes: &[u8], boundary: &str) -> (Vec<usize>, Vec<usize>)`. Validates line start (`i == 0 || raw_bytes[i-1] == b'\n' || raw_bytes[i-1] == b'\r'`), delimiter string (`--boundary` or `--boundary--`), optional linear whitespace (`[ \t]*`), and valid line ending (`\r\n`, `\n`, `\r`, or EOF).
+  - Validates that closing delimiters do not fall within the body spans of leaf parts (`offset_body <= pos < offset_end`).
+  - Enforces that the container's closing boundary occurs at or after all child parts belonging to that container (`pos >= max_child_end`).
+  - Enforces that no opening delimiters or body parts start after the container's closing boundary.
+  - Recursively validates nested multipart sub-structures (`part.offset_header() > 0 && is_multipart_part(part)`).
+
+---
+
+## 3. Test Verification & Results
+
+### Fix 1 Deterministic Integration Test
+- `test_slow_partial_request_overall_deadline_exceeded`: Spawns coordinator with `--client-timeout-secs=1`. A client transmits 1 byte every 120ms (well below the 1000ms inactivity timeout). After ~1.08s, the monotonic framing deadline triggers, coordinator terminates the request with error, and releases worker capacity. A subsequent scan immediately succeeds with `CLEAN`.
+
+### Fix 2 Deterministic Integration & Unit Tests
+- `test_snapshot_reservation_accounting_and_lifecycle`: Unit test verifying initial reservation, incremental growth, budget limit rejection, finalization downwards, and drop release.
+- `test_sealed_snapshot_with_budget_enforces_limit_during_copy`: Unit test verifying that copying a 150 KB growing file with a 100 KB budget fails during copying and restores `in_flight_snapshot_bytes` to 0.
+- `test_snapshot_budget_exhaustion_across_multiple_scans_and_recovery`: Integration test where active scan holds 20 KB of 30 KB budget; second scan requesting 15 KB is promptly rejected with `BUSY`; after first scan finishes, third scan succeeds `CLEAN`.
+- `test_concurrent_file_growth_exceeding_budget`: Integration test where growing file exceeding budget is rejected and subsequent scan recovers cleanly.
+
+### Fix 3 Deterministic Tests
+- `test_valid_multipart_message`: Valid multipart message passes with `CLEAN`.
+- `test_missing_closing_boundary`: Message missing closing boundary fails with `Unsupported` / `UNSCANNED`.
+- `test_closing_delimiter_embedded_inside_body`: Substring embedded in ordinary part content rejected; produces `Unsupported`.
+- `test_nested_multipart_message`: Valid nested multipart passes `CLEAN`; missing inner delimiter produces `Unsupported`.
+- `test_truncated_final_attachment`: Truncated final attachment fails with `Unsupported`.
+- `test_valid_crlf_formatting`: RFC 2046 compliant CRLF formatting with linear whitespace passes `CLEAN`.
+- `test_zip_attachment_detection_preserved`: Multipart email containing a ZIP attachment with an EICAR test signature is extracted and detected as `Infected`.
+
+### Overall Workspace Test Results
+```text
+running 8 tests in src/main.rs: 8 passed; 0 failed
+running 22 tests in tests/coordinator.rs: 22 passed; 0 failed
+running 25 tests in tests/integration_test.rs: 25 passed; 0 failed
+running 1 test in tests/malwarebazaar_import.rs: 1 passed; 0 failed
+running 1 test in tests/phase3a_corpus.rs: 1 passed; 0 failed
+running 1 test in tests/private_scanner.rs: 1 passed; 0 failed
+running 1 test in tests/public_scanner.rs: 1 passed; 0 failed
+running 9 tests in tests/supervised.rs: 9 passed; 0 failed
+running 9 tests in crates/raxosentinel-core: 9 passed; 0 failed
+running 27 tests in crates/raxosentinel-email: 27 passed; 0 failed
+running 9 tests in crates/raxosentinel-filetypes: 9 passed; 0 failed
+running 50 tests in crates/raxosentinel-signatures: 50 passed; 0 failed
+
+Total Active Tests: 163 passed, 0 failed, 2 ignored (scale benchmarks)
+Clippy: 0 warnings (-D warnings)
+Rustfmt: Clean
+```
+
+Commit: `0d2bf2f` on branch `phase-3b`.

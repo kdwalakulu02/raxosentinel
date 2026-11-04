@@ -1,0 +1,56 @@
+RaxoSentinel Phase 2D.2 handover
+2026-11-02 19:53 UTC
+
+Executive summary
+The private MalwareBazaar workflow now publishes complete private generations and requires evidence verification at the scanner boundary. It loads the same validated owned database bytes used for scanning. The existing live Phase 2D.1 database/evidence pair was preserved and verified outside the checkout; no new API acquisition or malware download occurred. Source commit: bb30e3837278136fb5b14d76e31e6be7dee7d277 on phase-2d. No push, merge, intelligence publication or production infrastructure changes.
+
+Scanner policy and commands
+Create a 0700 owner-controlled private root in a trusted parent, outside the checkout. Example:
+  install -d -m 700 /home/USER/raxosentinel-private
+Acquire and publish one metadata-only generation:
+  cargo run --release -p raxosentinel-cli --bin malwarebazaar_import -- /home/USER/raxosentinel-private GENERATION
+This requires RAXO_ABUSECH_AUTH_KEY; it was not used for this phase. Scan strictly:
+  cargo run --release -p raxosentinel-cli --bin raxosentinel -- scan FILE --private-db-root /home/USER/raxosentinel-private --private-generation GENERATION
+Generation names accept letters, digits, hyphens and underscores. At startup the scanner reports ambiguous staging entries, opens and validates a named generation, checks the RSIDB structure and payload checksum, requires the supported acquisition manifest, hashes and bounds/parses evidence, and checks count and indicator/name correspondence. Missing, corrupted, unsupported or mismatched evidence causes exit code 3 before scanning; deleting the manifest cannot select a weaker policy. Evidence verification is once per loaded index, not per lookup.
+
+--db and --db-store remain explicit legacy/release workflows and warn that private acquisition evidence was not verified; they do not claim verified acquisition. There is no private-generation hot reload in this one-shot scanner. A failed later load leaves an already returned validated instance usable; there is no automatic private fallback. Existing legacy store behavior remains separate.
+
+Threat model and mmap review
+Supported: Linux with an owner-controlled absolute private root, 0700 directories, 0600 regular single-link files, ownership matching the effective user, openat2 and renameat2(RENAME_NOREPLACE), /proc, and a same-filesystem implementation supporting directory fsync and atomic directory rename. Root acquisition uses openat2 with no symlinks or magic links; generation/file creation, opening and cleanup are relative to opened directory descriptors, with final-component no-follow. Traversal and unsafe permissions are rejected. Failures of required kernel/filesystem operations are explicit.
+
+The owning account and root are trusted. This does not protect against their compromise, an adversary able to replace both evidence and DB consistently, or filesystem/kernel behavior outside the stated assumptions. Local SHA-256 links evidence to the manifest; it is not a MalwareBazaar signature. HTTPS acquisition context, upstream malware classification, database integrity and redistribution permission are separate matters; redistribution remains unverified and intelligence must remain private.
+
+The previous mmap constructors could not establish immutable backing files for arbitrary paths. Both historical Mmap*Index constructors now read validated owned bytes despite retaining their public names. Strict private scanning also uses owned bytes. This avoids mutable mapping and truncation hazards at the expense of potentially higher memory usage and different legacy benchmark behavior; no incremental memory benchmark was performed. The directory threshold remains unchanged.
+
+Publication and recovery
+The importer writes exact raw evidence and its compiled RSIDB into a new private staging directory, syncs each file, syncs the staging directory, performs a same-filesystem no-replace directory rename, then syncs the containing root. The publication is a directory rename, not two independent file renames. Existing generation names cannot be overwritten. The supported update path publishes new names and never mutates a published generation. Root-sync failure after rename explicitly reports that a complete generation may be visible but durability is uncertain.
+
+Ordinary pre-publication failures attempt descriptor-anchored cleanup of the two known files and staging directory. A crash or cleanup failure may leave a .staging-* entry. Such entries cannot be selected as generations, are reported on scanner startup, and are not automatically deleted. Inspect ownership, contents and active processes before manual cleanup. The implementation ignores cleanup syscall errors; a leftover is reported on subsequent inspection rather than guaranteed removed. It does not automatically recover or garbage-collect ambiguous leftovers.
+
+Regression and verification
+Final cargo fmt --all -- --check: PASS.
+Final cargo clippy --workspace --all-targets -- -D warnings: PASS.
+Final cargo test --workspace: PASS, 102 passed, 0 failed, 0 ignored across 17 test/doc-test result groups.
+Focused tests use explicitly synthetic fixtures. They cover strict successful loading and exact/negative/wrong-size lookup, corruption/absence, a different DB with a recomputed internal checksum, removed manifest, parent/final symlinks, traversal, permissions, existing destination, two competing publishers, and retention of an earlier owned valid index. A scanner process test detects a synthetic target and rejects missing evidence with a load error. Existing workspace tests exercise legacy formats. Controlled injected failures cover partial writes, file-sync boundaries, staging sync, publication rename, and a post-rename root-sync failure; an orphan staging entry is reported and preserved. These are simulated failures, not actual power-loss or process-termination durability proof. Tests do not exhaust every filesystem, syscall error or concurrent filesystem race.
+
+Genuine versus synthetic data
+The original genuine Phase 2D.1 pair survived in /tmp. It was copied unchanged to /home/vscode/raxosentinel-private-phase2d1, a 0700 directory outside Git, and verified. The pair contains 100 accepted upstream records and exact original response evidence. A new private generation genuine-2d2 was generated from that verified response and its original acquisition timestamp; the original pair was retained. This is a new compilation from the same evidence, not the original historical RSIDB file. No API call was made in this phase. Synthetic test indicators are fixtures only and are not genuine intelligence.
+
+Release loading measurements
+Command, using the preserved genuine 100-record generation:
+  cargo run --release -p raxosentinel-cli --bin private_generation_benchmark -- /home/vscode/raxosentinel-private-phase2d1 genuine-2d2 21
+21 repeated warm-cache loads, microseconds, median (minimum–maximum): database read and RSIDB validation 44 (41–878); evidence read, digest, bounded parsing and correspondence verification 3,183 (1,536–14,577); total scanner-style staging inspection and verified load 4,021 (2,168–20,883). The timing is a local small-sample measurement and includes neither process launch nor target scan. It is not a production capacity claim; cache was not flushed. No synthetic performance result or incremental memory result is claimed. Reproducible benchmark and synthetic fixture-generation code are retained in source. Migration can be reproduced with the documented optional legacy DB argument; it verifies the original pair first.
+
+Files changed
+crates/raxosentinel-signatures/src/rsidb/malwarebazaar.rs and malwarebazaar/private_store.rs: strict validation and descriptor-anchored publication/load.
+crates/raxosentinel-signatures/src/rsidb/mmap_sorted.rs and mmap_compact_dir.rs: owned buffer constructors.
+crates/raxosentinel-cli/src/main.rs and src/bin/malwarebazaar_import.rs: scanner policy and new publication CLI.
+crates/raxosentinel-cli/src/bin/private_generation_benchmark.rs and rsidb_benchmark.rs: complete-load timing and removal of stale mmap claims.
+crates/raxosentinel-cli/tests/private_scanner.rs and tests/malwarebazaar_import.rs: scanner and updated importer regression.
+docs/private-intelligence.md: usage, threat model and recovery.
+
+Outstanding limitations / unmet acceptance criteria
+No actual power-loss durability or kill-at-every-boundary test was performed. Fault injection simulates write/sync/rename failures and does not establish guarantees for untested filesystems. Cleanup syscall failures are not individually returned; later inspection reports leftover staging entries. Private hot reload was not added because no such private reload path existed; a later load does not mutate an already returned index. Strict verification is selected externally by the private CLI options; explicitly selecting legacy --db or --db-store is unverified. No synthetic load-performance measurement was run. These limits should be addressed before expanding the threat model or making production performance claims.
+
+Next CTO decision
+Decide whether private generation activation/hot reload and verified fallback are needed for a future long-running scanner, and whether to commission crash/power-loss and filesystem-specific durability testing. Retain private research handling until redistribution permission is established.

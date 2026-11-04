@@ -1,0 +1,19 @@
+RaxoSentinel Phase 3B — incomplete baseline assessment
+
+Status: NOT IMPLEMENTED. Do not deploy this as Phase 3B. Branch phase-3b was created at Phase 3A commit f55a3c1f31354ec2562ab038f7143e4cb683a402. No Phase 3B implementation commit exists.
+
+Architecture and security boundaries: The existing CLI loads and verifies the selected private generation or signed public release separately for each CLI invocation. It does not provide a persistent coordinator, Unix socket, peer authentication, bounded queue, isolated workers, or atomic live generation replacement. Existing legacy database options have different trust properties and must not be treated as verified private or signed-public paths.
+
+Resource enforcement and file handling: Existing scan limits are cooperative and do not provide a coordinator-enforced wall-clock deadline or an OS-enforced worker memory limit. The CLI checks path metadata before independently identifying and opening the path; path replacement between those operations remains a TOCTOU risk. No descriptor-based protocol or worker filesystem isolation has been implemented.
+
+Verdicts: Existing verdicts are CLEAN, DETECTED, UNSCANNED, and ERROR. CLEAN is not a guarantee of safety. Existing tests cover some partial email and archive cases; these do not validate the requested service architecture.
+
+Checks on the unchanged baseline: cargo fmt --all -- --check passed; cargo clippy --workspace --all-targets -- -D warnings passed; cargo test --workspace passed with one existing ignored scale benchmark. These are baseline results, not Phase 3B acceptance tests. The mandatory service, concurrency, overload, worker failure, live replacement, and shutdown integration tests have not been implemented or run.
+
+Benchmarks: No Phase 3B measurements were taken. Verification and load time, warm latency, throughput, coordinator and worker peak RSS, four- and eight-request concurrency, timeout recovery, and queue saturation remain unmeasured.
+
+Files changed: This untracked handover only. Existing untracked chatwithcto reports were left untouched. No scanner code was changed.
+
+Remaining vulnerabilities and deployment blockers: Every Phase 3B architecture and isolation requirement remains outstanding, including privilege and filesystem separation, peer authorization, bounded framing and admission, descriptor validation, enforced resource limits, crash recovery, immutable generation snapshots, replacement correctness, integration tests, measurements, and independent security review. The existing TOCTOU race and cooperative deadline are specific known limitations. This assessment is not production readiness.
+
+No production server, ClamAV installation, signing keys, upstream credentials, or private intelligence was changed. Nothing was pushed or merged.

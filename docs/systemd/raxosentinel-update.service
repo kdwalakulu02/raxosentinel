@@ -1,0 +1,36 @@
+[Unit]
+Description=RaxoSentinel Automated Malware Intelligence Updater
+Documentation=https://github.com/raxosentinel/raxosentinel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vscode
+Group=vscode
+WorkingDirectory=/home/vscode
+
+# Environment and credentials (optional external environment file)
+EnvironmentFile=-/etc/default/raxosentinel-update
+
+# Executable invocation
+ExecStart=/usr/local/bin/raxosentinel db update --apply --root /home/vscode/raxosentinel-private-phase2d1
+
+# Execution boundaries & timeouts
+TimeoutStartSec=600
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/vscode/raxosentinel-private-phase2d1 /tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Safe failure handling
+Restart=no
+StandardOutput=journal
+StandardError=journal

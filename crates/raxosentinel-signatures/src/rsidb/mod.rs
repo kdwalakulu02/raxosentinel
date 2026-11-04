@@ -29,6 +29,7 @@ pub mod mmap_compact_dir;
 pub mod mmap_sorted;
 pub mod public_release;
 pub mod traits;
+pub mod updater;
 
 #[cfg(test)]
 mod tests;

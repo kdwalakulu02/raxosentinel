@@ -439,18 +439,36 @@ fn run_comparison(
     let target_str = target_file.to_str().unwrap();
     raxo_args.push(target_str);
 
-    let start = Instant::now();
-    let raxo_output = Command::new("/usr/bin/time")
-        .args(&raxo_args)
-        .output()
-        .expect("Failed to execute raxosentinel under /usr/bin/time");
-    let raxo_duration_ms = start.elapsed().as_millis() as u64;
+    let has_time = Path::new("/usr/bin/time").exists();
+    let (raxo_output, raxo_duration_ms, raxo_peak_rss_mb) = if has_time {
+        let start = Instant::now();
+        let out = Command::new("/usr/bin/time")
+            .args(&raxo_args)
+            .output()
+            .expect("Failed to execute raxosentinel under /usr/bin/time");
+        let dur = start.elapsed().as_millis() as u64;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let peak_kb = parse_max_rss_kb(&stderr);
+        (out, dur, peak_kb / 1024.0)
+    } else {
+        let start = Instant::now();
+        let bin_args: Vec<&str> = raxo_args.iter().skip(1).copied().collect();
+        let out = Command::new(raxo_bin)
+            .args(&bin_args)
+            .output()
+            .expect("Failed to execute raxosentinel");
+        let dur = start.elapsed().as_millis() as u64;
+        let mut rusage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        unsafe {
+            libc::getrusage(libc::RUSAGE_CHILDREN, rusage.as_mut_ptr());
+        }
+        let ru = unsafe { rusage.assume_init() };
+        let peak_mb = (ru.ru_maxrss as f64) / 1024.0;
+        (out, dur, peak_mb)
+    };
 
-    let raxo_stderr = String::from_utf8_lossy(&raxo_output.stderr);
     let raxo_stdout = String::from_utf8_lossy(&raxo_output.stdout);
-
-    let raxo_peak_rss_kb = parse_max_rss_kb(&raxo_stderr);
-    let raxo_peak_rss_mb = raxo_peak_rss_kb / 1024.0;
+    let raxo_stderr = String::from_utf8_lossy(&raxo_output.stderr);
 
     let raxo_verdict = if raxo_stdout.contains("[ CLEAN ]") || raxo_output.status.code() == Some(0)
     {
@@ -553,18 +571,33 @@ fn run_comparison(
     let clam_bin = "/usr/bin/clamscan";
     let (clamscan_verdict, clamscan_duration_ms, clamscan_peak_rss_mb) =
         if Path::new(clam_bin).exists() {
-            let start_clam = Instant::now();
-            let clam_output = Command::new("/usr/bin/time")
-                .args(["-v", clam_bin, "--no-summary", target_str])
-                .output()
-                .expect("Failed to execute clamscan under /usr/bin/time");
-            let clam_duration_ms = start_clam.elapsed().as_millis() as u64;
+            let (clam_output, clam_duration_ms, clam_peak_rss_mb) = if has_time {
+                let start_clam = Instant::now();
+                let out = Command::new("/usr/bin/time")
+                    .args(["-v", clam_bin, "--no-summary", target_str])
+                    .output()
+                    .expect("Failed to execute clamscan under /usr/bin/time");
+                let dur = start_clam.elapsed().as_millis() as u64;
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let peak_kb = parse_max_rss_kb(&stderr);
+                (out, dur, peak_kb / 1024.0)
+            } else {
+                let start_clam = Instant::now();
+                let out = Command::new(clam_bin)
+                    .args(["--no-summary", target_str])
+                    .output()
+                    .expect("Failed to execute clamscan");
+                let dur = start_clam.elapsed().as_millis() as u64;
+                let mut rusage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+                unsafe {
+                    libc::getrusage(libc::RUSAGE_CHILDREN, rusage.as_mut_ptr());
+                }
+                let ru = unsafe { rusage.assume_init() };
+                let peak_mb = (ru.ru_maxrss as f64) / 1024.0;
+                (out, dur, peak_mb)
+            };
 
-            let clam_stderr = String::from_utf8_lossy(&clam_output.stderr);
             let clam_stdout = String::from_utf8_lossy(&clam_output.stdout);
-
-            let clam_peak_rss_kb = parse_max_rss_kb(&clam_stderr);
-            let clam_peak_rss_mb = clam_peak_rss_kb / 1024.0;
 
             let clam_verdict = if clam_stdout.contains("OK") {
                 "OK (CLEAN)".to_string()

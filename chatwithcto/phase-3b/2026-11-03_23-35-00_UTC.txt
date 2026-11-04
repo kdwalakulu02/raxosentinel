@@ -1,0 +1,203 @@
+# RaxoSentinel Unified RSIDB — Actual Results
+
+| Metric | Result |
+|---|---|
+| Starting genuine indicators | 104 (MalwareBazaar abuse.ch API acquisitions) |
+| ClamAV records examined | 541,990 (.hdb and .hsb records from main.cvd and daily.cvd) |
+| ClamAV records converted | 541,953 (541,727 MD5, 3 SHA-1, 223 SHA-256) |
+| Other records imported | 0 (only ClamAV and MalwareBazaar) |
+| Duplicates rejected | 3 (deduplicated) + 34 (filtered: 13 wildcard sizes, 20 false-positive exclusions, 1 ignored name) |
+| Final unique RSIDB records | 542,057 |
+| Unified RSIDB size | 32,610,247 bytes (31.10 MB) |
+| Verification status | PASS (Strict format verification, SHA-256 payload checksum, evidence integrity check) |
+| Database load time | 105.06 ms (median warm cache; 39.88 ms min in release); initial cold load: 181.20 ms |
+| Peak observed memory | 94.75 MB delta RSS under warm load |
+| Git commit | `b192837` |
+
+---
+
+## 1. State Recovery & Verification Summary
+
+Following the unexpected Codespaces session interruption, an exhaustive inspection of the Git repository, local filesystem, and private intelligence storage was conducted:
+
+1. **Git Repository State:**
+   - Active Branch: `phase-3b`
+   - Active HEAD: `b1928370b7d3d9ce5a68d1f5b28aa67f7b3449f6` ("feat(rsidb): populate unified RSIDB generation with MalwareBazaar and ClamAV intelligence (Phase 2D.6)")
+   - Targeted Security Remediation Commit: `0d2bf2f` ("Remediate request deadline, snapshot budget, and MIME boundary defects (Phase 3B.3R)") is confirmed present in the history, followed by the Phase 3B.3R handover commit `4b88189`.
+   - Working Tree: Clean; no untracked files or uncommitted modifications.
+
+2. **Private Storage & Existing Generations:**
+   - Private storage root at `/home/vscode/raxosentinel-private-phase2d1/` remained fully intact across session restart:
+     - `genuine-2d2/`
+     - `phase2d3-core/`
+     - `phase2d4-acquisition/`
+     - `phase2d4-refreshed/`
+     - `phase2d4-refreshed-final/` (Contains the 104 genuine MalwareBazaar indicators)
+     - `phase2d6-unified/` (Contains the published 542,057 unified indicator generation)
+   - Unpacked ClamAV CVD distributions at `/home/vscode/clamav-unpack/` (with `main/` and `daily/`) and official signed CVD downloads in `/var/lib/clamav/` (`main.cvd` v63, `daily.cvd` v28173, `bytecode.cvd` v339) are fully preserved.
+
+---
+
+## 2. What Was Implemented
+
+### Single Canonical Runtime Architecture (ONE RSIDB)
+- In strict adherence to RaxoSentinel architectural directives, **there is only ONE canonical runtime intelligence database: RSIDB (`database.rsidb`)**.
+- No separate ClamAV database, parallel scanning engine, or compatibility emulation layer was introduced. ClamAV and MalwareBazaar act exclusively as input intelligence sources.
+- Indicators from all sources are converted directly into RaxoSentinel's native binary format (`SignatureEntry`), sorted monotonically, indexed with a 2-byte compact prefix directory, and compiled with cryptographic provenance manifests.
+
+### Multi-Source Ingestion & Evidence Attribution Pipeline
+- **Unified Registry & Associations (`raxosentinel-unified-v1`):**
+  - Designed and implemented `UnifiedSource`, `UnifiedRegistry`, `UnifiedAssociations`, `UnifiedIndicator`, and `UnifiedClaim` in `crates/raxosentinel-signatures/src/rsidb/malwarebazaar/private_store/unified.rs`.
+  - Supports tracking source ID, provider, acquisition method, timestamp, classification, provenance, redistribution license, and cryptographic evidence hashes.
+  - Implemented `publish_unified()`, enforcing atomic generation creation and immutable directory protections (0700 dir, 0600 files).
+- **ClamAV Whole-File Hash Acquisition & Ingestion Pipeline:**
+  - Implemented `crates/raxosentinel-cli/src/bin/populate_unified_rsidb.rs`.
+  - Loaded official ClamAV exclusion databases:
+    - 996 false-positive exclusion hashes loaded from `.fp` and `.sfp` files (`main.fp`, `main.sfp`, `daily.fp`, `daily.sfp`).
+    - 24 ignored/revoked signature names loaded from `.ign` and `.ign2` files (`daily.ign`, `daily.ign2`).
+  - Filtered and ingested whole-file hash signatures from `.hdb` and `.hsb` files (`main.hdb`, `main.hsb`, `daily.hdb`, `daily.hsb`).
+  - Enforced strict hash format rules:
+    - MD5 (16 bytes, 32 hex chars)
+    - SHA-1 (20 bytes, 40 hex chars)
+    - SHA-256 (32 bytes, 64 hex chars)
+    - Preserved exact algorithm semantics: **never invented SHA-256 equivalents for MD5 or SHA-1**.
+    - Rejected wildcard file sizes (`*`), preserving strict file size validation.
+    - Filtered false-positive and ignored entries.
+- **MalwareBazaar Ingestion & Preservation:**
+  - Preserved all 104 genuine operational SHA-256 indicators from `phase2d4-refreshed-final`.
+  - Maintained complete acquisition evidence files (`acq-130bdc21...` and `acq-7009a4d2...`) and sidecar digests.
+
+---
+
+## 3. What Was Tested & Verified
+
+### Comprehensive Workspace Test Suite
+- Executed `cargo test --workspace`: **All 164 unit, integration, and coordinator tests passed** (0 failures, 2 ignored synthetic scale benchmarks).
+- Executed `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings** (clean).
+- Executed `cargo fmt --all -- --check`: **Clean formatting**.
+
+### Unified Database Verification
+- Executed `raxosentinel db verify /home/vscode/raxosentinel-private-phase2d1/phase2d6-unified/database.rsidb`:
+  ```text
+  OK /home/vscode/raxosentinel-private-phase2d1/phase2d6-unified/database.rsidb md5=541727 sha1=3 sha256=327 names=541968 verify_ms=3248.35
+  provenance: {"associations":"associations.json","associations_sha256":"cc20b53c9019aa16ef3aafe4492d430dd329c0bea029ea9f92a2bc9ba7322f4c","database":"database.rsidb","format":"raxosentinel-unified-v1","md5_count":541727,"registry":"registry.json","registry_sha256":"4896a49221602f29065d92602d55bc5b241cd763edbb75d23db468ff5bc4cad4","sha1_count":3,"sha256_count":327,"total_records":542057}
+  ```
+- Executed `raxosentinel db sources --root /home/vscode/raxosentinel-private-phase2d1 --generation phase2d6-unified`:
+  - Verified source `malwarebazaar`: 104 unique indicators, provider `abuse.ch`, evidence verified.
+  - Verified source `clamav`: 541,953 unique indicators, provider `Cisco Talos`, evidence verified.
+- Executed `raxosentinel db indicator --root /home/vscode/raxosentinel-private-phase2d1 --generation phase2d6-unified 01115ec4c22e47143b098212dcbaf18f7c5c22f072d2f8f67d8cf73e63b3e931`:
+  - Successfully retrieved genuine MalwareBazaar claim (`family: Unknown`, `size: 162732`, `source_id: malwarebazaar`).
+
+### Functional Threat Scanning Verification
+- **Direct CLI Scanner (`raxosentinel scan`):**
+  - Clean text file: Verified output `[ CLEAN ]` in 39 ms.
+  - EICAR test string: Verified output `[ DETECTED ]` in 40 ms.
+- **Persistent Local Scanner Coordinator (`raxosentinel serve` + `raxosentinel client`):**
+  - Started coordinator with `--private-db-root /home/vscode/raxosentinel-private-phase2d1 --private-generation phase2d6-unified`.
+  - Tested client submission of clean file: `[ CLEAN ]` in 11 ms.
+  - Tested client submission of EICAR file: `[ DETECTED ]` in 0 ms.
+- **Real-World Known Malware Lookups:**
+  - `Win.Worm.Gaobot-308` (MD5: `073f4d8002652bc1b303c50412e851e8`, size 139,264): Match verified.
+  - `Win.Keylogger.Generic-7604980-0` (SHA-1: `0059ee2322c3301263c8006fd780d7fe95a30572`, size 1,705,472): Match verified.
+  - MalwareBazaar real indicator (`01115ec4...`, SHA-256): Match verified.
+  - Harmless clean text buffer: 0 matches verified.
+
+---
+
+## 4. Performance Investigation & Comparison
+
+### Comparison: Small Database vs. Populated Unified Database
+Measurements obtained using `private_generation_benchmark` on release builds (5 iterations, warm cache):
+
+| Metric | Small Generation (`phase2d4-refreshed-final`) | Unified Generation (`phase2d6-unified`) | Change Factor |
+|---|---|---|---|
+| **Unique Indicators** | 104 | 542,057 | **+5,212x** |
+| **MD5 Indicators** | 0 | 541,727 | New algorithm |
+| **SHA-1 Indicators** | 0 | 3 | New algorithm |
+| **SHA-256 Indicators** | 104 | 327 | +214% |
+| **Database Binary Size** | 5,282 bytes (5.16 KB) | 32,610,247 bytes (31.10 MB) | 31 MB |
+| **Associations Metadata Size** | 104 KB | 104,680,858 bytes (99.83 MB) | 100 MB |
+| **Database Load Time (median)** | 0.040 ms (40 µs) | 105.06 ms (39.88 ms min) | Bounded |
+| **Evidence Verification (median)** | 10.15 ms | 799.49 ms (650.10 ms min) | Linear in JSON |
+| **Total Verified Load Time** | 10.31 ms | 860.67 ms (690.10 ms min) | < 1 second |
+| **Lookup Throughput** | ~6.2M QPS | 5,467,417 queries/second | ~5.47M QPS |
+| **p50 Lookup Latency** | ~120 ns | 140 ns (0.140 µs) | Stable |
+| **p95 Lookup Latency** | ~170 ns | 190 ns (0.190 µs) | Stable |
+| **p99 Lookup Latency** | ~210 ns | 231 ns (0.231 µs) | Stable |
+| **Memory Delta (RSS under load)**| ~2.4 MB | 94.75 MB | Memory efficient |
+
+*Methodology Note:* Benchmark measurements distinguish in-memory mmap lookup latency (nanoseconds) from one-time cold/warm deserialization of association JSON files. The 2-byte compact prefix index ensures binary search performance scales logarithmically: searching 542,057 entries takes only ~20 additional nanoseconds compared to searching 104 entries.
+
+---
+
+## 5. Unsupported ClamAV Signature Types & Analysis
+
+During inspection of official ClamAV CVD distributions (`main.cvd` and `daily.cvd`), 3,099,065 signatures were identified that cannot be represented as whole-file cryptographic hashes:
+
+1. **PE Section Hashes (`.mdb`, `.msb`): 2,670,550 signatures**
+   - *Technical Reason for Rejection:* These signatures match hashes of individual executable sections (e.g. `.text`, `.data`) rather than the entire file. Attempting to match them against whole-file digests would result in false negatives.
+   - *Engineering Path Forward:* Requires integrating a safe, zero-unsafe, bounded PE32/PE32+ header parser within the supervised worker. The parser must validate DOS/NT headers, SectionHeaders, and virtual offsets with strict bounds checks before extracting section slices for hashing.
+2. **Byte Pattern Signatures (`.ndb`, `.ndu`): 106,069 signatures**
+   - *Technical Reason for Rejection:* These contain variable-length sub-sequence patterns with wildcards (`??`), byte ranges (`(aa|bb)`), regex jumps (`{-n}`), and offset anchors. They are not fixed cryptographic hashes.
+   - *Engineering Path Forward:* Expand RaxoSentinel's existing Aho-Corasick automaton to support bounded wildcard patterns and anchored offsets without degrading streaming performance.
+3. **Logical Signatures (`.ldb`, `.ldu`): 322,446 signatures**
+   - *Technical Reason for Rejection:* These combine multiple byte patterns, container metadata, and file type criteria using Boolean logic expressions (`A & B & !C`).
+   - *Engineering Path Forward:* Requires a strictly bounded AST evaluator with recursion depth limits and execution time budgets to avoid Denial of Service on hostile inputs.
+
+---
+
+## 6. Licensing and Distribution Limitations
+
+1. **ClamAV CVD Data:**
+   - Distributed by Cisco Talos under GNU General Public License v2.0 (GPL-2.0-only).
+   - Redistribution rights: Third-party redistribution of compiled CVD indicators in public distributions cannot take place until licensing compatibility review is complete.
+   - Storage Boundary: Maintained strictly in local private storage (`/home/vscode/raxosentinel-private-phase2d1/`) under POSIX permissions 0700/0600. No CVD data or extracted signatures have been committed to public Git tracking.
+2. **MalwareBazaar Data:**
+   - Sourced from abuse.ch API under research terms.
+   - Maintained in private research storage. No private threat indicators committed to Git.
+
+---
+
+## 7. Exact Commands to Resume and Reproduce
+
+### Reproduce Unified Generation Build
+```bash
+cargo run --release --bin populate_unified_rsidb \
+  /home/vscode/raxosentinel-private-phase2d1 \
+  phase2d4-refreshed-final \
+  /home/vscode/clamav-unpack \
+  phase2d6-unified
+```
+
+### Verify Generation Integrity & Metadata
+```bash
+cargo run --release --bin raxosentinel -- db verify \
+  /home/vscode/raxosentinel-private-phase2d1/phase2d6-unified/database.rsidb
+
+cargo run --release --bin raxosentinel -- db sources \
+  --root /home/vscode/raxosentinel-private-phase2d1 \
+  --generation phase2d6-unified
+```
+
+### Benchmark Generation Performance
+```bash
+cargo run --release --bin private_generation_benchmark \
+  /home/vscode/raxosentinel-private-phase2d1 \
+  phase2d6-unified 5
+```
+
+### Scan Files with the Unified Database
+```bash
+cargo run --release --bin raxosentinel -- scan \
+  --private-db-root /home/vscode/raxosentinel-private-phase2d1 \
+  --private-generation phase2d6-unified \
+  <PATH_TO_TARGET_FILE>
+```
+
+### Run Persistent Coordinator with Unified Database
+```bash
+cargo run --release --bin raxosentinel -- serve \
+  --socket /tmp/rs-sock-dir/scanner.sock \
+  --private-db-root /home/vscode/raxosentinel-private-phase2d1 \
+  --private-generation phase2d6-unified
+```

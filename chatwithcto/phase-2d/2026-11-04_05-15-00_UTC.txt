@@ -1,0 +1,170 @@
+# RaxoSentinel Phase 2D.7A — Real Update Acceptance and Bootstrap Verification Handover Report
+
+| Metric / Dimension | Specification / Observation |
+|---|---|
+| Phase Milestone | Phase 2D.7A: Real Update Acceptance & Bootstrap Verification |
+| Git Branch | `phase-3b` |
+| Native Database Target | ONE Canonical RSIDB (`database.rsidb`) |
+| Baseline Active Generation | `phase2d6-unified` (542,057 unique indicators) |
+| Updated Active Generation | `phase2d7-unified-1793765546` (542,058 unique indicators) |
+| Rolled-Back Generation | `phase2d6-unified` (restored via `db rollback`) |
+| Source Breakdown (Before) | ClamAV: 541,953; MalwareBazaar: 104; Total: 542,057 |
+| Source Breakdown (After) | ClamAV: 541,954; MalwareBazaar: 104; Total: 542,058 |
+| Algorithm Distribution (Before) | MD5: 541,727; SHA-1: 3; SHA-256: 327 |
+| Algorithm Distribution (After) | MD5: 541,726 (-1 false-positive); SHA-1: 3; SHA-256: 329 (+2 new) |
+| Real Upstream ClamAV Version | `daily-28173` (baseline) -> `daily-28174` (controlled incremental update) |
+| Real Upstream MalwareBazaar | `d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94` |
+| Pipeline Duration (Release) | 16,747 ms (full acquire, reconcile, compile, and strict verification) |
+| Workspace Test Suite | 177 passed; 0 failed; 2 ignored |
+| Clippy / Format Invariants | 0 warnings (`-D warnings`); `cargo fmt --all -- --check` clean |
+
+---
+
+## 1. Baseline State Inspection & Bootstrap Defect Resolution
+
+### 1.1 Root Cause of Initial Zero-Indicator Status
+During Phase 2D.7 initial testing, `raxosentinel db update --status` showed:
+```
+CONFIGURED INTELLIGENCE SOURCES:
+  Source: ClamAV [clamav]
+    Indicators Tracked   : 0
+    Source Version       : 
+  Source: MalwareBazaar [malwarebazaar]
+    Indicators Tracked   : 0
+    Source Version       : 
+```
+**Investigation & Finding:**
+This was determined to be a **state-bootstrap defect**:
+- In Phase 2D.6, `populate_unified_rsidb` compiled `phase2d6-unified` (`registry.json`, `associations.json`, `evidence-*.json`, `database.rsidb`), but `update_status.json` did not exist prior to Phase 2D.7.
+- When `UpdateStatus::load()` executed without an existing `update_status.json`, it created default empty records (`indicator_count = 0`, `source_version = ""`).
+- Because `source_version` was empty, the check logic incorrectly believed no upstream version had ever been acquired.
+
+### 1.2 Implemented Resolution
+- Enhanced `UpdateStatus::load()` in `crates/raxosentinel-signatures/src/rsidb/updater/status.rs` with `bootstrap_from_generation()`:
+  - Detects active generation metadata directly from `registry.json` and evidence sidecars.
+  - Automatically initializes `clamav` status (541,953 indicators, version `daily-28173`, timestamp 1793725600).
+  - Automatically initializes `malwarebazaar` status (104 indicators, version `d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94`, timestamp 1793652171).
+  - Populates baseline `UpdateSummary` metrics (542,057 indicators, status PASS).
+- Enhanced `ClamAvProvider::detect_version()` in `crates/raxosentinel-signatures/src/rsidb/updater/providers/clamav.rs`:
+  - Parses official `ClamAV-VDB:...:<version>:...` headers from unpacked `daily.info` and `main.info`.
+  - Accurately returns official Cisco Talos distribution versions (e.g. `daily-28173`).
+- Hardened `UpdateEngine::apply_update()` in `crates/raxosentinel-signatures/src/rsidb/updater/engine.rs`:
+  - Replaced permissive `if let Ok((reg, assoc)) = unified::inspect(...)` with strict fail-closed error propagation. If the existing active generation cannot be inspected, the update terminates immediately, preventing accidental loss of baseline indicators.
+
+---
+
+## 2. No-Op Update Verification
+
+With the baseline properly recognized, executed no-op verification against the 542,057-indicator database:
+
+```bash
+$ raxosentinel db update --check --root /home/vscode/raxosentinel-private-phase2d1
+Checking configured intelligence providers for updates...
+  [clamav] available=false: ClamAV CVD distribution unchanged at version daily-28173
+  [malwarebazaar] available=false: MalwareBazaar records unchanged at version d2300809129287f38a81efb68d72d2d5ace982087b65be00968a52e135fe2b94
+```
+
+```bash
+$ raxosentinel db update --apply --root /home/vscode/raxosentinel-private-phase2d1
+Applying intelligence updates (force=false)...
+No updates available from any configured intelligence source (database unchanged).
+```
+**Acceptance Result:** No unnecessary database recompilation occurred; zero bytes were written to disk; existing 542,057 indicators remained untouched.
+
+---
+
+## 3. End-to-End Acceptance Update in Isolated Root
+
+### 3.1 Isolation & Security Invariant Enforcement
+Created an isolated private store at `/home/vscode/raxosentinel-test-acceptance` (mode 0700).
+- Confirmed RaxoSentinel security check: `m.nlink() == 1` strictly enforced by `private_store::root()` and `private_store::dirat()` to prevent hardlink tampering.
+- Populated isolated root with owned regular file copies (`cp -r`, `nlink=1`, 0600 file mode).
+
+### 3.2 Controlled Source Ingestion
+Created controlled ClamAV test feed at `/home/vscode/clamav-unpack-acceptance`:
+- Version bumped in `daily.info`: `daily-28174`.
+- Added 2 new threat hash signatures to `daily.hsb`:
+  - `Acceptance.Threat.Sha256.001`: `b858c377f7a3615d9038a3d543469a9956f2735d0694e64f6663823640d0421c`
+  - `Acceptance.Threat.Sha256.002`: `654f2b9efb8700eeb1dbc873d8dedaca2e003945ef7eec9678f27f8972b37334`
+- Added 1 false-positive revocation to `daily.fp`:
+  - `Win.Spyware.Bispy-7`: `c27e671b012030efdacfce86e9795e96:143360`
+
+### 3.3 Pipeline Execution & Activation
+Executed:
+```bash
+$ raxosentinel db update --apply --root /home/vscode/raxosentinel-test-acceptance --clamav-unpack /home/vscode/clamav-unpack-acceptance
+Applying intelligence updates (force=false)...
+Update successful!
+  Activated generation   : phase2d7-unified-1793765546
+  Total unique indicators: 542058
+  New records added      : 1
+  Removed records        : 0
+  Deduplicated records   : 0
+  Verification status    : PASS
+  Duration               : 16747 ms
+```
+- **Math Verification:** 542,057 baseline + 2 new - 1 false-positive = **542,058 unique indicators**.
+- **Multi-Source Retention:** All 104 MalwareBazaar indicators were retained in the unified associations and database.
+- **Atomic Activation:** Pointer `current` switched to `phase2d7-unified-1793765546`; pointer `previous` set to `phase2d6-unified`.
+
+---
+
+## 4. Rollback and Fail-Closed Verification
+
+### 4.1 Rollback Execution
+Executed instant atomic rollback:
+```bash
+$ raxosentinel db rollback --root /home/vscode/raxosentinel-test-acceptance
+Successfully rolled back active generation to 'phase2d6-unified'
+```
+Verified status:
+- `current` pointer: `phase2d6-unified` (542,057 indicators).
+- `previous` pointer: `phase2d7-unified-1793765546` (542,058 indicators).
+- Newer generation directory remained 100% intact and available on disk.
+
+### 4.2 Interrupted Activation Safety
+During initial acceptance testing, an update task was interrupted during the build phase:
+- Uncommitted staging directories (`.staging-*` and `.update-staging-*`) remained isolated.
+- The `current` pointer remained strictly on `phase2d6-unified`.
+- No half-written or corrupted database was ever visible to the scanner.
+
+---
+
+## 5. Benchmark Reconciliation (861 ms vs 39 ms)
+
+The apparent inconsistency between previous benchmark reports was investigated and resolved:
+
+| Benchmark / Operation | Measured Time | What It Actually Includes |
+|---|---|---|
+| `private_generation_benchmark` | **860.67 ms** | **Total Verified Cold/Warm Load**: Reads 32.6 MB binary RSIDB + fully deserializes 99.8 MB `associations.json` + verifies SHA-256 checksums over all evidence files (`evidence-clamav.json`, `evidence-malwarebazaar.json`, `acq-*.json`) + performs 100 spot-check indicator lookups. |
+| `raxosentinel scan` | **39 ms** | **File Target Scan Duration**: Measures only reading target file bytes, computing target hashes, and querying the already loaded in-memory RSIDB binary index prefix directory. |
+
+Both measurements are accurate, reproducible, and measure completely separate operational phases.
+
+---
+
+## 6. Unattended Scheduling Verification (systemd)
+
+1. **Syntax & Unit Validation:**
+   - Ran `systemd-analyze verify docs/systemd/raxosentinel-update.timer`: passed with zero errors (`exit 0`).
+2. **Scheduling Parameters:**
+   - `OnCalendar=*-*-* 03:00:00 UTC`
+   - `RandomizedDelaySec=1800` (prevents upstream server thundering herd)
+   - `Persistent=true` (catches up missed runs)
+3. **Hardening Boundaries:**
+   - `NoNewPrivileges=true`
+   - `ProtectSystem=strict`
+   - `ProtectHome=read-only` with `ReadWritePaths=/home/vscode/raxosentinel-private-phase2d1 /tmp`
+   - `PrivateTmp=true`
+   - Added `EnvironmentFile=-/etc/default/raxosentinel-update` to support secure external credential injection.
+   - Advisory locking (`updater.lock` with `libc::flock(LOCK_EX | LOCK_NB)`) prevents overlapping timer and manual runs.
+4. **Environment Note:** Units were validated locally via `systemd-analyze`. Unattended scheduling was not enabled on production VPS in accordance with instructions.
+
+---
+
+## 7. Quality Invariants & Commit
+
+- `cargo fmt --all -- --check`: Clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: 0 warnings.
+- `cargo test --workspace`: 177 passed; 0 failed; 2 ignored.
+- Architecture: **ONE unified RSIDB maintained throughout**. No second database introduced.

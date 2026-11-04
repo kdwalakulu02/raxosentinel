@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily RaxoSentinel Intelligence Update Timer
+Documentation=https://github.com/raxosentinel/raxosentinel
+
+[Timer]
+# Schedule daily at 03:00 UTC
+OnCalendar=*-*-* 03:00:00 UTC
+# Randomized jitter to prevent synchronized load spikes on upstream feeds
+RandomizedDelaySec=1800
+# Run missed executions upon wake if system was offline/suspended
+Persistent=true
+# Corresponding update service
+Unit=raxosentinel-update.service
+
+[Install]
+WantedBy=timers.target
