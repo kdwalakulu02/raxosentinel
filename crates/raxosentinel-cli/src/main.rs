@@ -316,7 +316,8 @@ struct ScanArgs {
 fn main() {
     let cli = Cli::parse();
 
-    let subscriber_builder = tracing_subscriber::fmt();
+    // Diagnostics must never share stdout with JSON reports or the worker response channel.
+    let subscriber_builder = tracing_subscriber::fmt().with_writer(std::io::stderr);
     if cli.verbose {
         subscriber_builder
             .with_max_level(tracing::Level::DEBUG)
