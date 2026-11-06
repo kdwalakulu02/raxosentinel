@@ -568,6 +568,19 @@ impl<'a> EmailScanner<'a> {
                 let (subs, issue) = self.scan_zip(data, filename, tracker, depth + 1)?;
                 sub_reports = subs;
                 container_issue = issue;
+                // ZipArchive exposes one directory. Multiple end records can indicate
+                // concatenated archives; do not claim complete inspection of them.
+                if data
+                    .windows(4)
+                    .filter(|w| *w == b"PK\x05\x06")
+                    .take(2)
+                    .count()
+                    > 1
+                    && container_issue.is_none()
+                {
+                    container_issue = Some((ScanStatus::Unsupported,
+                        "Multiple ZIP end records; not all embedded archives may have been inspected".into()));
+                }
             }
             ContainerKind::Unsupported(kind) => {
                 container_issue = Some((
@@ -579,6 +592,32 @@ impl<'a> EmailScanner<'a> {
                 ));
             }
             ContainerKind::None => {}
+        }
+
+        // Recognizable unsupported embedded containers cannot be silently treated
+        // as fully inspected, even when the outer object is another format.
+        let unsupported_magic: &[(&[u8], &str)] = &[
+            (b"Rar!\x1a\x07", "RAR"),
+            (b"7z\xbc\xaf\x27\x1c", "7-Zip"),
+            (b"\x1f\x8b\x08", "GZIP"),
+            (b"BZh", "BZIP2"),
+            (b"\xfd7zXZ\x00", "XZ"),
+            (b"MSCF", "CAB"),
+        ];
+        if container_issue.is_none() {
+            for (magic, kind) in unsupported_magic {
+                tracker.check_timeout()?;
+                if data.windows(magic.len()).any(|w| w == *magic) {
+                    container_issue = Some((
+                        ScanStatus::Unsupported,
+                        format!(
+                            "Possible embedded {} container; contents not inspected",
+                            kind
+                        ),
+                    ));
+                    break;
+                }
+            }
         }
 
         for sr in &sub_reports {
@@ -653,7 +692,20 @@ impl<'a> EmailScanner<'a> {
         }
 
         let cap = tracker.limits().max_email_attachment_size;
-        let mut issue: Option<(ScanStatus, String)> = None;
+        // Extra local headers may belong to another or truncated embedded ZIP.
+        // ZipArchive only exposes one central directory, so do not report CLEAN.
+        let extra_headers = data
+            .windows(4)
+            .filter(|w| *w == b"PK\x03\x04")
+            .take(archive.len().saturating_add(1))
+            .count()
+            > archive.len();
+        let mut issue: Option<(ScanStatus, String)> = extra_headers.then(|| {
+            (
+                ScanStatus::Unsupported,
+                "Additional ZIP local headers may contain uninspected content".into(),
+            )
+        });
         let raise = |issue: &mut Option<(ScanStatus, String)>, st: ScanStatus, msg: String| {
             let replace = match issue {
                 None => true,
@@ -809,7 +861,7 @@ enum ContainerKind {
 /// Content-based container classification, with fallback to declared metadata
 /// for truncated or incomplete containers that cannot be safely inspected.
 fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) -> ContainerKind {
-    if data.starts_with(b"PK\x03\x04")
+    if data.windows(4).any(|w| w == b"PK\x03\x04")
         || data.starts_with(b"PK\x05\x06")
         || filename.to_ascii_lowercase().ends_with(".zip")
         || declared_mime.is_some_and(|m| m.eq_ignore_ascii_case("application/zip"))

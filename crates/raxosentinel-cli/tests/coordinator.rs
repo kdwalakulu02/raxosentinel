@@ -294,12 +294,11 @@ fn run_client(
     env_vars: &[(&str, &str)],
 ) -> (i32, serde_json::Value) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_raxosentinel"));
-    cmd.arg("client")
-        .arg("--socket")
-        .arg(socket)
-        .arg(target)
-        .arg("--json")
-        .args(extra_args);
+    cmd.arg("client").arg("--socket").arg(socket).arg(target);
+    if !extra_args.contains(&"--json-envelope") {
+        cmd.arg("--json");
+    }
+    cmd.args(extra_args);
 
     for (k, v) in env_vars {
         cmd.env(k, v);
@@ -702,7 +701,7 @@ fn test_07_worker_timeout_without_affecting_other_scans() {
         run_client(
             &s1,
             &f1,
-            &[],
+            &["--json-envelope"],
             &[("RAXOSENTINEL_TEST_WORKER_ACTION", "hang")],
         )
     });
@@ -719,6 +718,7 @@ fn test_07_worker_timeout_without_affecting_other_scans() {
 
     assert_eq!(c1, 3, "Timed out worker must return ERROR exit code 3");
     assert_eq!(r1["status"].as_str().unwrap(), "ERROR");
+    assert_eq!(r1["error_code"], "TIMEOUT");
 
     assert_eq!(c2, 0, "Concurrent scan must complete with CLEAN");
     assert_eq!(r2["status"].as_str().unwrap(), "CLEAN");

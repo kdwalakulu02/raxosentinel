@@ -148,6 +148,10 @@ pub struct ClientArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Output the complete coordinator response, including database generation
+    #[arg(long, conflicts_with = "json")]
+    pub json_envelope: bool,
+
     /// Requested maximum file size in bytes
     #[arg(long)]
     pub max_size: Option<u64>,
@@ -192,6 +196,9 @@ pub struct CoordinatorResponse {
     pub status: CoordinatorVerdict,
     pub report: Option<ScanReport>,
     pub error: Option<String>,
+    /// Stable reason for recognized timeout errors; absent for other errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -821,6 +828,7 @@ fn send_busy_response(mut stream: UnixStream, reason: &str) {
         status: CoordinatorVerdict::Busy,
         report: None,
         error: Some(reason.into()),
+        error_code: None,
         database_generation: None,
         degraded_freshness: None,
         pending_generation: None,
@@ -843,6 +851,7 @@ fn send_unauthorized_response(mut stream: UnixStream, reason: &str) {
         status: CoordinatorVerdict::Error,
         report: None,
         error: Some(reason.into()),
+        error_code: None,
         database_generation: None,
         degraded_freshness: None,
         pending_generation: None,
@@ -896,10 +905,18 @@ fn handle_client_connection(
                      report: Option<ScanReport>,
                      error: Option<String>|
      -> CoordinatorResponse {
+        let is_timeout = error
+            .as_deref()
+            .or_else(|| report.as_ref().and_then(|r| r.error.as_deref()))
+            .is_some_and(|s| {
+                s == "Worker deadline exceeded; worker terminated"
+                    || s.starts_with("Scan timeout reached after ")
+            });
         CoordinatorResponse {
             status,
             report,
             error,
+            error_code: is_timeout.then(|| "TIMEOUT".to_string()),
             database_generation: database_generation.clone(),
             degraded_freshness,
             pending_generation: pending_generation.clone(),
@@ -1009,8 +1026,7 @@ fn handle_client_connection(
     if let Some(ref ph) = pinned_handle {
         effective_config.private_generation = Some(ph.generation().to_string());
     }
-    let allow_test = cfg!(debug_assertions)
-        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    let allow_test = cfg!(debug_assertions);
     if allow_test {
         if let Some(action) = request.test_worker_action {
             effective_config.test_worker_action = Some(action);
@@ -1327,7 +1343,9 @@ pub fn client(args: ClientArgs) -> i32 {
         }
     };
 
-    if args.json {
+    if args.json_envelope {
+        println!("{}", serde_json::to_string(&response).unwrap_or_default());
+    } else if args.json {
         if let Some(ref report) = response.report {
             if let Ok(json) = report.to_json_pretty() {
                 println!("{json}");

@@ -1,0 +1,20 @@
+[Unit]
+Description=RaxoSentinel shadow scanner coordinator
+After=local-fs.target
+
+[Service]
+Type=simple
+User=raxosentinel
+Group=raxosentinel
+RuntimeDirectory=raxosentinel
+RuntimeDirectoryMode=0700
+UMask=0077
+EnvironmentFile=-/etc/raxosentinel/coordinator.env
+ExecStart=/opt/raxosentinel/bin/raxosentinel serve --socket /run/raxosentinel/scan.sock --private-db-root /var/lib/raxosentinel/private --max-workers ${RAXO_WORKERS} --worker-memory ${RAXO_WORKER_MEMORY} --worker-timeout-ms ${RAXO_WORKER_TIMEOUT_MS}
+Restart=on-failure
+TimeoutStopSec=30
+MemoryMax=4G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

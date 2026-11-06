@@ -125,6 +125,47 @@ fn real_files_nested_archives_mime_and_limits() {
     let archive = dir.join("fixture.zip");
     std::fs::write(&archive, zip(&[("payload.txt", PAYLOAD)])).unwrap();
     assert_eq!(run(&archive, &db, &[]).1["status"], "DETECTED");
+    for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut cursor);
+            writer
+                .start_file(
+                    "payload.txt",
+                    SimpleFileOptions::default().compression_method(method),
+                )
+                .unwrap();
+            writer.write_all(PAYLOAD).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut polyglot = b"%PDF-1.4\n".to_vec();
+        polyglot.extend(cursor.into_inner());
+        let path = dir.join("polyglot.pdf");
+        std::fs::write(&path, polyglot).unwrap();
+        assert_eq!(run(&path, &db, &[]).1["status"], "DETECTED");
+    }
+    let mut malformed = b"%PDF-1.4\nPK\x03\x04".to_vec();
+    malformed.extend_from_slice(b"incomplete archive");
+    let malformed_path = dir.join("malformed.pdf");
+    std::fs::write(&malformed_path, malformed).unwrap();
+    assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
+    let mut truncated = b"%PDF-1.4\n".to_vec();
+    let complete = zip(&[("clean.txt", b"harmless")]);
+    truncated.extend_from_slice(&complete[..complete.len() - 10]);
+    std::fs::write(&malformed_path, truncated).unwrap();
+    assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
+    let mut multiple = b"%PDF-1.4\n".to_vec();
+    multiple.extend_from_slice(&complete);
+    multiple.extend_from_slice(&complete);
+    std::fs::write(&malformed_path, multiple).unwrap();
+    assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
+    let mut trailing_truncated = complete.clone();
+    trailing_truncated.extend_from_slice(b"PK\x03\x04incomplete");
+    std::fs::write(&malformed_path, trailing_truncated).unwrap();
+    assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
+    let embedded_gzip = dir.join("embedded-gzip.pdf");
+    std::fs::write(&embedded_gzip, b"%PDF-1.4\n\x1f\x8b\x08\x00").unwrap();
+    assert_eq!(run(&embedded_gzip, &db, &[]).1["status"], "UNSCANNED");
     let inner = zip(&[("payload.txt", PAYLOAD)]);
     let nested = dir.join("nested.zip");
     std::fs::write(&nested, zip(&[("inner.zip", &inner)])).unwrap();

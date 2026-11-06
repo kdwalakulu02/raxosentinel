@@ -362,6 +362,7 @@ fn run_scan(args: ScanArgs) -> i32 {
                 socket: sock.clone(),
                 target: args.target,
                 json: args.json,
+                json_envelope: false,
                 max_size: args.max_size,
                 timeout: args.timeout,
                 max_depth: args.max_depth,
@@ -376,8 +377,7 @@ fn run_scan(args: ScanArgs) -> i32 {
         }
     }
 
-    let allow_test = cfg!(debug_assertions)
-        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    let allow_test = cfg!(debug_assertions);
     if allow_test && args.worker_internal {
         if let Ok(action) = std::env::var("RAXOSENTINEL_TEST_WORKER_ACTION") {
             match action.as_str() {
