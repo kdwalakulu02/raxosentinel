@@ -290,8 +290,7 @@ pub fn execute_worker_on_snapshot(
         return Err("Worker request exceeds argument limit".into());
     }
     command.env_clear();
-    let allow_test = cfg!(debug_assertions)
-        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    let allow_test = cfg!(debug_assertions);
     if allow_test {
         command.env("RAXOSENTINEL_ALLOW_TEST_ACTIONS", "1");
         if let Some(ref action) = config.test_worker_action {

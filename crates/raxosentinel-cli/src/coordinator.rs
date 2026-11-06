@@ -148,6 +148,10 @@ pub struct ClientArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Output the complete coordinator response, including database generation
+    #[arg(long, conflicts_with = "json")]
+    pub json_envelope: bool,
+
     /// Requested maximum file size in bytes
     #[arg(long)]
     pub max_size: Option<u64>,
@@ -1009,8 +1013,7 @@ fn handle_client_connection(
     if let Some(ref ph) = pinned_handle {
         effective_config.private_generation = Some(ph.generation().to_string());
     }
-    let allow_test = cfg!(debug_assertions)
-        || std::env::var("RAXOSENTINEL_ALLOW_TEST_ACTIONS").as_deref() == Ok("1");
+    let allow_test = cfg!(debug_assertions);
     if allow_test {
         if let Some(action) = request.test_worker_action {
             effective_config.test_worker_action = Some(action);
@@ -1327,7 +1330,9 @@ pub fn client(args: ClientArgs) -> i32 {
         }
     };
 
-    if args.json {
+    if args.json_envelope {
+        println!("{}", serde_json::to_string(&response).unwrap_or_default());
+    } else if args.json {
         if let Some(ref report) = response.report {
             if let Ok(json) = report.to_json_pretty() {
                 println!("{json}");
