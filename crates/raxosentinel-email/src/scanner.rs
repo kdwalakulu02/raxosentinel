@@ -599,6 +599,14 @@ impl<'a> EmailScanner<'a> {
             ContainerKind::None => {}
         }
 
+        if data.starts_with(b"%PDF-") {
+            let (pdf_reports, issue) = self.scan_pdf(data, filename, tracker, depth + 1)?;
+            sub_reports.extend(pdf_reports);
+            if container_issue.is_none() {
+                container_issue = issue;
+            }
+        }
+
         // Recognizable unsupported embedded containers cannot be silently treated
         // as fully inspected, even when the outer object is another format.
         let unsupported_magic: &[(&[u8], &str)] = &[
@@ -650,6 +658,106 @@ impl<'a> EmailScanner<'a> {
             duration_ms,
             details,
         ))
+    }
+
+    /// Strict classic-PDF parsing; no rendering, repair or document mutation.
+    #[allow(clippy::type_complexity)]
+    fn scan_pdf(
+        &self,
+        data: &[u8],
+        parent: &str,
+        tracker: &mut ResourceTracker,
+        depth: usize,
+    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
+        tracker.check_depth(depth)?;
+        tracker.check_timeout()?;
+        let options = lopdf::LoadOptions {
+            strict: true,
+            max_decompressed_size: Some(0),
+            ..Default::default()
+        };
+        let doc = match lopdf::Document::load_mem_with_options(data, options) {
+            Ok(doc) => doc,
+            Err(e) => {
+                return Ok((
+                    vec![],
+                    Some((
+                        ScanStatus::Unsupported,
+                        format!("PDF structure not inspected: {e}"),
+                    )),
+                ))
+            }
+        };
+        tracker.check_timeout()?;
+        if doc.trailer.has(b"Encrypt") || doc.is_encrypted() {
+            return Ok((
+                vec![],
+                Some((
+                    ScanStatus::Unsupported,
+                    "Encrypted PDF not inspected".into(),
+                )),
+            ));
+        }
+        let mut reports = Vec::new();
+        let mut issue = None;
+        for (id, object) in &doc.objects {
+            tracker.check_timeout()?;
+            let lopdf::Object::Stream(stream) = object else {
+                continue;
+            };
+            let supported = if stream.dict.has(b"Filter") {
+                stream
+                    .filters()
+                    .is_ok_and(|filters| filters.len() == 1 && filters[0] == b"FlateDecode")
+            } else {
+                true
+            };
+            if !supported || stream.dict.has(b"F") || stream.dict.has(b"DecodeParms") {
+                issue = Some((
+                    ScanStatus::Unsupported,
+                    "PDF unsupported filter, decode parameters or external stream".into(),
+                ));
+                continue;
+            }
+            tracker.register_attachment(0)?;
+            let cap = tracker.limits().max_email_attachment_size.min(
+                tracker
+                    .limits()
+                    .max_total_extracted_bytes
+                    .saturating_sub(tracker.total_extracted_bytes()),
+            ) as usize;
+            let bytes = if stream.dict.has(b"Filter") {
+                match stream.decompressed_content_with_limit(cap) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        issue = Some((
+                            ScanStatus::Unsupported,
+                            format!("PDF stream decoding incomplete: {e}"),
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                if stream.content.len() > cap {
+                    issue = Some((
+                        ScanStatus::Unsupported,
+                        "PDF stream extraction limit".into(),
+                    ));
+                    continue;
+                }
+                stream.content.clone()
+            };
+            tracker.check_timeout()?;
+            tracker.record_extracted_bytes(bytes.len())?;
+            reports.push(self.scan_object(
+                &bytes,
+                &format!("{parent}/pdf-object-{}-{}", id.0, id.1),
+                None,
+                tracker,
+                depth,
+            )?);
+        }
+        Ok((reports, issue))
     }
 
     /// Inspect each GZIP member independently, preserving exact-hash matching.
@@ -1379,6 +1487,68 @@ mod tests {
     use super::*;
     use raxosentinel_core::{ResourceLimits, ThreatCategory};
     use std::io::Write;
+
+    #[test]
+    fn pdf_streams_detection_and_limits() {
+        use lopdf::{dictionary, Document, Stream};
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        for compressed in [false, true] {
+            for payload in [
+                b"ordinary clean text".as_slice(),
+                b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*".as_slice(),
+            ] {
+                let mut doc = Document::with_version("1.4");
+                let pages = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => Vec::<lopdf::Object>::new(), "Count" => 0 });
+                let root = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+                doc.trailer.set("Root", root);
+                let mut stream =
+                    Stream::new(dictionary! { "Type" => "EmbeddedFile" }, payload.to_vec());
+                if compressed {
+                    let mut encoder =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(payload).unwrap();
+                    stream.set_content(encoder.finish().unwrap());
+                    stream.dict.set("Filter", "FlateDecode");
+                }
+                doc.add_object(stream);
+                let mut data = Vec::new();
+                doc.save_to(&mut data).unwrap();
+                let mut tracker = ResourceTracker::new(ResourceLimits::default());
+                let report = scanner
+                    .scan_object(&data, "fixture.pdf", None, &mut tracker, 0)
+                    .unwrap();
+                assert_eq!(
+                    report.status,
+                    if payload.starts_with(b"ordinary") {
+                        ScanStatus::Clean
+                    } else {
+                        ScanStatus::Infected
+                    }
+                );
+                assert!(!report.sub_targets.is_empty());
+                let mut tracker = ResourceTracker::new(ResourceLimits {
+                    max_total_extracted_bytes: 1,
+                    ..Default::default()
+                });
+                assert_ne!(
+                    scanner
+                        .scan_object(&data, "limited.pdf", None, &mut tracker, 0)
+                        .unwrap()
+                        .status,
+                    ScanStatus::Clean
+                );
+            }
+        }
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        assert_eq!(
+            scanner
+                .scan_object(b"%PDF-1.4\ntruncated", "broken.pdf", None, &mut tracker, 0)
+                .unwrap()
+                .status,
+            ScanStatus::Unsupported
+        );
+    }
 
     #[test]
     fn gzip_members_clean_trailing_and_count_limit() {
