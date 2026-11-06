@@ -196,6 +196,9 @@ pub struct CoordinatorResponse {
     pub status: CoordinatorVerdict,
     pub report: Option<ScanReport>,
     pub error: Option<String>,
+    /// Stable reason for recognized timeout errors; absent for other errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -825,6 +828,7 @@ fn send_busy_response(mut stream: UnixStream, reason: &str) {
         status: CoordinatorVerdict::Busy,
         report: None,
         error: Some(reason.into()),
+        error_code: None,
         database_generation: None,
         degraded_freshness: None,
         pending_generation: None,
@@ -847,6 +851,7 @@ fn send_unauthorized_response(mut stream: UnixStream, reason: &str) {
         status: CoordinatorVerdict::Error,
         report: None,
         error: Some(reason.into()),
+        error_code: None,
         database_generation: None,
         degraded_freshness: None,
         pending_generation: None,
@@ -900,10 +905,18 @@ fn handle_client_connection(
                      report: Option<ScanReport>,
                      error: Option<String>|
      -> CoordinatorResponse {
+        let is_timeout = error
+            .as_deref()
+            .or_else(|| report.as_ref().and_then(|r| r.error.as_deref()))
+            .is_some_and(|s| {
+                s == "Worker deadline exceeded; worker terminated"
+                    || s.starts_with("Scan timeout reached after ")
+            });
         CoordinatorResponse {
             status,
             report,
             error,
+            error_code: is_timeout.then(|| "TIMEOUT".to_string()),
             database_generation: database_generation.clone(),
             degraded_freshness,
             pending_generation: pending_generation.clone(),

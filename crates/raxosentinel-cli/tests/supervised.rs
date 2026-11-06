@@ -40,6 +40,31 @@ fn clean_detected_archive_and_existing_cli() {
     assert_eq!(verdict(&command(&zip).output().unwrap()), "DETECTED");
 }
 #[test]
+fn eicar_zip_and_pdf_polyglots() {
+    use std::io::{Cursor, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+    for method in [
+        zip::CompressionMethod::Stored,
+        zip::CompressionMethod::Deflated,
+    ] {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "eicar.com",
+                zip::write::SimpleFileOptions::default().compression_method(method),
+            )
+            .unwrap();
+        writer.write_all(eicar).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        for prefix in [&b""[..], &b"%PDF-1.4\n"[..]] {
+            let path = dir.path().join("fixture.bin");
+            std::fs::write(&path, [prefix, &bytes].concat()).unwrap();
+            assert_eq!(verdict(&command(&path).output().unwrap()), "DETECTED");
+        }
+    }
+}
+#[test]
 fn descriptor_validation_and_path_replacement() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("target.txt");

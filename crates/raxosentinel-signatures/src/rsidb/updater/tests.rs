@@ -1109,8 +1109,9 @@ fn test_15_clamav_dual_database_independent_tracking_and_authentication() {
     );
 
     // 3. Independent tracking: unchanged vs changed
-    let provider = ClamAvProvider::with_cvd_dir(cvd_dir);
     let composite = format!("main:{},daily:{}", main_meta.version, daily_meta.version);
+    // Authentication uses real CVDs; tracking must not depend on live DNS.
+    let provider = ClamAvProvider::with_cvd_dir(cvd_dir).with_version(&composite);
 
     // State with same version -> available=false (no unnecessary build)
     let state_same = ProviderState {
