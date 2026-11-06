@@ -664,7 +664,6 @@ fn test_06_worker_crash_without_affecting_other_scans() {
 
     assert_eq!(c1, 3, "Crashing worker must exit code 3");
     assert_eq!(r1["status"].as_str().unwrap(), "ERROR");
-    assert_eq!(r1["error_code"], "TIMEOUT");
 
     assert_eq!(c2, 0, "Concurrent clean scan must succeed with exit code 0");
     assert_eq!(r2["status"].as_str().unwrap(), "CLEAN");
@@ -719,6 +718,7 @@ fn test_07_worker_timeout_without_affecting_other_scans() {
 
     assert_eq!(c1, 3, "Timed out worker must return ERROR exit code 3");
     assert_eq!(r1["status"].as_str().unwrap(), "ERROR");
+    assert_eq!(r1["error_code"], "TIMEOUT");
 
     assert_eq!(c2, 0, "Concurrent scan must complete with CLEAN");
     assert_eq!(r2["status"].as_str().unwrap(), "CLEAN");
