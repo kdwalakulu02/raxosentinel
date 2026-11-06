@@ -1,0 +1,47 @@
+# file	expected	category	generator	structure	sha256	bytes	notes
+bomb-flate-embedded.pdf	ERROR	resource	generate.py (hand-built, PDF 32000-1 syntax)	64 MiB of zeros compressed ~1000:1 in one EmbeddedFile	f11f1c8b4c98b80f7ff0f1271b9ef31bd6363d12de9ed7fe924b63b533768527	65829	
+bomb-object-stream.pdf	ERROR	resource	generate.py (hand-built, PDF 32000-1 syntax)	object stream inflating to 80 MiB	8106a905ca34c69c47dc3d313edef45935cb450cf57b91cfb8ac453db9dd4fda	82025	
+cairo-default.pdf	CLEAN	clean	cairo 1.18.4 (pycairo 1.27.0)	PDF 1.7 object streams + xref stream; Flate images (cairo default)	73e224aa2d43e5202f574d335691239863b7c77246b659848c4e8bd17bf0b854	99136	
+cairo-pdf14.pdf	CLEAN	clean	cairo 1.18.4 (pycairo 1.27.0)	PDF 1.4 restricted; classic xref	2b74cf7ca4e2c021d7bf73876419a9d61d30010030ec377c92c2b4ebc88b1210	99603	
+cairo-text-only.pdf	CLEAN	clean	cairo 1.18.4 (pycairo 1.27.0)	single page; object streams; embedded subset font	396d84ae57ef07f14f1e82b211a2691e636eac784d6bbe5c8146de9ef9b012df	10220	
+chromium-links-tagged.pdf	CLEAN	clean	Chromium 156.0.8078.79 built on Debian GNU/Linux 13 (trixie)	URI link annotations; document outline; tagged	d69bc95fd0f7627fdabdc21dbcd64ae379da6d453088314f1018d8ba2ffa34f3	56240	
+chromium-print.pdf	CLEAN	clean	Chromium 156.0.8078.79 built on Debian GNU/Linux 13 (trixie)	Skia PDF backend; Flate image; subset fonts	40ed256e9eecb6ad95333a7cfd0dd0b78cee6b535449efa077ec85f5f5a1225c	79838	
+eicar-ahx-flate-chain.pdf	DETECTED	detection	generate.py (hand-built, PDF 32000-1 syntax)	EICAR behind an [/ASCIIHexDecode /FlateDecode] filter chain	8245065e73082cb565ef18fe78414d7f0562d981dd70e4f7230c9bf785788ff2	758	
+eicar-attachment-classic.pdf	DETECTED	detection	qpdf version 12.2.0	EICAR EmbeddedFile; Flate; classic xref	c2f707f1526b71ed0e91dc549ccef835cd33d122086a77b8dba394d67c2cf793	144564	
+eicar-attachment-encrypted-owner-only.pdf	DETECTED	detection	qpdf version 12.2.0	EICAR EmbeddedFile inside AES-256 empty-user-password encryption	07e531372f3f9ad463ab94e67306470cfc2147aa49350b21bb994d5027391418	146316	
+eicar-attachment-linearized.pdf	DETECTED	detection	qpdf version 12.2.0	EICAR EmbeddedFile in linearized file	8a3828014748027065ea50d2564800fe16365b775d63262c5a8b8829571bd142	145098	
+eicar-attachment-objstm.pdf	DETECTED	detection	qpdf version 12.2.0	EICAR EmbeddedFile; object streams + xref stream	f45a32040bfa5eafe286f89ea3bf526c7eed17d7499606de3071d8b47544aed1	143198	
+eicar-attachment-user-password.pdf	UNSCANNED	encrypted	qpdf version 12.2.0	EICAR inside password-protected PDF	e507e7047b137970c9ca6534ae1264946f5073bd9377fd2bbce3574fed6268c2	146316	cannot be decrypted; must not be CLEAN
+eicar-hex-string-info.pdf	DETECTED	detection	generate.py (hand-built, PDF 32000-1 syntax)	EICAR only as a hex string in the document Info dictionary	2bdcac93cb58ed833bf57f898d2d806fad2acc86bf00a464dfd3a5478e1e596c	534	
+eicar-incremental-added.pdf	DETECTED	detection	MuPDF mutool version 1.25.1	EICAR attachment introduced in a later revision	33b00058fb52d6ed6148e288befd8ed65b3005e9154b498bf77a31f0db362bd6	145181	
+eicar-incremental-shadowed.pdf	DETECTED	detection	MuPDF mutool version 1.25.1	EICAR attachment only in a superseded revision (still physically present)	125398955ab2062e356ddbf3f2447c572c84443dd5177a2fbbd4dec9a95e2635	144809	
+flate-trailing-garbage.pdf	CLEAN	tolerated	generate.py (hand-built, PDF 32000-1 syntax)	complete deflate body, Adler-32 cut short, trailing bytes after the final block	ba66f3c786e7401828d3965e5f5fbdc817324bb8f4ecdd9422632cce0facb325	699	
+ghostscript-ebook.pdf	CLEAN	clean	Ghostscript 10.05.1	Ghostscript /ebook optimisation of LibreOffice output	e84550e28c7bd1b1260d8336195cea206d67be130a570f937570a6f7c7eb4752	145490	
+libreoffice-calc-ledger.pdf	CLEAN	clean	LibreOffice 25.2.3.2 520(Build:2)	multi-page spreadsheet export; classic xref	fa0953f41855dd8c6c482cda03beeedac5e3c4c00385cf4c5565dbbc628e3180	337550	
+libreoffice-docx-export.pdf	CLEAN	clean	LibreOffice 25.2.3.2 520(Build:2)	classic xref; Flate content; DCT image; embedded fonts	df8bf390de08ac856f75f0b532b59217214093bc25a030fbd28fb533c63f278e	180035	Word-compatible DOCX source
+libreoffice-hybrid-embedded-odt.pdf	CLEAN	clean	LibreOffice 25.2.3.2 520(Build:2)	hybrid PDF: embedded ODF document as EmbeddedFile stream	47512db8c73a3631b75a731f850f5de139b5cf610354af7d1d3aacd53b8aa0fd	171744	
+libreoffice-pdfa2b.pdf	CLEAN	clean	LibreOffice 25.2.3.2 520(Build:2)	PDF/A-2b; classic xref; XMP metadata; ICC output intent	255d4042c6930f758f6aabadb104074eff9def858ecf8299ebc23b6db07f5c1f	188995	
+libreoffice-tagged.pdf	CLEAN	clean	LibreOffice 25.2.3.2 520(Build:2)	tagged PDF structure tree	d05f563a481c976aa18da94c3d528620c033b0d8363799392cc1acc2bed17440	180021	
+malformed-bad-startxref.pdf	UNSCANNED	malformed	byte edit of libreoffice-docx-export.pdf	startxref offset corrupted	06f96da89c1a9fd1b47e90087f84cb82d070037a49e8ac9b697bf4932d153c90	180035	
+malformed-corrupt-flate.pdf	UNSCANNED	malformed	generate.py (hand-built, PDF 32000-1 syntax)	EmbeddedFile whose first deflate block uses the reserved block type 3	0982120e9d93101b8730c9c79d7d943d1a0d8fc774bd217c5889dba105f2a1f0	1542	
+malformed-header-only.pdf	UNSCANNED	malformed	generate.py	header without body	c644f26a0d71bd3bbb2ef5e90ba41b6f10a19ca99934fb9e784edfafd3b2620c	15	
+malformed-truncated-flate.pdf	UNSCANNED	malformed	generate.py (hand-built, PDF 32000-1 syntax)	EmbeddedFile whose deflate data stops before the final block	6488863892fda16cbf4b66ab4986e33717f48d75c62069931852f3ff6d941ff9	1064	
+malformed-truncated.pdf	UNSCANNED	malformed	truncation of libreoffice-docx-export.pdf	file cut at 60%; xref and trailer missing	55b31d0d5bbee9bfef58aa8b0de98c82c88e74db8cb0c4cf858ea5964571ea8d	108021	
+mupdf-incremental-clean.pdf	CLEAN	clean	MuPDF mutool version 1.25.1	incremental update appended to a classic file	fcee80b30faa491f3eba9700ab317c2feb46b120ea2c6dbf65de4db526488bae	145112	
+mupdf-incremental-objstm.pdf	CLEAN	clean	MuPDF mutool version 1.25.1	incremental update over object/xref streams	aabae468df7088952019338a1293be82fca30645bf33280e693f1cc6d7f476b6	99472	
+pdftocairo-rewrite.pdf	CLEAN	clean	pdftocairo version 25.03.0 / cairo 1.18.4 (pycairo 1.27.0)	poppler->cairo rewrite of the LibreOffice fixture	11c6fc3a1a21bf388b2400e1afd98ac4097402c210ecc4f8f478fdf15f691eb0	141254	
+qpdf-attachment-clean.pdf	CLEAN	clean	qpdf version 12.2.0	EmbeddedFiles name tree; Flate EmbeddedFile stream	f4b0e1beb9a0a24f5c9f4aa51bd5b008cea61fa4a8ceab6627901deeddd9a827	144535	
+qpdf-encrypted-owner-only-aes256.pdf	CLEAN	clean	qpdf version 12.2.0	AES-256 (R6) encryption, empty user password (permissions-only)	2360d7134f5e0bf7f9deb2e907f697fd3a84973c34f79c232812ebe99b285ea6	145364	
+qpdf-encrypted-owner-only-rc4.pdf	CLEAN	clean	qpdf version 12.2.0	RC4-128 encryption, empty user password	637797fa992aff9410240238edf829bab141b07ea9b5797d845612c3e9485767	144425	
+qpdf-encrypted-user-password.pdf	UNSCANNED	encrypted	qpdf version 12.2.0	AES-256 with a required user password	b083aa6203bd61b84edac2790b8f89451a51f09c4dd429829c0eda67cea43eee	145361	content cannot be decrypted without the password
+qpdf-linearized-objstm.pdf	CLEAN	clean	qpdf version 12.2.0	linearized + object streams + xref streams	1400f4c3b073b8d35a40ad5ac446f36ee31cb06257ec98b7fb81548332b8ff5a	144491	
+qpdf-linearized.pdf	CLEAN	clean	qpdf version 12.2.0	linearized (fast web view); hint stream; two xref sections	969e27401491afe6e8b5d43cb1f3632a43628c0c2957f519aba685d0706bfad5	144552	
+qpdf-object-streams.pdf	CLEAN	clean	qpdf version 12.2.0	object streams + xref stream (qpdf generate)	bb7aed925c607c5deba788ef9ecea810e350710079b80a82fe28004f260a5835	142826	
+reportlab-ascii85-image.pdf	CLEAN	clean	ReportLab 4.3.1	uncompressed pages; image with [/ASCII85Decode /DCTDecode]	df41f757fb3b85c4fd2be2af0c0753215ae088191acdf578383601656d2a7dfd	149489	
+reportlab-compressed.pdf	CLEAN	clean	ReportLab 4.3.1	classic xref; Flate page content; JPEG image (DCT)	805bfdb37e408b3ae3c7d5a1de87380be5286d07b9d6fd223fdd038418a30abb	144623	
+reportlab-uncompressed.pdf	CLEAN	clean	ReportLab 4.3.1	classic xref; unfiltered page content (ASCII85 image off)	a6a322df3fd5ef48426a272afe24f98496699c286bc57c2277150872b7ed89b8	8776	
+scan-ghostscript-pdfwrite.pdf	CLEAN	clean	Ghostscript 10.05.1	Ghostscript pdfwrite re-distillation of a scanned page	60a750b4c997ca514e6339fa4d699c1b20bf63238da6c4da0d4e339de8567fb5	508309	
+scan-img2pdf-ccitt.pdf	CLEAN	clean	img2pdf 0.6.1	bilevel scan; CCITTFaxDecode G4 image	10e04929482c8a2fe2b699f5e0d831488d97d24669bde380fd558680dac1ca3e	39177	
+scan-img2pdf-jpeg.pdf	CLEAN	clean	img2pdf 0.6.1	scanned page; single DCTDecode image	fa7b45a71d19c0569676c9d941c55af28e6dc07e47f7512fa511f4c4ac6a28c5	507097	
+scan-img2pdf-png-predictor.pdf	CLEAN	clean	img2pdf 0.6.1	scanned page; Flate image with PNG predictor DecodeParms	44e953dc884002a3e73afcf5ef35b6012c491a12270d0565d9f6e3b09e2e981a	266526	
+unsupported-unknown-filter.pdf	UNSCANNED	unsupported	generate.py (hand-built, PDF 32000-1 syntax)	stream with a filter no PDF reader implements	d0c939f08437d67d7555c78529a8a987484002d2091d52d57e484343972649e0	597	

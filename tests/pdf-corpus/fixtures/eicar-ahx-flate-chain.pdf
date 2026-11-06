@@ -1,0 +1,33 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(a) 4 0 R] >> >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>
+endobj
+4 0 obj
+<< /Type /Filespec /F (a.com) /EF << /F 5 0 R >> >>
+endobj
+5 0 obj
+<< /Length 153 /Type /EmbeddedFile /Filter [/ASCIIHexDecode /FlateDecode] >>
+stream
+789c8b30f5570c5075700c88368909888a3035d10888d3347776d634af5571f574760cd20d0e71f473710c72d175f40bf10cf30c0a0dd60d710d0ed175f3f4715554f1d0f6d002007454120f>
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000117 00000 n 
+0000000174 00000 n 
+0000000245 00000 n 
+0000000312 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+575
+%%EOF

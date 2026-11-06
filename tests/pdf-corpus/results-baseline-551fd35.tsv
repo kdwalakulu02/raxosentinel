@@ -1,0 +1,47 @@
+file	expected	supervised	match	in_process	wall_s	peak_rss_kib	detail
+bomb-flate-embedded.pdf	ERROR	UNSCANNED	MISMATCH	UNSCANNED	0.02	31744	PDF stream decoding incomplete: couldn't decompress stream
+bomb-object-stream.pdf	ERROR	UNSCANNED	MISMATCH	UNSCANNED	0.00	6016	PDF structure not inspected: couldn't decompress stream
+cairo-default.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6016	PDF structure not inspected: couldn't decompress stream
+cairo-pdf14.pdf	CLEAN	CLEAN	ok	CLEAN	0.04	7808	
+cairo-text-only.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	5888	PDF structure not inspected: couldn't decompress stream
+chromium-links-tagged.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6784	
+chromium-print.pdf	CLEAN	CLEAN	ok	CLEAN	0.01	8448	
+eicar-ahx-flate-chain.pdf	DETECTED	UNSCANNED	MISMATCH	UNSCANNED	0.00	5760	PDF unsupported filter, decode parameters or external stream
+eicar-attachment-classic.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6144	
+eicar-attachment-encrypted-owner-only.pdf	DETECTED	DETECTED	ok	DETECTED	0.01	6528	
+eicar-attachment-linearized.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6016	
+eicar-attachment-objstm.pdf	DETECTED	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF structure not inspected: couldn't decompress stream
+eicar-attachment-user-password.pdf	UNSCANNED	ERROR	MISMATCH	UNSCANNED	0.00	6272	Malformed worker response
+eicar-hex-string-info.pdf	DETECTED	CLEAN	MISMATCH	CLEAN	0.00	5632	
+eicar-incremental-added.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6272	
+eicar-incremental-shadowed.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6272	
+flate-trailing-garbage.pdf	CLEAN	ERROR	MISMATCH	CLEAN	0.00	6016	Malformed worker response
+ghostscript-ebook.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6016	PDF structure not inspected: couldn't decompress stream
+libreoffice-calc-ledger.pdf	CLEAN	CLEAN	ok	CLEAN	0.01	12032	
+libreoffice-docx-export.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	7040	PDF unsupported filter, decode parameters or external stream
+libreoffice-hybrid-embedded-odt.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6400	PDF unsupported filter, decode parameters or external stream
+libreoffice-pdfa2b.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6656	PDF unsupported filter, decode parameters or external stream
+libreoffice-tagged.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6912	PDF unsupported filter, decode parameters or external stream
+malformed-bad-startxref.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	5888	PDF structure not inspected: failed parsing cross reference table
+malformed-corrupt-flate.pdf	UNSCANNED	ERROR	MISMATCH	CLEAN	0.00	5888	Malformed worker response
+malformed-header-only.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	5376	PDF structure not inspected: failed parsing cross reference table
+malformed-truncated-flate.pdf	UNSCANNED	ERROR	MISMATCH	CLEAN	0.00	6016	Malformed worker response
+malformed-truncated.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	5760	PDF structure not inspected: failed parsing cross reference table
+mupdf-incremental-clean.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6400	PDF unsupported filter, decode parameters or external stream
+mupdf-incremental-objstm.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF structure not inspected: couldn't decompress stream
+pdftocairo-rewrite.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6016	PDF structure not inspected: couldn't decompress stream
+qpdf-attachment-clean.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF unsupported filter, decode parameters or external stream
+qpdf-encrypted-owner-only-aes256.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6528	PDF unsupported filter, decode parameters or external stream
+qpdf-encrypted-owner-only-rc4.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6656	PDF unsupported filter, decode parameters or external stream
+qpdf-encrypted-user-password.pdf	UNSCANNED	ERROR	MISMATCH	UNSCANNED	0.00	6272	Malformed worker response
+qpdf-linearized-objstm.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6272	PDF structure not inspected: couldn't decompress stream
+qpdf-linearized.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF unsupported filter, decode parameters or external stream
+qpdf-object-streams.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF structure not inspected: couldn't decompress stream
+reportlab-ascii85-image.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF unsupported filter, decode parameters or external stream
+reportlab-compressed.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF unsupported filter, decode parameters or external stream
+reportlab-uncompressed.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	5760	
+scan-ghostscript-pdfwrite.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6528	PDF structure not inspected: couldn't decompress stream
+scan-img2pdf-ccitt.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF unsupported filter, decode parameters or external stream
+scan-img2pdf-jpeg.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	7168	PDF unsupported filter, decode parameters or external stream
+scan-img2pdf-png-predictor.pdf	CLEAN	UNSCANNED	MISMATCH	UNSCANNED	0.00	6144	PDF unsupported filter, decode parameters or external stream
+unsupported-unknown-filter.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	5760	PDF unsupported filter, decode parameters or external stream

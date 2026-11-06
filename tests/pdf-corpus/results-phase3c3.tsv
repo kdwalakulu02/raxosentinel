@@ -1,0 +1,47 @@
+file	expected	supervised	match	in_process	wall_s	peak_rss_kib	detail
+bomb-flate-embedded.pdf	ERROR	ERROR	ok	ERROR	0.11	31744	PDF_RESOURCE_LIMIT: bomb-flate-embedded.pdf/pdf-embedded-5-0: decoded size exceeds 26214400 bytes
+bomb-object-stream.pdf	ERROR	ERROR	ok	ERROR	0.05	32128	PDF_RESOURCE_LIMIT: object stream 4 0: decoded size exceeds 26214400 bytes
+cairo-default.pdf	CLEAN	CLEAN	ok	CLEAN	0.02	9472	
+cairo-pdf14.pdf	CLEAN	CLEAN	ok	CLEAN	0.02	9344	
+cairo-text-only.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6272	
+chromium-links-tagged.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7260	
+chromium-print.pdf	CLEAN	CLEAN	ok	CLEAN	0.01	9856	
+eicar-ahx-flate-chain.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6272	
+eicar-attachment-classic.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6912	
+eicar-attachment-encrypted-owner-only.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6932	
+eicar-attachment-linearized.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6988	
+eicar-attachment-objstm.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6984	
+eicar-attachment-user-password.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6400	PDF_ENCRYPTED: encrypted PDF requires a password; content not inspected
+eicar-hex-string-info.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6144	
+eicar-incremental-added.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6784	
+eicar-incremental-shadowed.pdf	DETECTED	DETECTED	ok	DETECTED	0.00	6784	
+flate-trailing-garbage.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6400	
+ghostscript-ebook.pdf	CLEAN	CLEAN	ok	CLEAN	0.02	7168	
+libreoffice-calc-ledger.pdf	CLEAN	CLEAN	ok	CLEAN	0.01	12532	
+libreoffice-docx-export.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7456	
+libreoffice-hybrid-embedded-odt.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7040	
+libreoffice-pdfa2b.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7492	
+libreoffice-tagged.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7328	
+malformed-bad-startxref.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6144	PDF_PARSE_FAILED: PDF structure not inspected: failed parsing cross reference table
+malformed-corrupt-flate.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6272	PDF_STREAM_DECODE_FAILED: malformed-corrupt-flate.pdf/pdf-embedded-5-0: corrupt deflate data: deflate decompression error
+malformed-header-only.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	5888	PDF_PARSE_FAILED: PDF structure not inspected: failed parsing cross reference table
+malformed-truncated-flate.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6400	PDF_STREAM_DECODE_FAILED: malformed-truncated-flate.pdf/pdf-embedded-5-0: truncated deflate data (no final block)
+malformed-truncated.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6144	PDF_PARSE_FAILED: PDF structure not inspected: failed parsing cross reference table
+mupdf-incremental-clean.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6784	
+mupdf-incremental-objstm.pdf	CLEAN	CLEAN	ok	CLEAN	0.02	9216	
+pdftocairo-rewrite.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6656	
+qpdf-attachment-clean.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6912	
+qpdf-encrypted-owner-only-aes256.pdf	CLEAN	CLEAN	ok	CLEAN	0.01	6932	
+qpdf-encrypted-owner-only-rc4.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6928	
+qpdf-encrypted-user-password.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6528	PDF_ENCRYPTED: encrypted PDF requires a password; content not inspected
+qpdf-linearized-objstm.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6912	
+qpdf-linearized.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6784	
+qpdf-object-streams.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6656	
+reportlab-ascii85-image.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6400	
+reportlab-compressed.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6912	
+reportlab-uncompressed.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6272	
+scan-ghostscript-pdfwrite.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7808	
+scan-img2pdf-ccitt.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	6400	
+scan-img2pdf-jpeg.pdf	CLEAN	CLEAN	ok	CLEAN	0.00	7552	
+scan-img2pdf-png-predictor.pdf	CLEAN	CLEAN	ok	CLEAN	0.02	12928	
+unsupported-unknown-filter.pdf	UNSCANNED	UNSCANNED	ok	UNSCANNED	0.00	6016	PDF_UNSUPPORTED_FILTER: unsupported-unknown-filter.pdf/pdf-embedded-5-0: unsupported filter /RaxoUnknownDecode
