@@ -652,7 +652,7 @@ impl<'a> EmailScanner<'a> {
         ))
     }
 
-    /// Decode concatenated gzip members as one bounded stream; malformed data fails closed.
+    /// Inspect each GZIP member independently, preserving exact-hash matching.
     #[allow(clippy::type_complexity)]
     fn scan_gzip(
         &self,
@@ -663,56 +663,82 @@ impl<'a> EmailScanner<'a> {
     ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
         use std::io::Read;
         tracker.check_depth(depth)?;
-        tracker.register_attachment(0)?;
-        let cap = tracker.limits().max_email_attachment_size.min(
-            tracker
-                .limits()
-                .max_total_extracted_bytes
-                .saturating_sub(tracker.total_extracted_bytes()),
-        );
-        let mut decoder = flate2::read::MultiGzDecoder::new(data);
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
+        let mut remaining = data;
+        let mut reports = Vec::new();
+        while !remaining.is_empty() {
             tracker.check_timeout()?;
-            match decoder.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if (buf.len() as u64).saturating_add(n as u64) > cap {
-                        return Ok((
-                            vec![],
-                            Some((ScanStatus::Failed, "GZIP extraction budget exceeded".into())),
-                        ));
+            if !remaining.starts_with(b"\x1f\x8b\x08") {
+                return Ok((
+                    reports,
+                    Some((
+                        ScanStatus::Unsupported,
+                        "Uninspected trailing GZIP content".into(),
+                    )),
+                ));
+            }
+            tracker.register_attachment(0)?;
+            let cap = tracker.limits().max_email_attachment_size.min(
+                tracker
+                    .limits()
+                    .max_total_extracted_bytes
+                    .saturating_sub(tracker.total_extracted_bytes()),
+            );
+            // bufread leaves the following member untouched; read::GzDecoder may over-read.
+            let mut decoder = flate2::bufread::GzDecoder::new(remaining);
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 65536];
+            loop {
+                tracker.check_timeout()?;
+                match decoder.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let consumed = remaining.len().saturating_sub(decoder.get_ref().len());
+                        if (buf.len() as u64).saturating_add(n as u64) > cap
+                            || (buf.len() as u64).saturating_add(n as u64)
+                                > (consumed as u64).saturating_mul(1000)
+                        {
+                            return Ok((
+                                reports,
+                                Some((
+                                    ScanStatus::Failed,
+                                    "GZIP extraction size or 1000:1 ratio budget exceeded".into(),
+                                )),
+                            ));
+                        }
+                        buf.try_reserve(n).map_err(|_| {
+                            ScanError::Internal("Cannot allocate gzip buffer".into())
+                        })?;
+                        tracker.record_extracted_bytes(n)?;
+                        buf.extend_from_slice(&chunk[..n]);
                     }
-                    buf.try_reserve(n)
-                        .map_err(|_| ScanError::Internal("Cannot allocate gzip buffer".into()))?;
-                    tracker.record_extracted_bytes(n)?;
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                Err(e) => {
-                    return Ok((
-                        vec![],
-                        Some((ScanStatus::Unsupported, format!("GZIP not inspected: {e}"))),
-                    ))
+                    Err(e) => {
+                        return Ok((
+                            reports,
+                            Some((
+                                ScanStatus::Unsupported,
+                                format!("GZIP member not inspected: {e}"),
+                            )),
+                        ))
+                    }
                 }
             }
+            let next = decoder.into_inner();
+            if next.len() >= remaining.len() {
+                return Ok((
+                    reports,
+                    Some((ScanStatus::Failed, "GZIP decoder made no progress".into())),
+                ));
+            }
+            reports.push(self.scan_object(
+                &buf,
+                &format!("{parent}/gzip-member-{}", reports.len()),
+                None,
+                tracker,
+                depth,
+            )?);
+            remaining = next;
         }
-        let report = self.scan_object(
-            &buf,
-            &format!("{parent}/gzip-content"),
-            None,
-            tracker,
-            depth,
-        )?;
-        // Concatenated members are decoded together; exact-hash rules for
-        // individual members may not match. Never claim complete inspection.
-        Ok((
-            vec![report],
-            Some((
-                ScanStatus::Unsupported,
-                "GZIP members are not inspected individually".into(),
-            )),
-        ))
+        Ok((reports, None))
     }
 
     /// Extracts and scans ZIP members in memory under the shared resource budget.
@@ -1353,6 +1379,40 @@ mod tests {
     use super::*;
     use raxosentinel_core::{ResourceLimits, ThreatCategory};
     use std::io::Write;
+
+    #[test]
+    fn gzip_members_clean_trailing_and_count_limit() {
+        use flate2::{write::GzEncoder, Compression};
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"ordinary clean text").unwrap();
+        let member = enc.finish().unwrap();
+        let mut data = member.clone();
+        data.extend_from_slice(&member);
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "members.gz", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert_eq!(report.sub_targets.len(), 2);
+        let mut tracker = ResourceTracker::new(ResourceLimits {
+            max_email_attachments: 1,
+            ..Default::default()
+        });
+        assert!(scanner
+            .scan_object(&data, "limited.gz", None, &mut tracker, 0)
+            .is_err());
+        data.extend_from_slice(b"uninspected suffix");
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        assert_eq!(
+            scanner
+                .scan_object(&data, "trailing.gz", None, &mut tracker, 0)
+                .unwrap()
+                .status,
+            ScanStatus::Unsupported
+        );
+    }
 
     #[test]
     fn gzip_detection_truncation_and_limits() {
