@@ -582,6 +582,11 @@ impl<'a> EmailScanner<'a> {
                         "Multiple ZIP end records; not all embedded archives may have been inspected".into()));
                 }
             }
+            ContainerKind::Gzip => {
+                let (subs, issue) = self.scan_gzip(data, filename, tracker, depth + 1)?;
+                sub_reports = subs;
+                container_issue = issue;
+            }
             ContainerKind::Unsupported(kind) => {
                 container_issue = Some((
                     ScanStatus::Unsupported,
@@ -607,6 +612,9 @@ impl<'a> EmailScanner<'a> {
         if container_issue.is_none() {
             for (magic, kind) in unsupported_magic {
                 tracker.check_timeout()?;
+                if *kind == "GZIP" && data.starts_with(b"\x1f\x8b\x08") {
+                    continue;
+                }
                 if data.windows(magic.len()).any(|w| w == *magic) {
                     container_issue = Some((
                         ScanStatus::Unsupported,
@@ -641,6 +649,69 @@ impl<'a> EmailScanner<'a> {
             sub_reports,
             duration_ms,
             details,
+        ))
+    }
+
+    /// Decode concatenated gzip members as one bounded stream; malformed data fails closed.
+    #[allow(clippy::type_complexity)]
+    fn scan_gzip(
+        &self,
+        data: &[u8],
+        parent: &str,
+        tracker: &mut ResourceTracker,
+        depth: usize,
+    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
+        use std::io::Read;
+        tracker.check_depth(depth)?;
+        tracker.register_attachment(0)?;
+        let cap = tracker.limits().max_email_attachment_size.min(
+            tracker
+                .limits()
+                .max_total_extracted_bytes
+                .saturating_sub(tracker.total_extracted_bytes()),
+        );
+        let mut decoder = flate2::read::MultiGzDecoder::new(data);
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            tracker.check_timeout()?;
+            match decoder.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if (buf.len() as u64).saturating_add(n as u64) > cap {
+                        return Ok((
+                            vec![],
+                            Some((ScanStatus::Failed, "GZIP extraction budget exceeded".into())),
+                        ));
+                    }
+                    buf.try_reserve(n)
+                        .map_err(|_| ScanError::Internal("Cannot allocate gzip buffer".into()))?;
+                    tracker.record_extracted_bytes(n)?;
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) => {
+                    return Ok((
+                        vec![],
+                        Some((ScanStatus::Unsupported, format!("GZIP not inspected: {e}"))),
+                    ))
+                }
+            }
+        }
+        let report = self.scan_object(
+            &buf,
+            &format!("{parent}/gzip-content"),
+            None,
+            tracker,
+            depth,
+        )?;
+        // Concatenated members are decoded together; exact-hash rules for
+        // individual members may not match. Never claim complete inspection.
+        Ok((
+            vec![report],
+            Some((
+                ScanStatus::Unsupported,
+                "GZIP members are not inspected individually".into(),
+            )),
         ))
     }
 
@@ -854,6 +925,7 @@ impl<'a> EmailScanner<'a> {
 
 enum ContainerKind {
     None,
+    Gzip,
     Zip,
     Unsupported(&'static str),
 }
@@ -874,7 +946,7 @@ fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) 
     } else if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         ContainerKind::Unsupported("7-Zip")
     } else if data.starts_with(&[0x1f, 0x8b]) {
-        ContainerKind::Unsupported("GZIP")
+        ContainerKind::Gzip
     } else if data.starts_with(b"BZh") && data.len() > 3 && data[3].is_ascii_digit() {
         ContainerKind::Unsupported("BZIP2")
     } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
@@ -1281,6 +1353,50 @@ mod tests {
     use super::*;
     use raxosentinel_core::{ResourceLimits, ThreatCategory};
     use std::io::Write;
+
+    #[test]
+    fn gzip_detection_truncation_and_limits() {
+        use flate2::{write::GzEncoder, Compression};
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(eicar).unwrap();
+        let data = enc.finish().unwrap();
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        assert_eq!(
+            scanner
+                .scan_object(&data, "fixture.gz", None, &mut tracker, 0)
+                .unwrap()
+                .status,
+            ScanStatus::Infected
+        );
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        assert_ne!(
+            scanner
+                .scan_object(
+                    &data[..data.len() - 4],
+                    "truncated.gz",
+                    None,
+                    &mut tracker,
+                    0
+                )
+                .unwrap()
+                .status,
+            ScanStatus::Clean
+        );
+        let mut tracker = ResourceTracker::new(ResourceLimits {
+            max_total_extracted_bytes: 4,
+            ..Default::default()
+        });
+        assert_ne!(
+            scanner
+                .scan_object(&data, "limited.gz", None, &mut tracker, 0)
+                .unwrap()
+                .status,
+            ScanStatus::Clean
+        );
+    }
 
     #[test]
     fn test_scan_plain_clean_email() {
