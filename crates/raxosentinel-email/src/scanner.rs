@@ -24,6 +24,9 @@ use raxosentinel_filetypes::{check_extension_mismatch, detect_type, is_tar_heade
 use raxosentinel_signatures::SignatureDatabase;
 use std::path::Path;
 
+mod pdf;
+mod pdf_decode;
+
 /// Scanner dedicated to RFC 822 and MIME email messages, parts, and attachments.
 pub struct EmailScanner<'a> {
     db: &'a SignatureDatabase,
@@ -561,9 +564,21 @@ impl<'a> EmailScanner<'a> {
         }
         tracker.check_timeout()?;
 
+        // PDF structure is inspected first so container signatures inside its
+        // already-inspected streams are not mistaken for embedded archives.
+        let mut pdf = match pdf::header_offset(data) {
+            Some(base) => Some(self.inspect_pdf(data, base, filename, tracker, depth + 1)?),
+            None => None,
+        };
+        let spans = pdf
+            .as_mut()
+            .map(|p| std::mem::take(&mut p.scanned_spans))
+            .unwrap_or_default();
+        let inspected_spans = spans.as_slice();
+
         let mut sub_reports = Vec::new();
         let mut container_issue: Option<(ScanStatus, String)> = None;
-        match classify_container(data, filename, declared_mime) {
+        match classify_container(data, filename, declared_mime, inspected_spans) {
             ContainerKind::Zip => {
                 let (subs, issue) = self.scan_zip(data, filename, tracker, depth + 1)?;
                 sub_reports = subs;
@@ -599,40 +614,24 @@ impl<'a> EmailScanner<'a> {
             ContainerKind::None => {}
         }
 
-        if data.starts_with(b"%PDF-") {
-            let (pdf_reports, issue) = self.scan_pdf(data, filename, tracker, depth + 1)?;
-            sub_reports.extend(pdf_reports);
-            if container_issue.is_none() {
-                container_issue = issue;
-            }
+        if let Some(pdf) = pdf {
+            sub_reports.extend(pdf.reports);
+            threats.extend(pdf.threats);
+            container_issue = more_severe(container_issue, pdf.issue);
         }
 
         // Recognizable unsupported embedded containers cannot be silently treated
         // as fully inspected, even when the outer object is another format.
-        let unsupported_magic: &[(&[u8], &str)] = &[
-            (b"Rar!\x1a\x07", "RAR"),
-            (b"7z\xbc\xaf\x27\x1c", "7-Zip"),
-            (b"\x1f\x8b\x08", "GZIP"),
-            (b"BZh", "BZIP2"),
-            (b"\xfd7zXZ\x00", "XZ"),
-            (b"MSCF", "CAB"),
-        ];
         if container_issue.is_none() {
-            for (magic, kind) in unsupported_magic {
-                tracker.check_timeout()?;
-                if *kind == "GZIP" && data.starts_with(b"\x1f\x8b\x08") {
-                    continue;
-                }
-                if data.windows(magic.len()).any(|w| w == *magic) {
-                    container_issue = Some((
-                        ScanStatus::Unsupported,
-                        format!(
-                            "Possible embedded {} container; contents not inspected",
-                            kind
-                        ),
-                    ));
-                    break;
-                }
+            tracker.check_timeout()?;
+            if let Some(kind) = embedded_container_magic(data, inspected_spans) {
+                container_issue = Some((
+                    ScanStatus::Unsupported,
+                    format!(
+                        "Possible embedded {} container; contents not inspected",
+                        kind
+                    ),
+                ));
             }
         }
 
@@ -658,106 +657,6 @@ impl<'a> EmailScanner<'a> {
             duration_ms,
             details,
         ))
-    }
-
-    /// Strict classic-PDF parsing; no rendering, repair or document mutation.
-    #[allow(clippy::type_complexity)]
-    fn scan_pdf(
-        &self,
-        data: &[u8],
-        parent: &str,
-        tracker: &mut ResourceTracker,
-        depth: usize,
-    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
-        tracker.check_depth(depth)?;
-        tracker.check_timeout()?;
-        let options = lopdf::LoadOptions {
-            strict: true,
-            max_decompressed_size: Some(0),
-            ..Default::default()
-        };
-        let doc = match lopdf::Document::load_mem_with_options(data, options) {
-            Ok(doc) => doc,
-            Err(e) => {
-                return Ok((
-                    vec![],
-                    Some((
-                        ScanStatus::Unsupported,
-                        format!("PDF structure not inspected: {e}"),
-                    )),
-                ))
-            }
-        };
-        tracker.check_timeout()?;
-        if doc.trailer.has(b"Encrypt") || doc.is_encrypted() {
-            return Ok((
-                vec![],
-                Some((
-                    ScanStatus::Unsupported,
-                    "Encrypted PDF not inspected".into(),
-                )),
-            ));
-        }
-        let mut reports = Vec::new();
-        let mut issue = None;
-        for (id, object) in &doc.objects {
-            tracker.check_timeout()?;
-            let lopdf::Object::Stream(stream) = object else {
-                continue;
-            };
-            let supported = if stream.dict.has(b"Filter") {
-                stream
-                    .filters()
-                    .is_ok_and(|filters| filters.len() == 1 && filters[0] == b"FlateDecode")
-            } else {
-                true
-            };
-            if !supported || stream.dict.has(b"F") || stream.dict.has(b"DecodeParms") {
-                issue = Some((
-                    ScanStatus::Unsupported,
-                    "PDF unsupported filter, decode parameters or external stream".into(),
-                ));
-                continue;
-            }
-            tracker.register_attachment(0)?;
-            let cap = tracker.limits().max_email_attachment_size.min(
-                tracker
-                    .limits()
-                    .max_total_extracted_bytes
-                    .saturating_sub(tracker.total_extracted_bytes()),
-            ) as usize;
-            let bytes = if stream.dict.has(b"Filter") {
-                match stream.decompressed_content_with_limit(cap) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        issue = Some((
-                            ScanStatus::Unsupported,
-                            format!("PDF stream decoding incomplete: {e}"),
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                if stream.content.len() > cap {
-                    issue = Some((
-                        ScanStatus::Unsupported,
-                        "PDF stream extraction limit".into(),
-                    ));
-                    continue;
-                }
-                stream.content.clone()
-            };
-            tracker.check_timeout()?;
-            tracker.record_extracted_bytes(bytes.len())?;
-            reports.push(self.scan_object(
-                &bytes,
-                &format!("{parent}/pdf-object-{}-{}", id.0, id.1),
-                None,
-                tracker,
-                depth,
-            )?);
-        }
-        Ok((reports, issue))
     }
 
     /// Inspect each GZIP member independently, preserving exact-hash matching.
@@ -1066,9 +965,16 @@ enum ContainerKind {
 
 /// Content-based container classification, with fallback to declared metadata
 /// for truncated or incomplete containers that cannot be safely inspected.
-fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) -> ContainerKind {
-    if data.windows(4).any(|w| w == b"PK\x03\x04")
+fn classify_container(
+    data: &[u8],
+    filename: &str,
+    declared_mime: Option<&str>,
+    inspected_spans: &[(usize, usize)],
+) -> ContainerKind {
+    if find_outside(data, b"PK\x03\x04", inspected_spans).is_some()
         || data.starts_with(b"PK\x05\x06")
+        || (!inspected_spans.is_empty()
+            && find_outside(data, b"PK\x05\x06", inspected_spans).is_some())
         || filename.to_ascii_lowercase().ends_with(".zip")
         || declared_mime.is_some_and(|m| m.eq_ignore_ascii_case("application/zip"))
     {
@@ -1101,6 +1007,80 @@ fn is_tar_claim(data: &[u8], filename: &str, declared_mime: Option<&str>) -> boo
             || m.eq_ignore_ascii_case("application/x-gtar")
     });
     (is_tar_named || is_tar_mime) && !data.is_empty()
+}
+
+/// First occurrence of `needle` not inside an already-inspected span.
+fn find_outside(data: &[u8], needle: &[u8], skip: &[(usize, usize)]) -> Option<usize> {
+    memchr::memmem::find_iter(data, needle)
+        .find(|&pos| !skip.iter().any(|&(start, end)| start <= pos && pos < end))
+}
+
+/// Finds a signature of an unsupported (or not separately extracted) container
+/// format outside inspected spans. Candidates are validated beyond the magic bytes
+/// so random binary data does not trigger false UNSCANNED results; a candidate cut
+/// off by the end of the data cannot be ruled out and still counts.
+fn embedded_container_magic(data: &[u8], skip: &[(usize, usize)]) -> Option<&'static str> {
+    type Validator = fn(&[u8]) -> bool;
+    // `rest` starts at the candidate. Each validator returns false only when the
+    // bytes present contradict the format.
+    let candidates: [(&[u8], &'static str, Validator); 6] = [
+        (b"Rar!\x1a\x07", "RAR", |r| match r.get(6) {
+            None => true,
+            Some(0) => true,
+            Some(1) => r.get(7).is_none_or(|&b| b == 0),
+            _ => false,
+        }),
+        (b"7z\xbc\xaf\x27\x1c", "7-Zip", |r| {
+            r.get(6).is_none_or(|&b| b == 0)
+        }),
+        (b"\x1f\x8b\x08", "GZIP", |r| {
+            r.get(3).is_none_or(|&flags| flags & 0xe0 == 0)
+                && r.get(8).is_none_or(|&xfl| matches!(xfl, 0 | 2 | 4))
+                && r.get(9).is_none_or(|&os| os <= 13 || os == 255)
+        }),
+        (b"BZh", "BZIP2", |r| {
+            const BLOCK: &[u8] = b"\x31\x41\x59\x26\x53\x59";
+            const END: &[u8] = b"\x17\x72\x45\x38\x50\x90";
+            let tail = r.get(4..).unwrap_or_default();
+            let n = tail.len().min(6);
+            r.get(3).is_none_or(|&level| (b'1'..=b'9').contains(&level))
+                && (tail[..n] == BLOCK[..n] || tail[..n] == END[..n])
+        }),
+        (b"\xfd7zXZ\x00", "XZ", |r| {
+            r.get(6).is_none_or(|&b| b == 0)
+                && r.get(7)
+                    .is_none_or(|&check| matches!(check, 0x00 | 0x01 | 0x04 | 0x0a))
+        }),
+        (b"MSCF", "CAB", |r| {
+            let reserved = r.get(4..8).unwrap_or(r.get(4..).unwrap_or_default());
+            reserved.iter().all(|&b| b == 0)
+        }),
+    ];
+    for (magic, kind, valid) in candidates {
+        // A leading GZIP stream is the object itself and is decoded separately.
+        if kind == "GZIP" && data.starts_with(magic) {
+            continue;
+        }
+        let found = memchr::memmem::find_iter(data, magic).any(|pos| {
+            !skip.iter().any(|&(start, end)| start <= pos && pos < end) && valid(&data[pos..])
+        });
+        if found {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// Keeps the more severe of two inspection issues (Failed > Unsupported).
+fn more_severe(
+    a: Option<(ScanStatus, String)>,
+    b: Option<(ScanStatus, String)>,
+) -> Option<(ScanStatus, String)> {
+    match (&a, &b) {
+        (None, _) => b,
+        (Some((ScanStatus::Unsupported, _)), Some((ScanStatus::Failed, _))) => b,
+        _ => a,
+    }
 }
 
 /// Applies verdict precedence Infected > Failed > Unsupported > Clean.
@@ -1524,7 +1504,9 @@ mod tests {
                         ScanStatus::Clean
                     } else {
                         ScanStatus::Infected
-                    }
+                    },
+                    "{:?}",
+                    report.error
                 );
                 assert!(!report.sub_targets.is_empty());
                 let mut tracker = ResourceTracker::new(ResourceLimits {

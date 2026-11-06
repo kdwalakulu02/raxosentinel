@@ -1515,6 +1515,7 @@ dependencies = [
  "flate2",
  "lopdf",
  "mail-parser",
+ "memchr",
  "raxosentinel-core",
  "raxosentinel-filetypes",
  "raxosentinel-signatures",
@@ -1522,6 +1523,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "weezl",
  "zip",
 ]
 
