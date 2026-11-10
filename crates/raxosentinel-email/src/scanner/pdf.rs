@@ -34,6 +34,7 @@
 //!
 //! Nothing is rendered, executed, repaired or written back.
 
+use super::extract::{Extracted, Extractor};
 use super::pdf_decode::{self, Budget, FailureKind, FilterSpec, Params};
 use super::EmailScanner;
 use lopdf::xref::XrefEntry;
@@ -57,6 +58,8 @@ const MAX_OBJSTM_TOTAL: u64 = 64 << 20;
 const MAX_KEPT_REPORTS: usize = 64;
 /// Earlier revisions loaded to explain streams the latest revision does not reference.
 const MAX_REVISIONS: usize = 32;
+/// Decoded image XObjects larger than this are inspected in streaming mode.
+const IMAGE_BUFFER_LIMIT: u64 = 4 << 20;
 /// The header may follow arbitrary bytes, as conforming readers accept (ISO 32000-2 §7.5.2).
 const HEADER_WINDOW: usize = 1024;
 /// Allowance for the EOL and whitespace between stream data and `endstream`.
@@ -233,6 +236,7 @@ impl LoadState {
         let cap = (self.objstm_cap as u64).min(self.objstm_remaining) as usize;
         let budget = Budget {
             cap,
+            buffer_cap: cap,
             deadline: self.deadline,
         };
         match pdf_decode::decode_chain(&stream.content, &specs, budget) {
@@ -570,6 +574,7 @@ struct Inspection<'p> {
     scanned: Vec<(usize, usize)>,
     streams: usize,
     raw_images: usize,
+    streamed: usize,
     embedded: usize,
     revisions: usize,
 }
@@ -613,6 +618,7 @@ impl EmailScanner<'_> {
             scanned: Vec::new(),
             streams: 0,
             raw_images: 0,
+            streamed: 0,
             embedded: 0,
             revisions: 0,
         };
@@ -629,6 +635,7 @@ impl EmailScanner<'_> {
             parent,
             streams = ctx.streams,
             raw_images = ctx.raw_images,
+            streamed = ctx.streamed,
             embedded = ctx.embedded,
             revisions = ctx.revisions,
             "PDF inspection finished"
@@ -852,41 +859,84 @@ impl EmailScanner<'_> {
                 return Ok(false);
             }
         };
-        let limits = tracker.limits();
-        let cap = limits.max_email_attachment_size.min(
-            limits
-                .max_total_extracted_bytes
-                .saturating_sub(tracker.total_extracted_bytes()),
-        ) as usize;
+        // Image data left in its codec, unchanged from the file bytes that the
+        // enclosing scan has already matched, is not scanned twice.
+        if pdf_decode::is_undecoded_image(&specs) && !encrypted && !embedded {
+            ctx.raw_images += 1;
+            return Ok(false);
+        }
+        let limits = tracker.limits().clone();
+        let is_image = stream
+            .dict
+            .get(b"Subtype")
+            .and_then(Object::as_name)
+            .is_ok_and(|name| name == b"Image");
+        // Embedded files and other streams may need recursive inspection, so they are
+        // buffered up to the attachment limit. Image XObjects are only matched, so
+        // larger ones are streamed and do not consume the extracted-bytes budget.
+        let buffer_limit = if is_image && !embedded {
+            IMAGE_BUFFER_LIMIT
+        } else {
+            limits.max_email_attachment_size
+        };
         let budget = Budget {
-            cap,
+            cap: usize::try_from(limits.max_streamed_object_bytes).unwrap_or(usize::MAX),
+            buffer_cap: usize::try_from(limits.max_buffered_object_bytes).unwrap_or(usize::MAX),
             deadline: ctx.deadline,
         };
-        let content = match pdf_decode::decode_chain(&stream.content, &specs, budget) {
-            Ok(decoded) => {
-                // Image data left in its codec, unchanged from the file bytes that the
-                // enclosing scan has already matched, is not scanned twice.
-                if decoded.image_codec.is_some() && decoded.applied == 0 && !encrypted && !embedded
-                {
-                    ctx.raw_images += 1;
-                    return Ok(false);
-                }
-                decoded.data
+        let mut extractor = Extractor::new(self.db, tracker, buffer_limit);
+        let decoded = pdf_decode::decode_chain_to(&stream.content, &specs, budget, &mut extractor);
+        let extracted = match extractor.finish(decoded.is_ok()) {
+            Ok(extracted) => extracted,
+            Err(e @ ScanError::Timeout { .. }) => return Err(e),
+            Err(e) => {
+                ctx.issues.failed(format!("{label}: {e}"));
+                return Ok(false);
             }
-            Err(failure) => {
-                let message = format!("{label}: {}", failure.message);
-                match failure.kind {
-                    FailureKind::Timeout => {
-                        tracker.check_timeout()?;
-                        return Err(ScanError::Timeout {
-                            duration_ms: tracker.elapsed_millis(),
-                        });
-                    }
-                    FailureKind::Limit => ctx.issues.failed(message),
-                    FailureKind::Unsupported => ctx.issues.unsupported(CODE_FILTER, message),
-                    FailureKind::Malformed => ctx.issues.unsupported(CODE_DECODE, message),
+        };
+        if let Err(failure) = decoded {
+            let message = format!("{label}: {}", failure.message);
+            match failure.kind {
+                FailureKind::Timeout => {
+                    tracker.check_timeout()?;
+                    return Err(ScanError::Timeout {
+                        duration_ms: tracker.elapsed_millis(),
+                    });
                 }
-                failure.partial
+                FailureKind::Limit => ctx.issues.failed(message),
+                FailureKind::Unsupported => ctx.issues.unsupported(CODE_FILTER, message),
+                FailureKind::Malformed => ctx.issues.unsupported(CODE_DECODE, message),
+            }
+        }
+        let content = match extracted {
+            Extracted::Buffered(content) => content,
+            Extracted::Streamed(object) => {
+                ctx.streamed += 1;
+                if embedded {
+                    ctx.embedded += 1;
+                    if let Err(e) = tracker.register_streamed_attachment() {
+                        return match e {
+                            ScanError::Timeout { .. } => Err(e),
+                            e => {
+                                ctx.issues.failed(format!("{label}: {e}"));
+                                Ok(false)
+                            }
+                        };
+                    }
+                }
+                if let Some((status, message)) = &object.issue {
+                    ctx.issues
+                        .raise(*status, "PDF_NESTED", format!("{label}: {message}"));
+                }
+                let report = object.report(&label, 0);
+                if (embedded || report.status != ScanStatus::Clean)
+                    && ctx.reports.len() < MAX_KEPT_REPORTS
+                {
+                    ctx.reports.push(report);
+                } else {
+                    ctx.threats.extend(report.threats);
+                }
+                return Ok(true);
             }
         };
         if embedded {

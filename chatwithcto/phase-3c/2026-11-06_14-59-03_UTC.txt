@@ -1,0 +1,20 @@
+RaxoSentinel Phase 3C.2 — bounded PDF stream inspection
+
+Commit: 551fd35f3bd638952341d50c5fb172de17841cc8
+Branch: phase-3c. Commit and push succeeded. No release, deployment, Raxo Mail changes, database generation changes or tested executable replacement.
+
+Prior workspace run: 205 passed, 0 failed, 2 ignored, confirmed from /tmp/phase3c-members-workspace.log.
+Current focused scanner tests: 30 passed, 0 failed.
+Current complete workspace: 206 passed, 0 failed, 2 ignored. Formatting and Clippy passed. Existing GZIP, ZIP, RSIDB and coordinator regression tests passed. Logs: /tmp/pdf-tests-verified.log, /tmp/pdf-clippy.log, /tmp/pdf-workspace.log.
+
+Implemented strict structural PDF loading with lopdf 0.47.0, default features disabled; scans loaded indirect streams including EmbeddedFile streams. Recursive scanning uses the existing detection engine, preserving signature and RSIDB matching. Supported filters: unfiltered or one FlateDecode, without DecodeParms. Parsing and decoding failures are UNSCANNED. Tracker resource failures remain ERROR. Existing detection precedence remains unchanged. The PDF input is not rendered, sanitised or rewritten.
+
+Tests generate clean and actual EICAR stream objects, including forced FlateDecode compression, embedded-file streams, malformed/truncated PDF and extraction-budget limits. Clean supported fixtures return CLEAN, EICAR returns DETECTED, malformed/truncated structure returns UNSCANNED, and over-budget content does not return CLEAN. These are deterministic small fixtures, not a broad false-positive or memory benchmark. The corpus does not independently prove every embedded-file referencing arrangement or unsupported filter combination.
+
+Limits: streams share attachment count, per-object extracted size, aggregate extraction bytes and recursion limits. Decoder output is capped. Load-time decompression allowance is zero, deliberately declining compressed object/xref structures rather than multiplying per-stream load budgets. Before/after parser and per-object deadline checks are cooperative; the synchronous parser cannot be interrupted by them. Use the existing supervised worker for hard memory and deadline limits. No peak RSS measurement was performed. Parser object graphs can consume memory up to worker limits.
+
+Unsupported: encrypted PDFs; other filters, filter chains, DecodeParms/predictors, external streams; load-time compressed structures; comprehensive inspection of incremental history, arbitrary PDF encodings and JavaScript semantics. No new SUSPICIOUS enum or structural suspicion classifier was added: malformed structures are explicit inspection limitations, not confirmed malware. Existing ERROR/TIMEOUT compatibility remains unchanged. Embedded streams are labelled by object number, without exposing private stream text.
+
+Selection and limitations are documented in docs/PDF_INSPECTION_PHASE3C2.md. Sources: https://docs.rs/lopdf/0.47.0/lopdf/struct.LoadOptions.html ; https://docs.rs/lopdf/0.47.0/lopdf/struct.Stream.html ; https://github.com/J-F-Liu/lopdf/blob/main/CHANGELOG.md . lopdf provides maintained strict parsing and capped decompression APIs (MIT). No comparative parser performance benchmark was performed.
+
+This is a working limited-support development checkpoint. Remaining work includes broader PDF fixtures, measured worker memory/time pressure, structured suspicion reporting and any wider filter/object-stream support. No release is authorised or published.

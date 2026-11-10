@@ -1,0 +1,19 @@
+RaxoSentinel Phase 3B private beta — status report
+
+RELEASE BLOCKED. No commit, push, or GitHub release was made. Do not deploy the experimental binary. The existing private database and packaged rollback release were not altered. Raxo Mail and production services were not touched.
+
+Work completed: retained the PDF-prefixed ZIP discovery change and added conservative UNSCANNED handling when extra ZIP local headers suggest a second or truncated archive. Added recognizable embedded RAR, 7-Zip, GZIP, BZIP2, XZ and CAB marker checks that return UNSCANNED when no higher-priority detection exists. These signature checks may produce false UNSCANNED results. The previous PDF + GZIP example returned CLEAN; it now returns UNSCANNED. Added regression cases for truncated trailing ZIP and embedded GZIP. Existing extraction limits and interface code were not intentionally changed.
+
+EICAR comparison on current debug scanner: normal PDF CLEAN; ordinary stored and deflated EICAR ZIPs DETECTED; PDF + stored EICAR ZIP DETECTED; PDF + deflated EICAR ZIP DETECTED. Prior comparison with ClamAV detected all four infected ZIP samples, and the preserved earlier scanner missed PDF + deflated. A current release build loaded a verified copy of private generation phase2d6-unified and detected PDF + deflated EICAR on the native Debian host. No current measurement independently establishes all 542,057 indicators in Ubuntu.
+
+Validation: cargo fmt --all -- --check PASS; cargo clippy --workspace --all-targets -- -D warnings PASS; cargo test --workspace PASS, 202 passed, 0 failed, 2 ignored (the phase 3B benchmark and synthetic history scale benchmark); cargo build --release --locked PASS on Debian 13 in a separate target directory. Focused archive regression passed. Logs: /tmp/phase3b-beta2-{fmt,clippy,tests,build}.log and /tmp/phase3b-beta-regression2.log. EICAR comparisons were executed manually; the complete requested deterministic EICAR/resource matrix is not yet established.
+
+Experimental executable: /tmp/phase3b-release-target/release/raxosentinel; SHA-256 65ff5bf07e273272b71c88f1e9a037bf8a6a1fc28ccacc7c39f65fd0be02b605. This is not a validated Ubuntu build or deployable beta.
+
+Release blockers:
+1. Archive discovery is incomplete. ZipArchive processes one central directory, not all multiple embedded ZIPs. Marker counts conservatively identify some but do not prove complete inspection of all malformed, ambiguous or nested polyglots. Unsupported-format checks cover recognizable byte signatures, not all possible embedded formats or encodings. False CLEAN remains possible for unrecognized embedded content; do not claim comprehensive support. Implement and validate bounded structural discovery, fail closed when incomplete, and test all requested cases including memory and recovery.
+2. The coordinator verdict enum lacks TIMEOUT; worker deadline failure is returned as ERROR. Implement a machine-readable distinct timeout with a compatibility path for current clients and test its behavior.
+3. Ubuntu 24.04 build and end-to-end private store/socket verification remain incomplete. Previous proot trial started an executable on glibc 2.39 but failed filesystem metadata operations and private store verification; it does not constitute compatibility evidence. Build and verify in a functioning Ubuntu 24.04 environment, including indicator count, EICAR, Unix socket and JSON response, and no public ports.
+4. The comprehensive actual-EICAR automated regression matrix, source review and publication steps are incomplete. No source commit SHA or private release URL exists for these uncommitted changes. Prior tested package remains available for rollback.
+
+RaxoSentinel can scan using its database and built-in rules without invoking ClamAV for the scan path; no claim of complete independence across optional updater tooling is made. No unattended updater was enabled.

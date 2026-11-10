@@ -1,0 +1,35 @@
+RAXOSENTINEL — INTERNAL MAIL INTEGRATION PRERELEASE
+
+INTERNAL DEVELOPMENT — NOT PRODUCTION VALIDATED
+
+A source-only prerelease has been published in the confirmed private repository:
+https://github.com/kdwalakulu02/raxosentinel/releases/tag/internal-mail-integration-20261107
+
+Tag: internal-mail-integration-20261107
+Pinned source commit: 551fd35f3bd638952341d50c5fb172de17841cc8
+The release is marked prerelease, and the tag was verified to point directly to the requested commit. GitHub provides source archives for the tag. No binary is attached; no older executable is represented as this build. Build in the target Ubuntu-compatible environment. Existing releases and tested executable remain available for rollback.
+
+Existing private RSIDB: phase2d6-unified, 542,057 indicators. The database is referenced, not attached or rebuilt. Obtain the existing private artifact through the authorised private channel. Do not distribute it publicly.
+
+MINIMAL INTEGRATION
+
+Build from the pinned source:
+  cargo build --release --locked
+  BIN="$PWD/target/release/raxosentinel"
+  "$BIN" --version
+
+Set PRIVATE_ROOT to the owner-controlled private database root containing the phase2d6-unified directory. Verify it:
+  PRIVATE_ROOT=/path/to/private-root
+  "$BIN" db sources --root "$PRIVATE_ROOT" --generation phase2d6-unified
+  "$BIN" db verify "$PRIVATE_ROOT/phase2d6-unified/database.rsidb"
+
+Start a coordinator using a protected Unix-socket directory and suitable service account:
+  SOCKET=/path/to/private-directory/scan.sock
+  "$BIN" serve --socket "$SOCKET" --private-db-root "$PRIVATE_ROOT" --private-generation phase2d6-unified --max-workers 1 --max-pending 1
+
+Submit an attachment from an authorised client:
+  "$BIN" client --socket "$SOCKET" --json-envelope /path/to/attachment
+
+The envelope provides status, report, error and database_generation when available; the report contains target SHA-256, detections and duration where available. CLEAN means no known indicator was found in the inspection performed, not a guarantee of safety. DETECTED indicates a match. UNSCANNED, ERROR, BUSY and missing responses must not be treated as CLEAN. A recognised scan or worker deadline is ERROR with error_code TIMEOUT in the full envelope; transport failures may not produce an envelope. Exit codes are clean 0, detected 1, unscanned 2, error/busy 3.
+
+Inspection is limited: unsupported formats, encodings, encrypted content and some polyglots may not be fully inspected. Supported PDF streams include unfiltered and a single FlateDecode filter without decode parameters. See the release notes and pinned source documents docs/PRIVATE_BETA_PHASE3B.md and docs/PDF_INSPECTION_PHASE3C2.md. Scanner execution does not require ClamAV. No unattended updates were enabled and nothing was deployed.

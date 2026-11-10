@@ -21,6 +21,7 @@ pub struct SupervisedWorkerConfig {
     pub timeout: Option<u64>,
     pub max_depth: Option<usize>,
     pub rules: Option<PathBuf>,
+    pub yara_rules: Vec<PathBuf>,
     pub private_db_root: Option<PathBuf>,
     pub private_generation: Option<String>,
     pub public_release: Option<PathBuf>,
@@ -96,6 +97,14 @@ pub fn error_report(target: &Path, message: String) -> ScanReport {
 }
 
 pub fn run(args: &ScanArgs) -> i32 {
+    // Worker stderr is discarded, so rule errors are reported by the parent.
+    if let Err(e) = super::attach_yara_rules(
+        &args.yara_rules,
+        &mut raxosentinel_signatures::SignatureDatabase::new(),
+    ) {
+        eprintln!("Error: {e}");
+        return 3;
+    }
     let result = run_inner(args);
     let report = result.unwrap_or_else(|e| error_report(&args.target, e));
     if args.json {
@@ -229,6 +238,7 @@ fn run_inner(args: &ScanArgs) -> Result<ScanReport, String> {
         timeout: args.timeout,
         max_depth: args.max_depth,
         rules: args.rules.clone(),
+        yara_rules: args.yara_rules.clone(),
         private_db_root: args.private_db_root.clone(),
         private_generation: args.private_generation.clone(),
         public_release: args.public_release.clone(),
@@ -262,6 +272,9 @@ pub fn execute_worker_on_snapshot(
     }
     if let Some(v) = &config.rules {
         command.arg("--rules").arg(v);
+    }
+    for v in &config.yara_rules {
+        command.arg("--yara-rules").arg(v);
     }
     if let Some(v) = &config.private_db_root {
         command.arg("--private-db-root").arg(v);

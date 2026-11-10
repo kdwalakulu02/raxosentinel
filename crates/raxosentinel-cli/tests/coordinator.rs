@@ -3091,3 +3091,86 @@ fn test_phase2d8b_resource_exhaustion_and_fault_tolerance() {
         "File descriptors must not leak across repeated scans (initial: {initial_fds}, final: {final_fds})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3D: optional YARA-X rules through the coordinator
+// ---------------------------------------------------------------------------
+fn yara_rule_set(set: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/yara-rules")
+        .join(set)
+}
+
+#[test]
+fn test_phase3d_yara_rules_complement_rsidb_via_socket() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, gen) = setup_test_db(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+    let valid = yara_rule_set("valid");
+    let heavy = yara_rule_set("resource");
+    let _coord = CoordinatorProcess::spawn(
+        &socket,
+        &db_root,
+        gen,
+        &["--yara-rules", valid.to_str().unwrap(), "--yara-rules", heavy.to_str().unwrap(),
+          "--worker-timeout-ms=3000"],
+    );
+
+    let marker = d.path().join("marker.txt");
+    std::fs::write(&marker, b"x RAXO-YARA-TEST-MARKER-7f3c9e y").unwrap();
+    let rsidb = d.path().join("rsidb.bin");
+    std::fs::write(&rsidb, SYNTHETIC_SIGNATURE).unwrap();
+    let clean = d.path().join("clean.txt");
+    std::fs::write(&clean, b"ordinary text").unwrap();
+
+    let (c, r) = run_client(&socket, &marker, &[], &[]);
+    assert_eq!((c, r["status"].as_str().unwrap()), (1, "DETECTED"), "{r}");
+    assert_eq!(r["threats"][0]["name"], "YARA:raxo_test.RaxoTestMarker");
+
+    let (c, r) = run_client(&socket, &rsidb, &[], &[]);
+    assert_eq!((c, r["status"].as_str().unwrap()), (1, "DETECTED"), "{r}");
+    assert!(r["threats"][0]["name"].as_str().unwrap().contains(SYNTHETIC_NAME));
+
+    let (c, r) = run_client(&socket, &clean, &[], &[]);
+    assert_eq!((c, r["status"].as_str().unwrap()), (0, "CLEAN"), "{r}");
+
+    // The heavy rule (`#a > 1000000`) cannot finish on 40 MiB of 'A' before the worker
+    // deadline: the result is ERROR with timeout diagnostics, never CLEAN.
+    let big = d.path().join("aaaa.bin");
+    std::fs::write(&big, vec![b'A'; 40 << 20]).unwrap();
+    let (c, r) = run_client(&socket, &big, &["--json-envelope"], &[]);
+    assert_eq!(c, 3, "{r}");
+    assert_eq!(r["status"], "ERROR", "{r}");
+
+    // The coordinator recovers and keeps serving with rules loaded.
+    let (c, r) = run_client(&socket, &marker, &[], &[]);
+    assert_eq!((c, r["status"].as_str().unwrap()), (1, "DETECTED"), "{r}");
+}
+
+#[test]
+fn test_phase3d_invalid_yara_rules_fail_coordinator_startup() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, gen) = setup_test_db(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::fs::set_permissions(socket.parent().unwrap(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for set in ["invalid-syntax", "invalid-slow"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_raxosentinel"))
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--private-db-root")
+            .arg(&db_root)
+            .arg("--private-generation")
+            .arg(gen)
+            .arg("--yara-rules")
+            .arg(yara_rule_set(set))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{set}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("YARA-X rules rejected"), "{set}: {err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("RAXOSENTINEL_COORDINATOR_READY"));
+        assert!(!socket.exists());
+    }
+}

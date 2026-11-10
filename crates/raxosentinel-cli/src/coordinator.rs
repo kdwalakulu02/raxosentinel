@@ -102,6 +102,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub rules: Option<PathBuf>,
 
+    /// Trusted local YARA-X rule file or directory (repeatable). Rules are compiled
+    /// at startup; any error prevents the service from starting.
+    #[arg(long = "yara-rules", value_name = "PATH")]
+    pub yara_rules: Vec<PathBuf>,
+
     /// Owner-controlled private storage root.
     #[arg(long, conflicts_with_all = ["db", "db_store", "public_release"])]
     pub private_db_root: Option<PathBuf>,
@@ -1076,6 +1081,14 @@ pub fn serve(args: ServeArgs) -> i32 {
         eprintln!("Coordinator startup error: {e}");
         return 3;
     }
+    // Optional YARA-X rules must compile before any request is accepted.
+    if let Err(e) = super::attach_yara_rules(
+        &args.yara_rules,
+        &mut raxosentinel_signatures::SignatureDatabase::new(),
+    ) {
+        eprintln!("Coordinator startup error: {e}");
+        return 3;
+    }
 
     let listener = match prepare_socket(&args.socket) {
         Ok(l) => l,
@@ -1105,6 +1118,7 @@ pub fn serve(args: ServeArgs) -> i32 {
         timeout: args.timeout,
         max_depth: Some(args.max_depth),
         rules: args.rules.clone(),
+        yara_rules: args.yara_rules.clone(),
         private_db_root: args.private_db_root.clone(),
         private_generation: args.private_generation.clone(),
         public_release: args.public_release.clone(),

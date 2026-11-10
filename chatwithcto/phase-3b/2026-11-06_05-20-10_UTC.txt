@@ -1,0 +1,54 @@
+# RaxoSentinel — Fast-Track Shadow Integration CTO Handover
+
+| Item | Status / observation |
+|---|---|
+| Acceptance target | **BLOCKED** — no scan through Raxo Email has been demonstrated |
+| Branch | `phase-3b` |
+| Local implementation commit | `38a6a14da123687943a665e410f630c776e9b729` (not pushed) |
+| Previous checkout HEAD | `46e9f12508abee4832d865418edb93e310e2091d` |
+| Handover commit discrepancy | The reported full hash `f140e4004944d6db8754b20755b41053075c3d25` does not resolve here; local history has `f140e40ef5a76fd1313e81ac7ae9f3f6727f6c31`. |
+| Private database | `phase2d6-unified` loaded successfully from the existing private store |
+| Release binary | Built locally at `target/release/raxosentinel` |
+| Raxo Email, Docker, Node.js, VPS | Not available in this workspace; no production access or routing change |
+
+## 1. Executive status
+
+The release scanner and Unix socket coordinator were exercised locally against the existing private database. Both EICAR samples were detected, while three ordinary sample files returned CLEAN. ClamAV independently detected EICAR and returned CLEAN for the normal text file. This establishes local scanner operation; it does not establish email delivery, database recording, or shadow operation in the existing mail pipeline.
+
+A release blocker was corrected: ordinary release builds no longer honor the environment switch that enabled worker fault injection. The coordinator client gained an opt-in JSON envelope containing the database generation. A standalone Node staging harness and systemd template were prepared, but neither was executed in its intended environment. The harness is not integrated into Raxo Email and must not replace the existing ClamAV policy.
+
+## 2. Actual scanner measurements
+
+All results below are local one-shot release scans with private generation `phase2d6-unified`. Times are wall clock seconds, including process startup and private database load and verification. The PDF is a small generated sample.
+
+| Sample | Verdict | Wall time |
+|---|---|---:|
+| Normal PDF | CLEAN | 0.983 s |
+| Normal TXT | CLEAN | 0.979 s |
+| Normal ZIP | CLEAN | 1.000 s |
+| EICAR test file | DETECTED | 1.117 s |
+| ZIP containing EICAR | DETECTED | 0.833 s |
+
+The coordinator started against the private store and detected EICAR through its Unix socket. A subsequent clean scan returned `database_generation: phase2d6-unified` in the new JSON envelope. A release scan returned CLEAN with crash injection environment variables set. The staging coordinator was stopped after verification.
+
+## 3. Changes made
+
+- Restricted the worker fault-injection gates to debug builds in the scanner, coordinator and supervised worker code. The earlier handover's release opt-in behavior is superseded by this change.
+- Added `client --json-envelope` to expose the existing coordinator response, including verdict, error and database generation, while retaining the existing `--json` output.
+- Added `integration/shadow-scan.js`: a standalone staging harness that copies an attachment to a private temporary location, runs ClamAV and the coordinator client with bounded subprocess deadlines, and emits scanner records without attachment content. It has not been run because Node.js is absent. It does not write PostgreSQL or deliver email; the actual mail integration must ensure both engines receive the same immutable content and preserve ClamAV's existing blocking decision.
+- Added `integration/raxosentinel.service`, `integration/coordinator.env`, and `integration/README.md` as unvalidated deployment templates and staging guidance. The service uses an internal Unix socket and configurable worker settings. Its same-user socket access requirement must be reconciled with the real mail deployment.
+- Private intelligence was kept outside the Git repository. Existing updater functionality was not changed.
+
+## 4. Verification and test-count issue
+
+- **PASS:** release build; five local sample scans; private database loading; coordinator startup and socket scan; release crash-injection check; coordinator generation envelope; ClamAV clean text and EICAR checks; formatting check.
+- **PASS:** 33 coordinator tests and 25 CLI integration tests in the executed workspace run. The 25 CLI integration tests also passed in a subsequent targeted run.
+- **PARTIAL:** the workspace suite failed one updater test, `test_15_clamav_dual_database_independent_tracking_and_authentication`. Its unchanged-source assertion assumes local ClamAV versions match live upstream DNS; the provider checks upstream DNS first. This observation does not establish that all updater paths are correct, and updater behavior was not modified.
+- **PARTIAL:** the reported decrease from 196 to 168 tests remains unexplained. Prior handovers do not provide sufficient complete counting evidence to reconcile those totals; do not represent this as restored coverage or a passing full suite.
+- **NOT STARTED:** real email acceptance tests A–D, including delivery and ClamAV blocking, scanner unavailability and recovery, and activation of a controlled database generation followed by a scan reporting that generation.
+
+## 5. Deployment and remaining work
+
+The local binary is a release build, but a deployable VPS installation has not been validated. The service template, health-check approach, and prerequisites are described in `integration/README.md`. The actual private store, updater schedule and credentials must be provisioned securely on the staging host; no private intelligence should be committed or included in a public artifact. No secrets are included in this handover.
+
+**Next action:** provide access to the Raxo Email repository and an isolated staging environment with Node.js, Docker Compose, PostgreSQL, ClamAV and SMTP. Inspect the existing attachment pipeline, integrate independent shadow scanning and persistent per-scanner outcomes using its immutable attachment content, then execute acceptance tests A–D. Resolve the updater test and test-count discrepancy, validate the staging service and updater, and obtain explicit owner approval before changing live email delivery or production routing.

@@ -1,0 +1,19 @@
+RaxoSentinel Phase 3B — limited-scope private beta handover
+
+STATUS: Source committed and pushed. Private prerelease NOT published: actual Ubuntu 24.04 build and end-to-end verification remain outstanding. No production service, existing deployed executable, database or Raxo Mail was modified.
+
+Private development branch: phase-3b
+Commit: dc9c5192e8e7ff0de291dd7fc6dd8ec2069f6e55
+Remote branch head was independently checked and matches the commit. The preceding commit c471e4f introduced the source and documentation; dc9c519 corrects a misplaced test assertion.
+
+Changes: PDF-prefixed ZIP discovery and conservative UNSCANNED handling for identifiable incomplete archives; recognized unsupported embedded format markers remain conservative. Added automated actual EICAR ZIP tests for stored and deflated ZIP, both ordinary and PDF-prefixed, and retained archive/decompression, nesting, worker memory, deadline and recovery tests. Existing coordinator JSON status ERROR is retained for timeout compatibility; the --json-envelope response adds error_code TIMEOUT for recognized scan/worker deadlines. Client transport timeouts may differ. The interface, supported format scope and known limitations are documented in docs/PRIVATE_BETA_PHASE3B.md.
+
+Validation on Debian 13: cargo fmt --all -- --check PASS; cargo clippy --workspace --all-targets -- -D warnings PASS; cargo test --workspace PASS with 203 passed, 0 failed, 2 ignored; cargo build --release --locked PASS. The first run after adding timeout coverage failed because the assertion was accidentally placed in the crash test. That test was corrected; both crash and timeout targeted tests passed and the full suite was rerun successfully. Logs: /tmp/limited-beta-final-tests.log, /tmp/limited-beta-clippy.log and /tmp/limited-beta-cached-build.log.
+
+Debian experimental binary (not Ubuntu-validated, do not deploy): /tmp/phase3b-release-target/release/raxosentinel
+SHA-256: b6dcb675462a4067864096ca832819c459dfce73b421aaf9cdd34bc7f4e5b409
+The source change after this build was limited to a test assertion. This binary is not a release artifact.
+
+Beta inspection scope: raw signature and hash matching including PDF, text, images and binaries; ZIP stored/deflated entries and supported nested ZIPs within limits; decoded supported RFC822/MIME parts. PDF streams and arbitrary polyglots are not comprehensively decoded. TAR, RAR, 7-Zip, GZIP, BZIP2, XZ and CAB are not unpacked. Recognized unsupported or incomplete structures are UNSCANNED; unrecognized content and encodings can still receive CLEAN. CLEAN means no known match in the inspection performed, not malware absence. Marker checks can cause false UNSCANNED. Multiple embedded ZIPs are not comprehensively inspected. Error, timeout and unsupported results must not be treated as CLEAN. See the committed documentation for complete wording.
+
+ACTION FOR CONTABO CODER: check out commit dc9c5192e8e7ff0de291dd7fc6dd8ec2069f6e55 in an isolated Ubuntu 24.04 x86_64 checkout and follow docs/PRIVATE_BETA_PHASE3B.md verbatim. It provides exact commands to build into a separate /tmp target, run tests, verify phase2d6-unified and 542057 records, start an isolated Unix-socket coordinator, scan clean and EICAR files with the full JSON envelope, check generation, SHA-256, status, duration, and inspect listening TCP ports. Keep the current service and tested executable untouched; do not enable updates or deploy. Record binary SHA-256 and the results. Once the Ubuntu checks pass, package the Ubuntu-built executable and configuration and publish a versioned PRIVATE prerelease with checksums and the documented limitations. Preserve the prior tested release for rollback. No release URL exists yet.

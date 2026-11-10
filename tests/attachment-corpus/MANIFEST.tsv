@@ -1,0 +1,64 @@
+# file	expected	expected_with_yara	category	structure	sha256	bytes	notes
+bz2-bomb.bz2	ERROR	ERROR	resource	256 MiB zeros in bzip2 (ratio far above 1000:1)	d99a84a031125acced2231b16f3afe6b8fb96947de4303d1efea8a65a3e044bc	208	
+bz2-corrupt.bz2	UNSCANNED	UNSCANNED	malformed	bzip2 block CRC mismatch	d4c870d79476a52265447a320874f77f1a324c62edeb7dc82d311405585631cc	4794	
+bz2-eicar.bz2	DETECTED	DETECTED	detection	EICAR in bzip2	c6b350d88f7d75bc5f641aa75d0fc32e5163e0042f9c03640afc73f86fc5d3a0	107	
+gz-bomb.gz	ERROR	ERROR	resource	64 MiB zeros (~1000:1)	51106a06ad1106750dcbfb528de28513ac854d6285cfdfe8cdfdbd757b139445	65250	
+gz-multi-member-clean.gz	CLEAN	CLEAN	clean	two concatenated gzip members	7019e7743f8f3538d032892390b0e8d9e4672d1e7acc317650cbc6b993e20623	48	
+gz-trailing-garbage.gz	UNSCANNED	UNSCANNED	malformed	data after the last gzip member	f9d3e997f0d254b5101482f0442333c7289f724812269ce640a8712d9487c884	51	
+office-docm-vba.docm	UNSCANNED	UNSCANNED	office-active	DOCX package with a vbaProject.bin part (macros not analysed)	6964b6b998b6f9430299b0e97325f68e94881385761b466bad191c26e5ea1596	6138	
+office-docx-embedded-eicar-bin.docx	DETECTED	DETECTED	office	DOCX embedding part containing EICAR bytes	f9bfbb463c95912435038839d0bb3386a29188105c8fbfd79f2e356c407aec9e	6221	
+office-docx-embedded-zip-eicar.docx	DETECTED	DETECTED	office	DOCX with an embedded package (ZIP) containing EICAR	f94bd7a15fb95ee268a7f11a0a68fe3403266d0779cfd6a3516035502f3a16e7	6284	
+office-ledger.xls	CLEAN	CLEAN	office	LibreOffice 25.2.3.2 Excel 97 (OLE2/CFB)	ab4eba2c7e299318fce73e816a6792c1e0bf11dedee642cc5bf5bc9b280a3397	28160	
+office-ledger.xlsx	CLEAN	CLEAN	office	LibreOffice 25.2.3.2 XLSX (Calc)	49f176a6f0d0120f64c2cdd9119c3e68169ec6d7065ecb437668eea6d6e786e4	12385	
+office-letter.doc	CLEAN	CLEAN	office	LibreOffice 25.2.3.2 Word 97 (OLE2/CFB)	5c09b91ee992b5b3a613ba483f778d693bc3d4b3b44d9af90a7b04a348b269fc	25600	
+office-letter.docx	CLEAN	CLEAN	office	LibreOffice 25.2.3.2 DOCX (Writer)	4429a48a683d6c018140085cfdc922d97f9d3e153a77603f1db5a09111f03eb7	6175	
+office-pptx-large-media.pptx	CLEAN	CLEAN	office	PPTX with a 30 MiB media part (streamed, not buffered)	0e25e122f072b87c477ecc75bc067b6e69e7bf3c94aea79d9861cd1bd70f117b	323581	
+office-slides.pptx	CLEAN	CLEAN	office	LibreOffice 25.2.3.2 PPTX (Impress)	42c5c7d2eba2f4ca801aa29df8efae5761bb4ce897183ed976f2c0d5a04bd40a	11551	
+office-xlsm-xlm-macrosheet.xlsm	UNSCANNED	UNSCANNED	office-active	XLSX package with an Excel 4.0 macro sheet	424c2bfb0f14a653de27c22744470e515f2801f87a0954ed2dd303638cfb6218	12369	
+pdf-prefixed-deflated-eicar.pdf	DETECTED	DETECTED	polyglot	PDF header followed by a ZIP with a deflated EICAR member (Phase 3B case)	afd398725c7efa01d51b0a69080723241cbdcf043a5a61300dcd3ce9bf195774	195	
+pdf-zip-polyglot-clean.pdf	CLEAN	CLEAN	polyglot	complete PDF with a clean ZIP appended after %%EOF	bc0ff728923fb0c235ceef4706b4b7e22e48f8e6224ff547480b3f43a951e929	600	
+pdf-zip-polyglot-eicar.pdf	DETECTED	DETECTED	polyglot	complete PDF with a ZIP appended after %%EOF	8198bae87fa90b66c7a5be3964e0bfce645faee34571f27536f2ab2815b9ecc2	672	
+tar-bz2-clean.tar.bz2	CLEAN	CLEAN	clean	tar.bz2	eae8776cf869f5ad1133d1ff36ee781e9d70a6433f3edb1c9ad155f9d0444ff7	11697	
+tar-clean.tar	CLEAN	CLEAN	clean	GNU tar, two members	dae1c727b87ef0005bc3ff866b15fb8d97eeaf9a84983616e304f30d92252eea	10240	
+tar-gnu-longname-eicar.tar	DETECTED	DETECTED	detection	EICAR behind a GNU long-name record	441b6923f5ee683bfa2d4c7a625e64863542a553180ad3073f2471eef6a618e3	10240	
+tar-gz-eicar.tar.gz	DETECTED	DETECTED	detection	EICAR in tar.gz	5b89d9d30ed034d997fbd89a1153d90a5b3f23051914eaeafcd301274443f2c2	189	
+tar-pax-eicar.tar	DETECTED	DETECTED	detection	EICAR in a PAX-format archive	c77c8ca3a85f15679054295f1f1e4e88c17f9ce745c7c8ca6a02e1e3ab123733	10240	
+tar-trailing-data.tar	UNSCANNED	UNSCANNED	malformed	data after the TAR end-of-archive marker	c2409b0d52a7d65ed71135106e4b6d1c261d7d25538b6c605d3112991e6baff0	10272	
+tar-traversal-names.tar	CLEAN	CLEAN	security	path traversal member names (labels only)	74fb996b10e041330ca94cc6a3b28e63c0ae560863104f64d5c8a329b8d78c74	10240	
+tar-truncated.tar	UNSCANNED	UNSCANNED	malformed	TAR cut inside a member	0e5167b27a7ab6a3c3a7cce5111a30ac34bc65e65199ccb6d6f354215fe875a0	3000	
+tar-xz-eicar.tar.xz	DETECTED	DETECTED	detection	EICAR in tar.xz	e8058d5071b4155b3606076f18cc16f964c0d0913b2606f8d327a323e6762436	240	
+unsupported-7z.7z	UNSCANNED	UNSCANNED	unsupported	7-Zip signature header (format not unpacked)	898ae0cae8e4abd7fee0f35d9d7d4abc60a3fd75b3af03410d579cef1a48292e	520	
+unsupported-cab.cab	UNSCANNED	UNSCANNED	unsupported	Microsoft CAB signature (format not unpacked)	fb6b5b05df8d686148412e0081134f9653ac3ba6840445d4beefa480df2a172c	264	
+unsupported-rar5.rar	UNSCANNED	UNSCANNED	unsupported	RAR5 signature (format not unpacked)	48bffc0270ac3301c82017060b785dbdfdd1a991101499a27e934dd51659490e	520	
+xz-clean.xz	CLEAN	CLEAN	clean	xz (CRC64)	773bc349065154481f20127abe2a92b19aad3767a652fe4b26bbefe161075bf4	5404	
+xz-sha256-eicar.xz	DETECTED	DETECTED	detection	EICAR in xz with SHA-256 check	10c774db6552ac220070e8de0867d398c30924983c2778a1996dd7974c692e62	148	
+xz-truncated.xz	UNSCANNED	UNSCANNED	malformed	xz without index/footer	808f2ba381d14543ff93116be063d2e24dd1dbdd0a063394e8ff64a84bb060c4	5374	
+yara-and-eicar.zip	DETECTED	DETECTED	yara	EICAR and marker: RSIDB/builtin and YARA-X both report	714152f5accb14022462a9b903ea1d9d2de8f2c7a70350269413b40dba1b4701	294	
+yara-hex-wildcard.bin	CLEAN	DETECTED	yara	hex pattern with a wildcard byte	667ac37d281ee4e83e1454210358afdee57bc290d56dfa683d3358a027d06280	16	
+yara-marker-in-tar-xz.tar.xz	CLEAN	DETECTED	yara	marker inside tar.xz	9a5bd87c21f9242ecbd624b58cd762d83b3c26f16bfb5f6f3ce8f9d10eaba190	196	
+yara-marker-in-xlsx-pdf.xlsx	CLEAN	DETECTED	yara	YARA marker inside a Flate stream of a PDF embedded in XLSX	896854a6ef65b2f7c0c098235e3d6c373eb9ab44540cbd5f5007880958370988	12651	
+yara-marker-in-zip.zip	CLEAN	DETECTED	yara	marker inside a deflated ZIP member	aee9cb60c0a94b57b3e0c849a6a8fae1a0cb074b74ecf21fef75c55adab19e03	138	
+yara-marker-large-member.zip	CLEAN	DETECTED	yara	marker across a 1 MiB block boundary of a 30 MiB streamed member	728e9262a27b2c8932d91406f2c1b3c649d552203423c8554d5a1ab369ef3097	334063	
+yara-marker-pdf-flate.pdf	CLEAN	DETECTED	yara	marker only inside a Flate-compressed PDF content stream	498a33f57cb7d18ca705066f2592052a266c8845158114a644cb26f463999c74	489	
+yara-marker.txt	CLEAN	DETECTED	yara	plain text with the synthetic YARA marker	40f71ec63a20c58af5d7ff2660b7e77bd98a3630936f38270d745698fc7fa067	43	
+yara-near-miss.txt	CLEAN	CLEAN	yara-nonmatch	truncated marker and half a pair: must not match	e20a91a048dd9c5080f258d6d307466ff3b0b15ffc4bff61b55a56b7da7f4448	42	
+yara-pair.txt	CLEAN	DETECTED	yara	two-string condition	ca3e65a10c56cdc077869f2e67ba4510266adc6bd7794f59d2880dfa40250a35	34	
+zip-bomb-ratio.zip	ERROR	ERROR	resource	64 MiB of zeros deflated ~1000:1	75065c7927833d5d29cd3e0a5475bcd6b9ec398e3c33ffb7fe466b4ee5648807	65348	
+zip-concatenated-clean.zip	CLEAN	CLEAN	multiple	two complete clean ZIPs concatenated	6fbafb9ead4f8be42e38f2b9c3153811d47eaf5840e5bfdb7595a3d64abcf92c	247	
+zip-concatenated-eicar-second.zip	DETECTED	DETECTED	multiple	two complete ZIPs concatenated; EICAR only in the second	1d09c4a362686a895f6777c8b0faf8473118ef44473d9905081d9641cb1566aa	309	
+zip-containing-rar.zip	UNSCANNED	UNSCANNED	unsupported	RAR5 signature inside a ZIP member	fc008e78022c94f99d9fb5bc4908ff515aede82f4a2a6eb9460c3defbbb8e4b4	120	
+zip-corrupt-deflate.zip	UNSCANNED	UNSCANNED	malformed	deflate body bytes flipped	b0f4443ee8b9b34d6ff3145e4eebfea3bd9b2edd5363d3fbb3851e9a9a31c16f	1468	
+zip-deflated-clean.zip	CLEAN	CLEAN	clean	one deflated text member	d3b0eeec009c6f6b04065efe56493f8943a311d21f30beda1d0b985f0ada4c42	59622	
+zip-eicar-deflated.zip	DETECTED	DETECTED	detection	EICAR deflated member	354f6341976ebb132306921d19e63e64b2bfa3fa9c1fbe2b23ec31933db3cb96	186	
+zip-eicar-stored.zip	DETECTED	DETECTED	detection	EICAR stored member	07b0d892812532275ee3baab106fffb6ef9d7f6ad96d2bc1c3dddfdbe6bee9b2	282	
+zip-encrypted-zipcrypto.zip	UNSCANNED	UNSCANNED	encrypted	Info-ZIP traditional (ZipCrypto) encryption	6d5c3a6445af0eacba71801d4726080018b9e757e91287709075d1d0ecdaf984	159	not byte-reproducible (random header)
+zip-large-member-eicar.zip	DETECTED	DETECTED	streaming	40 MiB deflated member (streamed); EICAR near the end	05398242d45226fe70d1218b99867167a72eddafcfad88caee40dbb7f1f586a0	424986	
+zip-many-members.zip	ERROR	ERROR	resource	10,001 members (limit 10,000)	05422e8b72a91cc2364e5c496c45306149a58582846b526e6a837c0dd47247be	947899	
+zip-nested-clean.zip	CLEAN	CLEAN	clean	three clean ZIP levels	6a0adbd3f20ab9821423f41f8d537b0cf671b56f099e14dddf8158d8e071425c	238	
+zip-nested-eicar.zip	DETECTED	DETECTED	detection	EICAR three ZIP levels deep	00cb7f09ed39305d35a81b3d8848030ca18b26e791374594ef00cd4eed5fdd1a	469	
+zip-nested-fanout-bomb.zip	ERROR	ERROR	resource	10x10 nested ZIPs of 10 MiB zeros (1 GiB expanded)	b6130e0ce1d8f83b283a96f185f09b52830ea5062d7c4f8a3b0c702b4a2cd69a	1041462	
+zip-overlapping-entries.zip	ERROR	ERROR	malformed	central directory entries whose data overlap	d594e1491d5456a81c33d9122f684d8f39c1e6ef18799cc93547f037f86ef83a	204	
+zip-stored-clean.zip	CLEAN	CLEAN	clean	two stored members	d1bc842a3a024376ecc611f46e7a3334d53ab32046874f543db8c3cda9a9ec75	212	
+zip-traversal-names.zip	CLEAN	CLEAN	security	path traversal and absolute member names (labels only; nothing extracted)	4c04628a902a064a910c0403d035e842df8b7f34f5064428b98b5595ca4814d0	375	
+zip-truncated.zip	UNSCANNED	UNSCANNED	malformed	ZIP cut at 66%	6fec8081dd4856c8a3790791aa27480b44b5c0f44418033c6a439a2c540aee97	978	
+zip-unreferenced-local-header.zip	UNSCANNED	UNSCANNED	multiple	local file record with no central directory before a valid ZIP	39407f9f049d0ff712d3a4e25542df8af67f3b0b0b6373f5c47a73215c947073	178	

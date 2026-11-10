@@ -1,0 +1,5 @@
+# Private staging deployment
+
+Run `./package.sh PRIVATE_STORE OUTPUT_DIRECTORY` on Linux x86_64 at the recorded commit. The private archive contains restricted third-party intelligence; do not upload it to GitHub. Securely transfer both archives, SHA256SUMS, and install-staging.sh to the authorized VPS over an authenticated encrypted connection. Verify SHA256SUMS through a separately authenticated channel before use. As root, run `./install-staging.sh ARTIFACT_DIRECTORY`. The installer refuses existing staging paths/accounts and starts a dedicated socket-only systemd service; it does not modify email routing, Docker, ClamAV, or install an update timer. Review the script and adapt access control to the intended client before using it. The installer has not been tested on Contabo.
+
+Check health with `systemctl status raxosentinel-staging` and, as the staging account, use `raxosentinel client --socket /run/raxosentinel-staging/scan.sock --json-envelope FILE`. Files must be accessible to the service account. Existing updater state records no rollback generation; do not enable updates until a verified rollback generation and source checks exist.

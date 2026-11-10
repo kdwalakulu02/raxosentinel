@@ -39,6 +39,36 @@ pub struct ResourceLimits {
     pub max_total_extracted_bytes: u64,
     /// Buffer size used for chunked streaming I/O (bytes). Default: 64 KiB.
     pub buffer_size: usize,
+    /// Largest extracted object held completely in memory for recursive inspection
+    /// (bytes). Larger objects are inspected in streaming mode. Default: 25 MiB.
+    #[serde(default = "default_max_buffered_object_bytes")]
+    pub max_buffered_object_bytes: u64,
+    /// Maximum decoded size of one object inspected in streaming mode (bytes).
+    /// Default: 512 MiB.
+    #[serde(default = "default_max_streamed_object_bytes")]
+    pub max_streamed_object_bytes: u64,
+    /// Maximum cumulative bytes inspected in streaming mode per scan (bytes).
+    /// Streamed bytes are never retained, so this bounds work, not memory.
+    /// Default: 1 GiB.
+    #[serde(default = "default_max_total_streamed_bytes")]
+    pub max_total_streamed_bytes: u64,
+    /// Maximum archive members (ZIP/TAR/OLE entries, compressed members) per scan.
+    /// Default: 10,000.
+    #[serde(default = "default_max_archive_members")]
+    pub max_archive_members: usize,
+}
+
+fn default_max_buffered_object_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+fn default_max_streamed_object_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+fn default_max_total_streamed_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_max_archive_members() -> usize {
+    10_000
 }
 
 impl Default for ResourceLimits {
@@ -51,6 +81,10 @@ impl Default for ResourceLimits {
             max_email_attachment_size: 25 * 1024 * 1024,  // 25 MiB
             max_total_extracted_bytes: 100 * 1024 * 1024, // 100 MiB
             buffer_size: 64 * 1024,                       // 64 KiB
+            max_buffered_object_bytes: default_max_buffered_object_bytes(),
+            max_streamed_object_bytes: default_max_streamed_object_bytes(),
+            max_total_streamed_bytes: default_max_total_streamed_bytes(),
+            max_archive_members: default_max_archive_members(),
         }
     }
 }
@@ -61,7 +95,9 @@ pub struct ResourceTracker {
     start_time: Instant,
     total_bytes_read: u64,
     total_extracted_bytes: u64,
+    total_streamed_bytes: u64,
     attachment_count: usize,
+    archive_members: usize,
 }
 
 impl ResourceTracker {
@@ -71,7 +107,9 @@ impl ResourceTracker {
             start_time: Instant::now(),
             total_bytes_read: 0,
             total_extracted_bytes: 0,
+            total_streamed_bytes: 0,
             attachment_count: 0,
+            archive_members: 0,
         }
     }
 
@@ -89,6 +127,14 @@ impl ResourceTracker {
             });
         }
         Ok(())
+    }
+
+    /// Timeout error carrying the elapsed scan time, for deadlines detected by
+    /// components (such as YARA-X) that only know their remaining budget.
+    pub fn timeout_error(&self) -> ScanError {
+        ScanError::Timeout {
+            duration_ms: self.start_time.elapsed().as_millis() as u64,
+        }
     }
 
     /// Records newly read bytes and checks against max_file_size limit.
@@ -159,6 +205,21 @@ impl ResourceTracker {
         Ok(())
     }
 
+    /// Registers an attachment whose content was streamed rather than buffered. It
+    /// counts towards `max_email_attachments`; its bytes were already charged to the
+    /// streamed-byte limits (`max_streamed_object_bytes`, `max_total_streamed_bytes`)
+    /// and are not charged again to the extracted-bytes budget.
+    pub fn register_streamed_attachment(&mut self) -> Result<(), ScanError> {
+        self.check_timeout()?;
+        if self.attachment_count + 1 > self.limits.max_email_attachments {
+            return Err(ScanError::AttachmentLimitExceeded {
+                limit: self.limits.max_email_attachments,
+            });
+        }
+        self.attachment_count += 1;
+        Ok(())
+    }
+
     /// Records newly extracted data (decompressed or decoded) and checks against cumulative limit.
     pub fn record_extracted_bytes(&mut self, bytes: usize) -> Result<(), ScanError> {
         self.check_timeout()?;
@@ -176,6 +237,46 @@ impl ResourceTracker {
             });
         }
         Ok(())
+    }
+
+    /// Records bytes inspected in streaming mode (not retained) against the
+    /// cumulative streamed-bytes budget.
+    pub fn record_streamed_bytes(&mut self, bytes: usize) -> Result<(), ScanError> {
+        self.check_timeout()?;
+        self.total_streamed_bytes = self.total_streamed_bytes.saturating_add(bytes as u64);
+        if self.total_streamed_bytes > self.limits.max_total_streamed_bytes {
+            return Err(ScanError::ExtractedSizeLimitExceeded {
+                limit: self.limits.max_total_streamed_bytes,
+                current: self.total_streamed_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Registers one archive member against the per-scan member limit.
+    pub fn register_archive_member(&mut self) -> Result<(), ScanError> {
+        self.check_timeout()?;
+        if self.archive_members >= self.limits.max_archive_members {
+            return Err(ScanError::AttachmentLimitExceeded {
+                limit: self.limits.max_archive_members,
+            });
+        }
+        self.archive_members += 1;
+        Ok(())
+    }
+
+    /// Remaining whole-scan deadline.
+    pub fn remaining(&self) -> Duration {
+        Duration::from_millis(self.limits.max_scan_duration_ms)
+            .saturating_sub(self.start_time.elapsed())
+    }
+
+    pub fn total_streamed_bytes(&self) -> u64 {
+        self.total_streamed_bytes
+    }
+
+    pub fn archive_members(&self) -> usize {
+        self.archive_members
     }
 
     pub fn elapsed_millis(&self) -> u64 {
@@ -224,6 +325,37 @@ mod tests {
         assert!(tracker.register_attachment(60).is_err()); // exceeds individual size
         assert!(tracker.register_attachment(30).is_ok()); // 2nd attachment
         assert!(tracker.register_attachment(10).is_err()); // exceeds max count
+    }
+
+    #[test]
+    fn test_streamed_and_member_budgets() {
+        let limits = ResourceLimits {
+            max_total_streamed_bytes: 100,
+            max_archive_members: 2,
+            ..Default::default()
+        };
+        let mut tracker = ResourceTracker::new(limits);
+        assert!(tracker.record_streamed_bytes(100).is_ok());
+        assert!(tracker.record_streamed_bytes(1).is_err());
+        assert_eq!(tracker.total_extracted_bytes(), 0);
+        assert!(tracker.register_archive_member().is_ok());
+        assert!(tracker.register_archive_member().is_ok());
+        assert!(tracker.register_archive_member().is_err());
+        assert_eq!(tracker.attachment_count(), 0);
+        // Streamed attachments count but are not charged to the extracted budget.
+        let mut tracker = ResourceTracker::new(ResourceLimits {
+            max_email_attachments: 1,
+            ..Default::default()
+        });
+        assert!(tracker.register_streamed_attachment().is_ok());
+        assert_eq!(tracker.total_extracted_bytes(), 0);
+        assert!(tracker.register_streamed_attachment().is_err());
+        // Older serialized limits without the new fields still deserialize.
+        let old = r#"{"max_file_size":1,"max_scan_duration_ms":1,"max_email_depth":1,
+            "max_email_attachments":1,"max_email_attachment_size":1,
+            "max_total_extracted_bytes":1,"buffer_size":1}"#;
+        let parsed: ResourceLimits = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.max_archive_members, 10_000);
     }
 
     #[test]

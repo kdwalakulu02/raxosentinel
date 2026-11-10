@@ -1,0 +1,11 @@
+PHASE 3C CONTINUATION — INCOMPLETE; NO RELEASE
+
+Pushed private development commit: 09d1ee5744c054971b782e430887e03f8730bca1 on phase-3c.
+
+Implemented: independent concatenated GZIP member decoding using flate2's buffered decoder, preserving member boundaries for exact-hash RSIDB matching. Each decoded member re-enters existing recursive scanning. Member count, per-member and aggregate extracted size, recursion and time budgets remain enforced. Added a conservative 1000:1 output-to-consumed-input cap. Trailing unrecognized content is UNSCANNED. Invalid/truncated members are UNSCANNED; size/ratio exhaustion is ERROR. Ordinary fully decoded clean members can now return CLEAN rather than the prior blanket UNSCANNED.
+
+Tests: focused email library suite 29 passed, 0 failed. New tests cover clean concatenated members, per-member count exhaustion and trailing content; existing actual EICAR, truncated GZIP and extracted-size regressions pass. Formatting and Clippy passed. The prior committed full workspace result was 204 passed, 0 failed, 2 ignored. The current full workspace run is in progress in /tmp/phase3c-members-workspace.log; do not treat its result as passed before inspecting completion. No peak RSS or CPU benchmark was performed. The clean fixture is not a measured false-positive rate.
+
+Remaining: structural multi-ZIP validation; TAR, BZIP2 and XZ extraction; 7-Zip/RAR/CAB evaluation; PDF parser and bounded stream inspection; YARA-X integration/measurement; structured suspicion and coverage reports; expanded corpus and fuzzing; complete validation. GZIP appended after a non-GZIP prefix remains unsupported. Ratio policy is currently fixed for GZIP only. Decoder calls are synchronous: the supervised worker remains necessary for hard process limits; checks between reads alone are not a hard CPU bound.
+
+No database generation changes, tested executable replacement, Raxo Mail changes, deployment or release publication. This is a development checkpoint, not the completed Phase 3C deliverable.

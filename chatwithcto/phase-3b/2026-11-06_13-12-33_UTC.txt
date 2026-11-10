@@ -1,0 +1,28 @@
+RaxoSentinel Phase 3B continuation — CTO report
+
+STATUS: INCOMPLETE. Do not deploy or treat this as a release candidate. Source changes remain uncommitted on phase-3b. No push or release publication. Ubuntu 24.04 build and verified private-store scan remain outstanding, as does complete safe handling of all embedded archive variants.
+
+ROOT CAUSE AND CURRENT CORRECTION
+The original scanner classified ZIP only by a ZIP header at offset zero or ZIP metadata. A PDF-prefixed ZIP was scanned as raw PDF. Stored EICAR remained visible in raw bytes; deflated EICAR required decompression and was missed. The experimental dispatch now finds a local ZIP header at any offset and lets ZipArchive validate structure before extracting. Existing depth, extraction budget and timeout controls remain in the extraction path. Invalid or truncated candidates return UNSCANNED. Multiple ZIP end-record markers yield UNSCANNED unless a detection takes precedence, because ZipArchive selects one directory and cannot establish that all archives were inspected.
+
+LIMITATIONS: This is not a complete solution for all requested polyglots. Multiple archives are not all extracted; an earlier compressed payload can be missed, though multiple visible end markers prevent a CLEAN verdict. End-record and header byte searches may create conservative false UNSCANNED results. Embedded unsupported formats and truncated archives lacking a recognizable header are not comprehensively discovered. Archive-looking data may occur inside other file content. Do not claim complete inspection. Further design and security regression tests are required before release.
+
+EICAR COMPARISON
+Generated identical samples with standard EICAR and Python stored/deflated ZIPs, prepending %PDF-1.4 for polyglots. Results below are ClamAV 1.4.3 / 28173; preserved binary from raxosentinel-38a6a14 package; current debug scanner, respectively:
+  ordinary PDF: CLEAN / CLEAN / CLEAN
+  stored ZIP: DETECTED / DETECTED / DETECTED
+  deflated ZIP: DETECTED / DETECTED / DETECTED
+  PDF + stored ZIP: DETECTED / DETECTED / DETECTED
+  PDF + deflated ZIP: DETECTED / CLEAN / DETECTED
+This reproduces the reported disagreement. A current release build also detected PDF + deflated EICAR using a verified copy of private generation phase2d6-unified on the native Debian host. Original database and release package were not changed.
+
+TESTS AND CHECKS
+The focused phase3a_corpus test passed, including existing normal PDF, ZIP and nested coverage, synthetic stored/deflated polyglots, malformed/truncated candidates and a multiple ZIP case. These use a synthetic signature; the EICAR comparison above was executed separately. Existing resource-limit and security tests were retained. This does not exhaust the requested polyglot and unsupported-format matrix.
+Full cargo test --workspace against the current source: 202 passed, 0 failed, 2 ignored. Ignored tests are run_phase_3b3_measurements and synthetic_history_scale_benchmark. The earlier /tmp/raxo-tests.log run failed one test: scenario 15 compared local CVD version to live upstream DNS. The test now pins its version for tracking checks while retaining actual local CVD authentication and tampering checks; the full suite passes. The test still returns early if local CVD files are absent, so its effective coverage depends on environment. cargo fmt --all -- --check and cargo clippy --workspace --all-targets -- -D warnings passed. Logs: /tmp/phase3b-final-tests.log and /tmp/phase3b-clippy.log.
+
+RELEASE AND UBUNTU
+A separate Debian 13 release build passed: /tmp/phase3b-release-target/release/raxosentinel; SHA-256 3f9ab7670eaf24979a548cc279b658110bf03569f5e34e682bc66854da657b71. This is an experimental build, not a release candidate. It was not built in Ubuntu.
+An isolated Ubuntu 24.04.5 filesystem with glibc 2.39 was prepared. Its loader started the current executable and printed the version, but this is not a complete runtime verification. Proot in this environment failed metadata/stat operations for files in the isolated filesystem; verified private-store scanning could not complete. Ubuntu build tool installation also failed at signed repository verification inside proot. A native user-namespace chroot was denied by the host. No claim is made that the binary is compatible with the documented runtime. Complete a build and verified private database scan in a functioning Ubuntu 24.04 VM/container, then test the deployed interface before committing.
+
+NEXT WORK
+Implement bounded discovery and inspection of all supported embedded archives, including accurate non-clean outcomes for partially inspectable and unsupported embedded formats; add EICAR, nested, multiple, malformed, truncated and resource-limit regressions. Re-run the suite and target-runtime validation. Then review, commit and push the source on the existing private development branch. No CLI or socket protocol was intentionally changed. Performance and concurrency optimisation remain separate work.

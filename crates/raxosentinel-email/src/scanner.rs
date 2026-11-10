@@ -24,6 +24,9 @@ use raxosentinel_filetypes::{check_extension_mismatch, detect_type, is_tar_heade
 use raxosentinel_signatures::SignatureDatabase;
 use std::path::Path;
 
+mod archive;
+use archive::StreamFormat;
+mod extract;
 mod pdf;
 mod pdf_decode;
 
@@ -127,6 +130,9 @@ impl<'a> EmailScanner<'a> {
                 for t in self.db.match_bytes(raw_bytes) {
                     unparsed_threats.push(t.with_location("email_root"));
                 }
+                for t in self.match_yara(raw_bytes, tracker)? {
+                    unparsed_threats.push(t.with_location("email_root"));
+                }
 
                 let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
                 let (status, details) = if !unparsed_threats.is_empty() {
@@ -173,6 +179,10 @@ impl<'a> EmailScanner<'a> {
             threats.push(hash_threat.with_location("email_root"));
         }
         for t in self.db.match_rsidb(raw_bytes) {
+            threats.push(t.with_location("email_root"));
+        }
+        // Optional YARA-X rules over the raw message.
+        for t in self.match_yara(raw_bytes, tracker)? {
             threats.push(t.with_location("email_root"));
         }
 
@@ -524,6 +534,21 @@ impl<'a> EmailScanner<'a> {
         Ok(report)
     }
 
+    /// Optional YARA-X rules over a complete object; a rule-evaluation timeout is a
+    /// scan timeout reported with the elapsed scan time.
+    fn match_yara(
+        &self,
+        data: &[u8],
+        tracker: &ResourceTracker,
+    ) -> Result<Vec<Threat>, ScanError> {
+        self.db
+            .match_yara(data, tracker.remaining())
+            .map_err(|e| match e {
+                ScanError::Timeout { .. } => tracker.timeout_error(),
+                other => other,
+            })
+    }
+
     /// Scans one complete, already-extracted object (raw file, decoded attachment or
     /// archive member): extension mismatch, builtin SHA-256 rules, RSIDB exact-hash
     /// lookups, byte patterns, and bounded recursion into supported containers.
@@ -562,6 +587,10 @@ impl<'a> EmailScanner<'a> {
         for t in self.db.match_bytes(data) {
             threats.push(t.with_location(location.clone()));
         }
+        // Optional YARA-X rules; a rule-evaluation timeout is a scan timeout.
+        for t in self.match_yara(data, tracker)? {
+            threats.push(t.with_location(location.clone()));
+        }
         tracker.check_timeout()?;
 
         // PDF structure is inspected first so container signatures inside its
@@ -578,40 +607,33 @@ impl<'a> EmailScanner<'a> {
 
         let mut sub_reports = Vec::new();
         let mut container_issue: Option<(ScanStatus, String)> = None;
-        match classify_container(data, filename, declared_mime, inspected_spans) {
+        let inspected = match classify_container(data, filename, declared_mime, inspected_spans) {
             ContainerKind::Zip => {
-                let (subs, issue) = self.scan_zip(data, filename, tracker, depth + 1)?;
-                sub_reports = subs;
-                container_issue = issue;
-                // ZipArchive exposes one directory. Multiple end records can indicate
-                // concatenated archives; do not claim complete inspection of them.
-                if data
-                    .windows(4)
-                    .filter(|w| *w == b"PK\x05\x06")
-                    .take(2)
-                    .count()
-                    > 1
-                    && container_issue.is_none()
-                {
-                    container_issue = Some((ScanStatus::Unsupported,
-                        "Multiple ZIP end records; not all embedded archives may have been inspected".into()));
-                }
+                Some(self.scan_zip(data, filename, inspected_spans, tracker, depth + 1)?)
             }
-            ContainerKind::Gzip => {
-                let (subs, issue) = self.scan_gzip(data, filename, tracker, depth + 1)?;
-                sub_reports = subs;
-                container_issue = issue;
+            ContainerKind::Tar => Some(self.scan_tar(data, filename, tracker, depth + 1)?),
+            ContainerKind::Compressed(format) => {
+                Some(self.scan_compressed(format, data, filename, tracker, depth + 1)?)
             }
+            ContainerKind::Cfb => Some(self.scan_cfb(data, filename, tracker, depth + 1)?),
             ContainerKind::Unsupported(kind) => {
                 container_issue = Some((
                     ScanStatus::Unsupported,
                     format!(
-                        "{} container cannot be extracted; contents not inspected",
+                        "ARCHIVE_UNSUPPORTED_FORMAT: {} container cannot be extracted; \
+                         contents not inspected",
                         kind
                     ),
                 ));
+                None
             }
-            ContainerKind::None => {}
+            ContainerKind::None => None,
+        };
+        let mut swept_spans = spans.clone();
+        if let Some(inspected) = inspected {
+            sub_reports = inspected.subs;
+            container_issue = inspected.issue;
+            swept_spans.extend(inspected.covered);
         }
 
         if let Some(pdf) = pdf {
@@ -624,7 +646,7 @@ impl<'a> EmailScanner<'a> {
         // as fully inspected, even when the outer object is another format.
         if container_issue.is_none() {
             tracker.check_timeout()?;
-            if let Some(kind) = embedded_container_magic(data, inspected_spans) {
+            if let Some(kind) = embedded_container_magic(data, &swept_spans) {
                 container_issue = Some((
                     ScanStatus::Unsupported,
                     format!(
@@ -658,308 +680,14 @@ impl<'a> EmailScanner<'a> {
             details,
         ))
     }
-
-    /// Inspect each GZIP member independently, preserving exact-hash matching.
-    #[allow(clippy::type_complexity)]
-    fn scan_gzip(
-        &self,
-        data: &[u8],
-        parent: &str,
-        tracker: &mut ResourceTracker,
-        depth: usize,
-    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
-        use std::io::Read;
-        tracker.check_depth(depth)?;
-        let mut remaining = data;
-        let mut reports = Vec::new();
-        while !remaining.is_empty() {
-            tracker.check_timeout()?;
-            if !remaining.starts_with(b"\x1f\x8b\x08") {
-                return Ok((
-                    reports,
-                    Some((
-                        ScanStatus::Unsupported,
-                        "Uninspected trailing GZIP content".into(),
-                    )),
-                ));
-            }
-            tracker.register_attachment(0)?;
-            let cap = tracker.limits().max_email_attachment_size.min(
-                tracker
-                    .limits()
-                    .max_total_extracted_bytes
-                    .saturating_sub(tracker.total_extracted_bytes()),
-            );
-            // bufread leaves the following member untouched; read::GzDecoder may over-read.
-            let mut decoder = flate2::bufread::GzDecoder::new(remaining);
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 65536];
-            loop {
-                tracker.check_timeout()?;
-                match decoder.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let consumed = remaining.len().saturating_sub(decoder.get_ref().len());
-                        if (buf.len() as u64).saturating_add(n as u64) > cap
-                            || (buf.len() as u64).saturating_add(n as u64)
-                                > (consumed as u64).saturating_mul(1000)
-                        {
-                            return Ok((
-                                reports,
-                                Some((
-                                    ScanStatus::Failed,
-                                    "GZIP extraction size or 1000:1 ratio budget exceeded".into(),
-                                )),
-                            ));
-                        }
-                        buf.try_reserve(n).map_err(|_| {
-                            ScanError::Internal("Cannot allocate gzip buffer".into())
-                        })?;
-                        tracker.record_extracted_bytes(n)?;
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    Err(e) => {
-                        return Ok((
-                            reports,
-                            Some((
-                                ScanStatus::Unsupported,
-                                format!("GZIP member not inspected: {e}"),
-                            )),
-                        ))
-                    }
-                }
-            }
-            let next = decoder.into_inner();
-            if next.len() >= remaining.len() {
-                return Ok((
-                    reports,
-                    Some((ScanStatus::Failed, "GZIP decoder made no progress".into())),
-                ));
-            }
-            reports.push(self.scan_object(
-                &buf,
-                &format!("{parent}/gzip-member-{}", reports.len()),
-                None,
-                tracker,
-                depth,
-            )?);
-            remaining = next;
-        }
-        Ok((reports, None))
-    }
-
-    /// Extracts and scans ZIP members in memory under the shared resource budget.
-    /// Never writes to disk; member names are used only as display labels.
-    #[allow(clippy::type_complexity)]
-    fn scan_zip(
-        &self,
-        data: &[u8],
-        parent: &str,
-        tracker: &mut ResourceTracker,
-        depth: usize,
-    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
-        use std::io::Read;
-        let mut subs = Vec::new();
-
-        if let Err(e) = tracker.check_depth(depth) {
-            if matches!(e, ScanError::Timeout { .. }) {
-                return Err(e);
-            }
-            return Ok((
-                subs,
-                Some((ScanStatus::Failed, format!("ZIP not inspected: {}", e))),
-            ));
-        }
-
-        let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(data)) {
-            Ok(a) => a,
-            Err(e) => {
-                return Ok((
-                    subs,
-                    Some((
-                        ScanStatus::Unsupported,
-                        format!("Malformed ZIP container: {}", e),
-                    )),
-                ))
-            }
-        };
-
-        let max_entries = tracker.limits().max_email_attachments;
-        if archive.len() > max_entries {
-            return Ok((
-                subs,
-                Some((
-                    ScanStatus::Failed,
-                    format!("ZIP has {} entries (limit {})", archive.len(), max_entries),
-                )),
-            ));
-        }
-
-        let cap = tracker.limits().max_email_attachment_size;
-        // Extra local headers may belong to another or truncated embedded ZIP.
-        // ZipArchive only exposes one central directory, so do not report CLEAN.
-        let extra_headers = data
-            .windows(4)
-            .filter(|w| *w == b"PK\x03\x04")
-            .take(archive.len().saturating_add(1))
-            .count()
-            > archive.len();
-        let mut issue: Option<(ScanStatus, String)> = extra_headers.then(|| {
-            (
-                ScanStatus::Unsupported,
-                "Additional ZIP local headers may contain uninspected content".into(),
-            )
-        });
-        let raise = |issue: &mut Option<(ScanStatus, String)>, st: ScanStatus, msg: String| {
-            let replace = match issue {
-                None => true,
-                Some((cur, _)) => *cur == ScanStatus::Unsupported && st == ScanStatus::Failed,
-            };
-            if replace {
-                *issue = Some((st, msg));
-            }
-        };
-
-        for i in 0..archive.len() {
-            tracker.check_timeout()?;
-            let mut file = match archive.by_index(i) {
-                Ok(f) => f,
-                Err(zip::result::ZipError::UnsupportedArchive(m)) => {
-                    raise(
-                        &mut issue,
-                        ScanStatus::Unsupported,
-                        format!("ZIP member {} not inspectable: {}", i, m),
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    raise(
-                        &mut issue,
-                        ScanStatus::Failed,
-                        format!("ZIP member {} unreadable: {}", i, e),
-                    );
-                    continue;
-                }
-            };
-            if file.is_dir() {
-                continue;
-            }
-            let name: String = file.name().chars().take(256).collect();
-            let label = format!("{}/{}", parent, name);
-            if file.encrypted() {
-                raise(
-                    &mut issue,
-                    ScanStatus::Unsupported,
-                    format!("Encrypted ZIP member: {}", label),
-                );
-                continue;
-            }
-
-            let declared = file.size();
-            if let Err(e) = tracker.register_attachment(declared) {
-                match e {
-                    ScanError::Timeout { .. } => return Err(e),
-                    ScanError::AttachmentLimitExceeded { .. }
-                    | ScanError::ExtractedSizeLimitExceeded { .. } => {
-                        raise(
-                            &mut issue,
-                            ScanStatus::Failed,
-                            format!("ZIP extraction budget exhausted: {}", e),
-                        );
-                        break;
-                    }
-                    _ => {
-                        raise(
-                            &mut issue,
-                            ScanStatus::Failed,
-                            format!("ZIP member {} rejected: {}", label, e),
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // Check the deadline between bounded decompression reads.
-            let remaining_budget = tracker
-                .limits()
-                .max_total_extracted_bytes
-                .saturating_sub(tracker.total_extracted_bytes());
-            let output_limit = cap.min(declared.saturating_add(remaining_budget));
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 64 * 1024];
-            let mut extraction_error = None;
-            loop {
-                tracker.check_timeout()?;
-                let remaining = output_limit
-                    .saturating_add(1)
-                    .saturating_sub(buf.len() as u64);
-                if remaining == 0 {
-                    break;
-                }
-                let limit = remaining.min(chunk.len() as u64) as usize;
-                match file.read(&mut chunk[..limit]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if buf.try_reserve(n).is_err() {
-                            extraction_error = Some("allocation failed".to_string());
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    Err(e) => {
-                        extraction_error = Some(e.to_string());
-                        break;
-                    }
-                }
-            }
-            if let Some(e) = extraction_error {
-                raise(
-                    &mut issue,
-                    ScanStatus::Failed,
-                    format!("ZIP member {} extraction failed: {}", label, e),
-                );
-                continue;
-            }
-            if buf.len() as u64 > output_limit {
-                raise(
-                    &mut issue,
-                    ScanStatus::Failed,
-                    format!("ZIP member {} exceeds extraction budget", label),
-                );
-                continue;
-            }
-            if buf.len() as u64 > declared {
-                if let Err(e) =
-                    tracker.record_extracted_bytes((buf.len() as u64 - declared) as usize)
-                {
-                    raise(
-                        &mut issue,
-                        ScanStatus::Failed,
-                        format!("ZIP extraction budget exhausted: {}", e),
-                    );
-                    break;
-                }
-            }
-            drop(file);
-
-            match self.scan_object(&buf, &label, None, tracker, depth) {
-                Ok(r) => subs.push(r),
-                Err(e @ ScanError::Timeout { .. }) => return Err(e),
-                Err(e) => raise(
-                    &mut issue,
-                    ScanStatus::Failed,
-                    format!("ZIP member {} scan failed: {}", label, e),
-                ),
-            }
-        }
-        Ok((subs, issue))
-    }
 }
 
 enum ContainerKind {
     None,
-    Gzip,
     Zip,
+    Tar,
+    Compressed(StreamFormat),
+    Cfb,
     Unsupported(&'static str),
 }
 
@@ -980,23 +708,27 @@ fn classify_container(
     {
         ContainerKind::Zip
     } else if is_tar_header(data) || is_tar_claim(data, filename, declared_mime) {
-        ContainerKind::Unsupported("TAR")
+        ContainerKind::Tar
     } else if data.starts_with(b"Rar!\x1a\x07") {
         ContainerKind::Unsupported("RAR")
     } else if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         ContainerKind::Unsupported("7-Zip")
     } else if data.starts_with(&[0x1f, 0x8b]) {
-        ContainerKind::Gzip
+        ContainerKind::Compressed(StreamFormat::Gzip)
     } else if data.starts_with(b"BZh") && data.len() > 3 && data[3].is_ascii_digit() {
-        ContainerKind::Unsupported("BZIP2")
+        ContainerKind::Compressed(StreamFormat::Bzip2)
     } else if data.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        ContainerKind::Unsupported("XZ")
+        ContainerKind::Compressed(StreamFormat::Xz)
     } else if data.starts_with(b"MSCF") {
         ContainerKind::Unsupported("CAB")
+    } else if data.starts_with(OLE2_MAGIC) {
+        ContainerKind::Cfb
     } else {
         ContainerKind::None
     }
 }
+
+const OLE2_MAGIC: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 
 fn is_tar_claim(data: &[u8], filename: &str, declared_mime: Option<&str>) -> bool {
     let lower_name = filename.to_ascii_lowercase();
@@ -1020,10 +752,30 @@ fn find_outside(data: &[u8], needle: &[u8], skip: &[(usize, usize)]) -> Option<u
 /// so random binary data does not trigger false UNSCANNED results; a candidate cut
 /// off by the end of the data cannot be ruled out and still counts.
 fn embedded_container_magic(data: &[u8], skip: &[(usize, usize)]) -> Option<&'static str> {
-    type Validator = fn(&[u8]) -> bool;
-    // `rest` starts at the candidate. Each validator returns false only when the
-    // bytes present contradict the format.
-    let candidates: [(&[u8], &'static str, Validator); 6] = [
+    let candidates = unsupported_container_candidates();
+    for (magic, kind, valid) in candidates {
+        // A leading GZIP stream is the object itself and is decoded separately.
+        if kind == "GZIP" && data.starts_with(magic) {
+            continue;
+        }
+        let found = memchr::memmem::find_iter(data, magic).any(|pos| {
+            !skip.iter().any(|&(start, end)| start <= pos && pos < end) && valid(&data[pos..])
+        });
+        if found {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+type Validator = fn(&[u8]) -> bool;
+type Candidate = (&'static [u8], &'static str, Validator);
+
+/// Signatures of containers not separately extracted when embedded in another
+/// object. `rest` starts at the candidate; each validator returns false only when
+/// the bytes present contradict the format.
+fn unsupported_container_candidates() -> [Candidate; 6] {
+    [
         (b"Rar!\x1a\x07", "RAR", |r| match r.get(6) {
             None => true,
             Some(0) => true,
@@ -1055,20 +807,51 @@ fn embedded_container_magic(data: &[u8], skip: &[(usize, usize)]) -> Option<&'st
             let reserved = r.get(4..8).unwrap_or(r.get(4..).unwrap_or_default());
             reserved.iter().all(|&b| b == 0)
         }),
+    ]
+}
+
+/// Plausible ZIP local file header: version, flags, method and name length.
+fn plausible_zip_local_header(r: &[u8]) -> bool {
+    let u16_at = |i: usize| r.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    u16_at(4).is_none_or(|v| v <= 100)
+        && u16_at(6).is_none_or(|flags| flags & 0xc780 == 0 || flags & 0x0001 != 0)
+        && u16_at(8).is_none_or(|m| matches!(m, 0..=20 | 93 | 95 | 96 | 97 | 98 | 99))
+        && u16_at(26).is_none_or(|n| (1..=4096).contains(&n))
+}
+
+/// Container signatures searched for in objects inspected in streaming mode, which
+/// cannot be unpacked recursively. Stronger validation than the buffered path keeps
+/// random image data from producing false UNSCANNED results.
+fn streamed_container_candidates() -> Vec<Candidate> {
+    let mut list: Vec<Candidate> = vec![
+        (b"PK\x03\x04", "ZIP", plausible_zip_local_header),
+        (b"%PDF-", "PDF", |r| {
+            r.get(5).is_none_or(|b| b.is_ascii_digit()) && r.get(6).is_none_or(|&b| b == b'.')
+        }),
+        (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "OLE2/CFB", |_| true),
     ];
-    for (magic, kind, valid) in candidates {
-        // A leading GZIP stream is the object itself and is decoded separately.
-        if kind == "GZIP" && data.starts_with(magic) {
-            continue;
-        }
-        let found = memchr::memmem::find_iter(data, magic).any(|pos| {
-            !skip.iter().any(|&(start, end)| start <= pos && pos < end) && valid(&data[pos..])
-        });
-        if found {
-            return Some(kind);
-        }
+    list.extend(unsupported_container_candidates());
+    list
+}
+
+/// Identifies a container format from the start of an object.
+fn container_head(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+        return Some("ZIP");
     }
-    None
+    if pdf::header_offset(head).is_some() {
+        return Some("PDF");
+    }
+    if head.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
+        return Some("OLE2/CFB");
+    }
+    if is_tar_header(head) {
+        return Some("TAR");
+    }
+    unsupported_container_candidates()
+        .into_iter()
+        .find(|(magic, _, valid)| head.starts_with(magic) && valid(head))
+        .map(|(_, kind, _)| kind)
 }
 
 /// Keeps the more severe of two inspection issues (Failed > Unsupported).
@@ -1509,8 +1292,23 @@ mod tests {
                     report.error
                 );
                 assert!(!report.sub_targets.is_empty());
+                // An exhausted buffered budget switches to streaming, which still
+                // inspects every byte; only exhausting the streamed budget as well
+                // leaves content uninspected, and that must never be CLEAN.
                 let mut tracker = ResourceTracker::new(ResourceLimits {
                     max_total_extracted_bytes: 1,
+                    ..Default::default()
+                });
+                assert_eq!(
+                    scanner
+                        .scan_object(&data, "buffer-exhausted.pdf", None, &mut tracker, 0)
+                        .unwrap()
+                        .status,
+                    report.status
+                );
+                let mut tracker = ResourceTracker::new(ResourceLimits {
+                    max_total_extracted_bytes: 1,
+                    max_total_streamed_bytes: 1,
                     ..Default::default()
                 });
                 assert_ne!(
@@ -1549,12 +1347,14 @@ mod tests {
         assert_eq!(report.status, ScanStatus::Clean);
         assert_eq!(report.sub_targets.len(), 2);
         let mut tracker = ResourceTracker::new(ResourceLimits {
-            max_email_attachments: 1,
+            max_archive_members: 1,
             ..Default::default()
         });
-        assert!(scanner
+        let limited = scanner
             .scan_object(&data, "limited.gz", None, &mut tracker, 0)
-            .is_err());
+            .unwrap();
+        assert_eq!(limited.status, ScanStatus::Failed);
+        assert!(limited.error.unwrap().contains("ARCHIVE_LIMIT"));
         data.extend_from_slice(b"uninspected suffix");
         let mut tracker = ResourceTracker::new(ResourceLimits::default());
         assert_eq!(
@@ -2130,7 +1930,7 @@ Hello world=ZZ invalid escape\r\n\
     }
 
     #[test]
-    fn test_tar_archive_produces_unsupported_verdict_never_clean() {
+    fn test_tar_archive_members_are_inspected() {
         let tar_data = make_test_tar("clean_document.txt", b"Benign text content inside TAR.");
         let db = SignatureDatabase::new();
         let scanner = EmailScanner::new(&db);
@@ -2147,20 +1947,20 @@ Hello world=ZZ invalid escape\r\n\
             )
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Unsupported);
-        assert!(report
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("TAR container cannot be extracted"));
+        assert_eq!(report.status, ScanStatus::Clean, "{:?}", report.error);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(
+            report.sub_targets[0].target.file_name.as_deref(),
+            Some("archive.tar/clean_document.txt")
+        );
     }
 
     #[test]
-    fn test_tar_archive_with_hash_only_malware_returns_unsupported_never_clean() {
+    fn test_tar_member_malware_is_detected() {
         let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
         let tar_data = make_test_tar("eicar.txt", eicar);
 
-        let db = SignatureDatabase::new();
+        let db = SignatureDatabase::with_defaults();
         let scanner = EmailScanner::new(&db);
         let limits = ResourceLimits::default();
         let mut tracker = ResourceTracker::new(limits);
@@ -2175,12 +1975,15 @@ Hello world=ZZ invalid escape\r\n\
             )
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Unsupported);
-        assert!(report
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("TAR container cannot be extracted"));
+        assert_eq!(report.status, ScanStatus::Infected);
+        assert!(report.threats.iter().any(|t| t.name.contains("EICAR")));
+
+        // A truncated copy of the same archive is never CLEAN.
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let truncated = scanner
+            .scan_object(&tar_data[..600], "cut.tar", None, &mut tracker, 0)
+            .unwrap();
+        assert_ne!(truncated.status, ScanStatus::Clean);
     }
 
     #[test]
@@ -2206,7 +2009,7 @@ Hello world=ZZ invalid escape\r\n\
     }
 
     #[test]
-    fn test_nested_tar_inside_zip_produces_unsupported() {
+    fn test_nested_tar_inside_zip_is_inspected() {
         use std::io::Write;
         let tar_data = make_test_tar("inner.txt", b"Safe inner text");
 
@@ -2238,9 +2041,10 @@ Hello world=ZZ invalid escape\r\n\
             )
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.status, ScanStatus::Clean, "{:?}", report.error);
         assert_eq!(report.sub_targets.len(), 1);
-        assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Clean);
+        assert_eq!(report.sub_targets[0].sub_targets.len(), 1);
     }
 
     fn base64_encode(data: &[u8]) -> String {

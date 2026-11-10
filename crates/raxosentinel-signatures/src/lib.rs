@@ -21,8 +21,10 @@ pub mod database;
 pub mod loader;
 pub mod models;
 pub mod rsidb;
+pub mod yara;
 
 pub use builtin::{default_hash_rules, default_pattern_rules};
-pub use database::SignatureDatabase;
+pub use database::{SignatureDatabase, StreamMatcher, StreamOutcome};
+pub use yara::{YaraEngine, YaraLoadError};
 pub use loader::{load_rules_from_file, load_rules_from_str, RuleSetFile};
 pub use models::{HashRule, PatternRule};

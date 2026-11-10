@@ -39,3 +39,18 @@ md-5 = "0.10"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
 rand = "0.8"
+# YARA-X: pinned exactly; only the modules below are compiled in.
+yara-x = { version = "=1.23.0", default-features = false, features = [
+    "constant-folding", "exact-atoms", "fast-regexp",
+    "hash-module", "math-module", "string-module", "time-module",
+    "pe-module", "elf-module", "lnk-module",
+] }
+
+# Full debug info for third-party crates (YARA-X, wasmtime, cranelift) dominates rustc
+# and linker memory in dev/test builds on small (8 GiB) machines. Dependencies keep line
+# tables for backtraces; workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+[profile.dev.package.cranelift-codegen]
+debug = false

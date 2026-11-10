@@ -363,6 +363,11 @@ def synthetic_structures():
     # BTYPE bits of the first deflate block header set to 11 (reserved).
     corrupt_flate = text_flate[:2] + bytes([text_flate[2] | 0x06]) + text_flate[3:]
     hexed = zlib.compress(EICAR).hex().encode() + b">"
+    # Smooth scan-like gradient: large decoded size, small Flate encoding.
+    gradient = b"".join(bytes(c for x in range(2480) for c in (x * 255 // 2480, y * 255 // 3508, 128))
+                        for y in range(3508))
+    block = text[:20_000]
+    big_text = (block * ((30 << 20) // len(block) + 1))[:30 << 20]
     fixtures = [
         ("eicar-ahx-flate-chain.pdf", "DETECTED", "detection",
          stream(hexed, b"/Type /EmbeddedFile /Filter [/ASCIIHexDecode /FlateDecode]"),
@@ -375,10 +380,29 @@ def synthetic_structures():
         ("malformed-truncated-flate.pdf", "UNSCANNED", "malformed",
          stream(text_flate[:len(text_flate) // 2], b"/Type /EmbeddedFile /Filter /FlateDecode"),
          "EmbeddedFile whose deflate data stops before the final block"),
-        ("flate-trailing-garbage.pdf", "CLEAN", "tolerated",
+        ("flate-trailing-garbage.pdf", "UNSCANNED", "malformed",
          stream(zlib.compress(b"harmless " * 400)[:40] + b"\x00garbage\xff" * 8,
                 b"/Type /EmbeddedFile /Filter /FlateDecode"),
-         "complete deflate body, Adler-32 cut short, trailing bytes after the final block"),
+         "complete deflate body followed by non-whitespace bytes that were never inspected "
+         "(Phase 3C.3: CLEAN; Phase 3D: UNSCANNED)"),
+        ("flate-truncated-adler.pdf", "CLEAN", "tolerated",
+         stream(zlib.compress(text, 9)[:-2], b"/Type /EmbeddedFile /Filter /FlateDecode"),
+         "complete deflate body with the Adler-32 trailer cut short (common writer defect)"),
+        ("flate-trailing-whitespace.pdf", "CLEAN", "tolerated",
+         stream(zlib.compress(text, 9) + b"\r\n  ", b"/Type /EmbeddedFile /Filter /FlateDecode"),
+         "complete zlib stream followed only by whitespace before endstream"),
+        ("streamed-large-image.pdf", "CLEAN", "streaming",
+         stream(zlib.compress(gradient, 6), b"/Type /XObject /Subtype /Image /Width 2480 /Height 3508 "
+                b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode"),
+         "A4 300 dpi RGB image XObject (26.1 MB decoded) inspected by the streaming path"),
+        ("eicar-end-of-streamed-embedded-file.pdf", "DETECTED", "streaming",
+         stream(zlib.compress(big_text[:-200] + EICAR + big_text[-200 + len(EICAR):], 6),
+                b"/Type /EmbeddedFile /Filter /FlateDecode"),
+         "EICAR near the end of a 30 MiB EmbeddedFile (beyond the 25 MiB buffer limit)"),
+        ("eicar-across-chunk-boundary.pdf", "DETECTED", "streaming",
+         stream(zlib.compress(big_text[:(26 << 20) - 30] + EICAR + big_text[(26 << 20) - 30 + len(EICAR):], 6),
+                b"/Type /EmbeddedFile /Filter /FlateDecode"),
+         "EICAR straddling a 64 KiB chunk boundary of a streamed EmbeddedFile"),
         ("unsupported-unknown-filter.pdf", "UNSCANNED", "unsupported",
          stream(b"opaque", b"/Type /EmbeddedFile /Filter /RaxoUnknownDecode"),
          "stream with a filter no PDF reader implements"),

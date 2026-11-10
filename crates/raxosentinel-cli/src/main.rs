@@ -26,7 +26,7 @@ use raxosentinel_signatures::rsidb::crypto;
 use raxosentinel_signatures::rsidb::ingest::{BuildProfile, IngestPipeline, SourceManifest};
 use raxosentinel_signatures::rsidb::lifecycle::DbStore;
 use raxosentinel_signatures::rsidb::{MmapCompactDirIndex, RsidbIndex};
-use raxosentinel_signatures::{load_rules_from_file, SignatureDatabase};
+use raxosentinel_signatures::{load_rules_from_file, SignatureDatabase, YaraEngine};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -275,6 +275,11 @@ struct ScanArgs {
     #[arg(long)]
     rules: Option<PathBuf>,
 
+    /// Trusted local YARA-X rule file, or directory of *.yar/*.yara files
+    /// (repeatable). Any compilation error rejects the whole rule set.
+    #[arg(long = "yara-rules", value_name = "PATH")]
+    yara_rules: Vec<PathBuf>,
+
     /// Display resident memory usage statistics
     #[arg(long)]
     memory: bool,
@@ -444,6 +449,10 @@ fn run_scan(args: ScanArgs) -> i32 {
             return 3;
         }
     }
+    if let Err(e) = attach_yara_rules(&args.yara_rules, &mut db) {
+        eprintln!("Error: {e}");
+        return 3;
+    }
 
     // A configured database that fails validation is a hard error: never scan "without" it.
     if let Some(ref release) = args.public_release {
@@ -558,11 +567,15 @@ fn run_scan(args: ScanArgs) -> i32 {
         }
     }
     let mut tracker = ResourceTracker::new(limits);
-    let report = if args.worker_internal {
+    let mut report = if args.worker_internal {
         scan_descriptor(&args.target, &db, &mut tracker)
     } else {
         scan_path(&args.target, &db, &mut tracker)
     };
+    let folded = report.compact(raxosentinel_core::report::MAX_REPORT_NODES);
+    if folded > 0 {
+        tracing::info!("{folded} sub-target report(s) summarised to bound the report size");
+    }
 
     let mem_usage = if args.memory {
         Some(MemoryUsage::capture())
@@ -583,6 +596,22 @@ fn run_scan(args: ScanArgs) -> i32 {
     }
 
     report.status.exit_code()
+}
+
+/// Compiles trusted local YARA-X rules (if any were configured) and attaches them
+/// alongside RSIDB. With no paths the database is left unchanged.
+pub(crate) fn attach_yara_rules(paths: &[PathBuf], db: &mut SignatureDatabase) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let engine = YaraEngine::from_paths(paths).map_err(|e| format!("YARA-X rules rejected: {e}"))?;
+    tracing::info!(
+        "Loaded {} YARA-X rules from {} file(s)",
+        engine.rule_count(),
+        engine.files().len()
+    );
+    db.attach_yara(Arc::new(engine));
+    Ok(())
 }
 
 fn scan_descriptor(

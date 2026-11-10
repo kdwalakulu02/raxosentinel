@@ -1,0 +1,235 @@
+RAXOSENTINEL — PHASE 3C.3 HANDOVER: REAL-WORLD PDF COMPATIBILITY AND SECURE INSPECTION
+
+INTERNAL DEVELOPMENT — NOT PRODUCTION VALIDATED — NOT YET PUSHED OR RELEASED
+
+STATUS SUMMARY
+
+Implementation, corpus, measurement, documentation and validation are complete and
+committed locally on phase-3c. Push and prerelease are pending only because this
+environment has no GitHub credentials (git fetch/push fail; gh is not installed). The
+owner deferred git work. No tag was created, the existing tag
+internal-mail-integration-20261107 (551fd35) is untouched and remains the rollback
+point. Raxo Mail, the private RSIDB, repository visibility and production were not
+touched.
+
+Local commits on phase-3c (parent 551fd35f3bd638952341d50c5fb172de17841cc8):
+  58c7df8  Write CLI diagnostics to stderr
+  dc7598f  Inspect real-world PDFs with bounded decoders and coverage checks
+  2030f31  Add PDF regression corpus, measurements and Phase 3C.3 documentation
+Full SHAs: run `git rev-parse 58c7df8 dc7598f 2030f31` (the final SHA will be fixed at
+push; it is not rewritten unless the owner requests changes).
+
+Headline (46-fixture corpus, supervised worker, actual measurements):
+  Baseline 551fd35: 14/46 correct verdicts; 5 of 28 valid clean PDFs returned CLEAN;
+                    22 false UNSCANNED, 1 false ERROR; 5/8 EICAR detections; 1 false
+                    CLEAN on an EICAR fixture.
+  Phase 3C.3:       46/46 correct verdicts; 28/28 valid clean PDFs CLEAN; 0 false
+                    UNSCANNED; 8/8 detections; all malformed/encrypted/unsupported
+                    fixtures UNSCANNED; both decompression bombs ERROR.
+
+
+1. ROOT CAUSES (BASELINE 551fd35)
+
+R1  Load-time decompression limit of 0 bytes (max_decompressed_size: Some(0)).
+    lopdf needs to decompress xref streams and object streams while loading, so every
+    PDF 1.5+ file using them (cairo, Ghostscript, qpdf, MuPDF, pdftocairo, most modern
+    writers) failed with "couldn't decompress stream". This is the Cairo failure:
+    cairo 1.18 emits a compressed xref stream plus object streams by default. The
+    Cairo file was valid; the configuration was the problem. The 0-byte limit was set
+    deliberately because lopdf's per-stream limit multiplies across streams with no
+    aggregate bound — so simply raising it would have reopened a bomb vector.
+R2  Every non-trivial filter configuration rejected: DecodeParms (PNG predictors used
+    by LibreOffice, img2pdf, qpdf), filter chains, ASCII85/AHx/LZW/RL, image codecs
+    (DCT/CCITT, i.e. every JPEG or fax-scan PDF), and all encryption including
+    owner-password-only (permissions) encryption, which ordinary readers open without
+    a password.
+R3  Each stream called register_attachment, consuming the 30-attachment budget per
+    stream instead of per embedded file.
+R4  lopdf's Flate helper is fail-open (corrupt data can yield partial/empty output with
+    no error). Decoded content could therefore be silently incomplete.
+R5  Strings were not inspected: EICAR in a hex string of the Info dictionary returned
+    CLEAN (a false CLEAN, policy violation).
+R6  Container magic search was unvalidated: any "PK\x03\x04", BZh, 7z etc. byte
+    sequence anywhere, including inside compressed image data, reclassified the PDF
+    as an archive → false UNSCANNED.
+R7  tracing logs (lopdf warnings) were written to stdout and corrupted the JSON
+    report and the supervised worker response channel → "Malformed worker response"
+    ERROR on 5 fixtures (user-password encryption, corrupt Flate etc.).
+
+Strictly malformed files (bad startxref, truncated, header-only) are genuine
+corruption; these remain UNSCANNED by design.
+
+
+2. IMPLEMENTED CHANGES
+
+Architecture (crates/raxosentinel-email/src/scanner/pdf.rs, pdf_decode.rs):
+* lopdf 0.47.0 retained (maintained, MIT, already vetted) and used in strict mode only.
+  Lenient xref reconstruction was evaluated and rejected: it repairs files (out of
+  scope), creates parser-differential risk versus the reader the recipient uses, and
+  would turn malformed input into CLEAN.
+* Object streams are intercepted through lopdf's load filter and expanded by our code:
+  bounded decode against a 64 MiB object-stream total and the aggregate extraction
+  budget; header validated; members parsed slot-by-slot in isolation, so overlapping
+  member offsets cannot amplify memory (a known lopdf amplification). Members only join
+  the document where the xref assigns them to that container.
+* Xref streams decoded by lopdf under a 4 MiB per-stream limit.
+* All content streams decoded by our own fail-closed decoders: Flate (flate2, raw
+  deflate after validated zlib header; must reach the final block), LZW (weezl crate,
+  EarlyChange 0/1), ASCIIHex, ASCII85 (verified against Python reference vectors —
+  lopdf's own ASCII85 decoder disagrees with the reference), RunLength, PNG predictors
+  10–15, TIFF predictor 2 (8-bit), chains up to 8 filters, identity /Crypt. Partial
+  output from a failed decode is still scanned, then reported.
+* Per-chain decoded/raw ratio limit 1100:1 above 1 MiB (a single deflate layer cannot
+  exceed ~1032:1, so ordinary maximal compression passes and nested bombs do not).
+* Deadline checks inside decoders, the load filter and string walking.
+* Owner-password-only encryption (empty user password) is decrypted and inspected;
+  user-password encryption is PDF_ENCRYPTED (UNSCANNED).
+* Incremental updates: every "endstream" keyword in the file must fall in an inspected
+  stream span. Streams the latest revision no longer references (shadowed or orphaned
+  content, a classic hiding technique) are found by loading earlier %%EOF-terminated
+  revisions (max 32). Anything still unexplained → PDF_UNREFERENCED_STREAM.
+* Integrity: every declared xref entry must have been loaded (PDF_OBJECT_UNREADABLE).
+* String objects (literal and hex, after unescaping) and shadowed object-stream members
+  are matched against the signature database.
+* Embedded files: recursive scan, counted once each against the attachment limit.
+* Image codecs (DCT/JPX/JBIG2/CCITT) are not decoded; ordinary JPEG/fax scans are no
+  longer rejected. Their raw bytes are covered by the whole-file scan, and they are
+  recorded in debug statistics (raw_images).
+* Container classification ignores magic bytes inside inspected PDF stream spans and
+  requires validated archive headers (GZIP flags/XFL/OS, BZh level+block magic, CAB
+  reserved fields, etc.). The ZIP/PDF polyglot regressions still DETECT.
+* Logs go to stderr (crates/raxosentinel-cli/src/main.rs).
+
+Machine-readable diagnostics (in the existing "error" field as "CODE: message"; no
+schema or protocol change, Rust Mail needs no change):
+  UNSCANNED: PDF_PARSE_FAILED, PDF_ENCRYPTED, PDF_UNSUPPORTED_FILTER,
+             PDF_STREAM_DECODE_FAILED, PDF_EXTERNAL_STREAM, PDF_OBJSTM_INVALID,
+             PDF_OBJECT_UNREADABLE, PDF_UNREFERENCED_STREAM
+  ERROR:     PDF_RESOURCE_LIMIT
+  PDF_NESTED: incomplete inspection inherited from a nested scan.
+DETECTED always takes precedence. No inspection path silently yields CLEAN.
+
+New direct dependencies: memchr 2 and weezl 0.2 (widely used, MIT/Apache-2.0).
+
+Resource limits (all pre-existing limits unchanged and still enforced):
+  per-stream decoded 25 MiB, aggregate 100 MiB, ratio 1100:1, object-stream total
+  64 MiB, lopdf internal decode 4 MiB, 500,000 objects, 32 revisions, 30 attachments,
+  depth 5, 10 s deadline; worker RLIMIT_AS 1 GiB and SIGKILL unchanged.
+
+
+3. REGRESSION CORPUS (tests/pdf-corpus/)
+
+46 fixtures generated locally by generate.py; no third-party documents; EICAR is the
+only malicious content. MANIFEST.tsv records generator + version, structure, expected
+verdict, SHA-256. The integration test crates/raxosentinel-cli/tests/pdf_corpus.rs runs
+every fixture through the supervised worker and verifies hashes and verdicts.
+
+Generators: LibreOffice (Writer DOCX export as the Word-compatible exporter, Calc,
+tagged, PDF/A-2b, hybrid with embedded ODT), Chromium print-to-PDF, cairo 1.18.4
+(default, PDF 1.4, text-only), ReportLab (compressed, uncompressed, ASCII85 image),
+Ghostscript, img2pdf scans (JPEG, CCITT, PNG-predictor), qpdf (object streams,
+linearized, attachment, RC4/AES-256 owner-only, user-password), MuPDF incremental
+updates, pdftocairo rewrite, hand-built PDF 32000-1 structures.
+Microsoft Word itself is not available here; LibreOffice DOCX export stands in.
+
+Categories: 28 CLEAN (incl. 1 tolerated: complete deflate with trailing bytes),
+8 DETECTED (embedded EICAR in classic, object-stream, linearized, owner-encrypted,
+incremental-added, incremental-shadowed, AHx+Flate chain, hex string), 8 UNSCANNED
+(4 malformed structure, corrupt Flate, truncated Flate, user-password ×2 [one with
+EICAR], unknown filter), 2 ERROR (Flate bomb in attachment, object-stream bomb).
+
+Note: the original "corrupt Flate" fixture was mislabelled — its deflate body was
+actually complete (only Adler-32 truncated, then trailing bytes). It is now the CLEAN
+"flate-trailing-garbage" fixture; genuinely corrupt (reserved block type) and truncated
+deflate fixtures were added. Python's zlib confirms each classification.
+
+
+4. MEASUREMENTS (actual, this host)
+
+Host: Debian 13, 2 vCPU, ~7 GiB RAM, Rust 1.99.1. This is NOT the Ubuntu 24.04 /
+4 vCPU / 8 GiB Contabo target; figures should be re-measured there. Single runs,
+small corpus — no general false-positive/false-UNSCANNED rate is claimed.
+
+                                    baseline 551fd35        Phase 3C.3
+  correct verdicts                  14/46                   46/46
+  valid clean PDFs → CLEAN          5/28                    28/28
+  false UNSCANNED (valid PDFs)      22                      0
+  false ERROR                       1 (log corruption)      0
+  EICAR detections                  5/8 (1 false CLEAN)     8/8
+  bombs                             UNSCANNED (2)           ERROR (2), as expected
+  corpus wall time (sum, in-proc)   0.09 s                  0.27 s
+  max per-file time                 ≤0.04 s                 0.11 s (Flate bomb)
+  peak RSS, valid clean PDFs        5.6–11.8 MiB            6.1–12.6 MiB (avg 7.5 MiB)
+  peak RSS, any fixture             31 MB                   32 MB (bombs)
+
+Most of the baseline was faster only because it gave up early on 22 files.
+
+Large scans (A4, 300 dpi, full-colour Flate image ≈ 26.1 MB decoded per page):
+  pages  baseline                     Phase 3C.3
+  1      CLEAN 0.25 s, 31 MB          CLEAN 0.11 s, 32 MB
+  4      CLEAN 0.99 s, 33 MB          CLEAN 0.38 s, 33 MB
+  5      UNSCANNED 0.89 s, 33 MB      ERROR 0.40 s, 33 MB (PDF_RESOURCE_LIMIT, 100 MiB
+                                      aggregate budget exhausted — fails closed)
+Our decoder is ~2.5× faster than lopdf's on these streams; memory stays flat because
+each decoded buffer is released after scanning.
+
+Release binary (built from 2030f31 source, this host, not for distribution):
+  sha256 70660f4ccfd168c97cf5ac1b45f4514041e4429a2dd4ff13db63f699202848ce
+
+
+5. VALIDATION
+
+  cargo fmt --all -- --check                               pass
+  cargo clippy --workspace --all-targets -- -D warnings    pass
+  cargo test --workspace                                   pass (0 failures; includes
+      36 email-crate unit tests incl. 6 decoder tests, 10 supervised-worker tests,
+      phase3a corpus, polyglot regressions, coordinator 33, new pdf_corpus test)
+  cargo build --release --locked                           pass
+  PDF corpus (run-corpus.sh, supervised)                   46/46
+
+Not available here: Ubuntu 24.04 / 4 vCPU hardware, Microsoft Word, live Rust Mail
+end-to-end run, GitHub push/release.
+
+
+6. KNOWN LIMITATIONS
+
+* Image codecs (DCT/JPX/JBIG2/CCITT) are not decoded; inline images scanned encoded.
+* Multi-page colour Flate scans above ~100 MiB decoded total return ERROR (measured
+  at 5 A4 pages, 300 dpi). Mail will withhold these. Recommended next step: count image
+  XObjects against a bounded sliding-window scan instead of the aggregate extraction
+  budget (requires streaming signature matching); not implemented in this phase.
+* Malformed-but-viewable PDFs (broken xref that Acrobat silently repairs) stay
+  UNSCANNED by policy.
+* Strings in shadowed non-stream objects of earlier revisions are matched raw only.
+* lopdf's encrypted-document path expands object streams itself (4 MiB each) and only
+  logs per-object decryption failures; xref-aliasing parse time is bounded by the
+  worker deadline and address-space limit rather than in-library limits.
+* %PDF- header accepted within the first 1024 bytes (small risk that text quoting a
+  PDF header is treated as a PDF and returned UNSCANNED).
+* Corpus is generated, not sampled from real mail traffic; the real false-UNSCANNED
+  rate must be measured on a private sample before production decisions.
+
+Full capability and code reference: docs/PDF_INSPECTION_PHASE3C3.md
+
+
+7. RELEASE PLAN (PENDING GIT CREDENTIALS)
+
+1. git push origin phase-3c   (3 commits on top of 551fd35)
+2. Create private source-only prerelease, proposed tag
+   internal-mail-integration-20261108-pdf, pinned to the pushed HEAD (2030f31 unless
+   amended). No binary attached (the binary above was built on Debian, not Ubuntu).
+3. Keep internal-mail-integration-20261107 (551fd35) as rollback.
+
+RUST MAIL CODER INSTRUCTIONS (once the tag exists)
+
+* No protocol, envelope, exit-code or socket change. Rebuild and swap the binary:
+    git checkout <new tag>; cargo build --release --locked
+  Same serve/client commands and phase2d6-unified database as the previous handover.
+* Verdict handling unchanged: only CLEAN may be delivered; DETECTED, UNSCANNED,
+  ERROR, BUSY and missing responses withhold.
+* Optional: the "error" field now starts with a stable PDF_* code; Mail may show it in
+  operator notifications (e.g. PDF_ENCRYPTED → "password-protected PDF, cannot be
+  inspected"). Do not parse the message text after the code.
+* Expect far fewer withheld PDFs. Expect ERROR/PDF_RESOURCE_LIMIT on very large
+  colour scans.
+* Rollback: rebuild from internal-mail-integration-20261107.

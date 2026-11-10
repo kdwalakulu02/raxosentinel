@@ -1,0 +1,15 @@
+RaxoSentinel Phase 3B handover — 2026-11-06
+
+STATUS: INCOMPLETE. This is not a release candidate. Do not deploy the present working-tree change. No commit or push was made. Existing executable and database were not overwritten intentionally. Existing untracked private artifacts were left alone.
+
+PDF/ZIP: scan_object dispatches to scan_zip only when classify_container identifies ZIP. Previously this required a ZIP signature at offset zero or ZIP filename/MIME. Therefore a PDF-prefixed deflated ZIP is not decompressed; raw signature matching can find an uncompressed stored payload but generally not the compressed payload. An experimental change searches for a ZIP local header anywhere and invokes the existing bounded ZIP extraction. The phase3a_corpus regression was extended with PDF-prefix stored and deflated ZIPs using a synthetic SHA-256 signature; it passed. This is not an exact reproduction with EICAR and ClamAV. The discovery approach needs further security review: arbitrary local-header bytes can create false unsupported results, and a single ZipArchive invocation does not establish complete inspection of multiple embedded archives. Unsupported embedded formats and truncated embedded archives are not comprehensively discovered. Do not claim complete polyglot coverage.
+
+Regression: targeted phase3a_corpus test passed (1 test), including its pre-existing normal PDF, ZIP and nested cases and the added two polyglots. The requested complete regression matrix remains incomplete. Existing decompression limits were not intentionally changed.
+
+Overhead and concurrency: no before/after timings were collected, no bottleneck established, and no optimisation implemented. Coordinator source shows bounded admission and supervised child processes. No 1/5/10/25 workload, CPU or memory benchmark was completed. No evidence-based Contabo worker recommendation can be made.
+
+Full suite: cargo test --workspace was started; it had not finished when this report was written. The ignored benchmark test was observed; exact counts and DNS failure investigation remain outstanding. Output: /tmp/raxo-tests.log. Formatting check passed. Clippy --workspace --all-targets -- -D warnings passed; output /tmp/raxo-clippy.log. Release build was started after Clippy, result pending in /tmp/raxo-release.log. Existing target artifacts must not be mistaken for a validated release.
+
+Compatibility: no CLI or socket protocol changes were made, but integration compatibility is not verified. This environment reports Debian glibc 2.41; a binary built here is not proven compatible with Ubuntu 24.04 glibc 2.39. Build and test in the target runtime or an appropriate older baseline.
+
+Commit SHA: none. New executable SHA-256: none. No database generation change was made. Before release, complete archive discovery design and tests, deterministically separate live updater tests, finish checks, profile using the verified phase2d6-unified database, benchmark on the stated VPS, build in an Ubuntu 24.04-compatible environment, validate integration, then commit and push the reviewed result.

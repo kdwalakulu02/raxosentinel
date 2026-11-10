@@ -1,0 +1,21 @@
+RaxoSentinel private repository artifact handover
+
+Repository: https://github.com/kdwalakulu02/raxosentinel
+Visibility: private, confirmed through authenticated GitHub API before push.
+Branch: phase-3b
+Final pushed commit: f75b2c4e55e81b8361374426da00359d3feb520e
+Executable source commit: 38a6a14da123687943a665e410f630c776e9b729
+
+Committed files:
+ deploy/binary/raxosentinel-38a6a14-linux-x86_64.tar.gz — 3,487,279 bytes; SHA-256 1133ee76f45f64bf4c056b5c37dc0f1b05f06e99e16e828c3152d174e538c42d
+ deploy/database/raxosentinel-private-phase2d6-unified.tar.gz — 35,799,906 bytes; SHA-256 63cf7c3aff822505c6f9a89013a7fcc9d53f5d3980bef46c0f54acda856e652d
+ deploy/SHA256SUMS
+ deploy/README.md
+
+A fresh authenticated clone of phase-3b fetched the final commit and both archives. Both SHA-256 checks passed. The archives were extracted in separate clean directories; the packaged executable successfully loaded the private database using db sources. The verified source indicator counts total 542,057. Generation: phase2d6-unified; target: x86_64-unknown-linux-gnu. Existing archives were used without rebuilding the database.
+
+The database contains third-party intelligence with unverified redistribution rights. Keep the repository private and confirm applicable terms before any further distribution. No credentials, private keys, or malware samples were intentionally included in this commit. No history was rewritten.
+
+No deployment to Contabo was performed. Scanner behavior, socket access, restart, and Raxo Email health on the VPS remain untested. The prior upstream-DNS-dependent updater test failure and test-count discrepancy remain unresolved; the full test suite is not claimed to pass. No unattended updates were enabled. Earlier local updater status reported no previous rollback generation.
+
+The existing private prerelease was created during the earlier task; this artifact commit did not create another release or repository. Existing untracked workspace files remain untouched. For extraction and verification, see deploy/README.md.
