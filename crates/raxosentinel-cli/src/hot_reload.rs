@@ -362,11 +362,12 @@ impl DatabaseManager {
         max_resident_generations: usize,
     ) -> Result<Self, String> {
         let max_resident_generations = max_resident_generations.max(1);
-        let generation = match initial_generation {
-            Some(g) => g,
-            None => private_store::resolve_generation(&root, "current")
-                .map_err(|e| format!("Cannot resolve active database generation: {e}"))?,
-        };
+        // Pin the concrete name so a literal "current" is not later seen as a generation change.
+        let generation = private_store::resolve_generation(
+            &root,
+            initial_generation.as_deref().unwrap_or("current"),
+        )
+        .map_err(|e| format!("Cannot resolve active database generation: {e}"))?;
 
         // Check for incomplete staging directories
         match private_store::incomplete(&root) {
@@ -503,6 +504,17 @@ impl DatabaseManager {
             .collect()
     }
 
+    /// Records `msg` as the last error; returns whether it differs from the previous one, so
+    /// the 100 ms monitor loop logs each distinct problem once instead of on every tick.
+    fn note_error(&self, msg: &str) -> bool {
+        let mut last = self.last_error.write().unwrap();
+        if last.as_deref() == Some(msg) {
+            return false;
+        }
+        *last = Some(msg.to_string());
+        true
+    }
+
     /// Check if active generation pointer changed; if so, verify and atomically hot reload.
     ///
     /// Ensures strictly bounded generations in memory simultaneously.
@@ -524,8 +536,9 @@ impl DatabaseManager {
             None => {
                 self.degraded.store(true, Ordering::SeqCst);
                 let err_msg = "Malformed or missing 'current' generation pointer".to_string();
-                *self.last_error.write().unwrap() = Some(err_msg.clone());
-                tracing::warn!("{}", err_msg);
+                if self.note_error(&err_msg) {
+                    tracing::warn!("{}", err_msg);
+                }
                 return Ok(false);
             }
         };
@@ -550,8 +563,9 @@ impl DatabaseManager {
                 "Candidate generation name '{}' starts with '.' and is rejected as incomplete staging",
                 target_gen
             );
-            *self.last_error.write().unwrap() = Some(err_msg.clone());
-            tracing::warn!("{}", err_msg);
+            if self.note_error(&err_msg) {
+                tracing::warn!("{}", err_msg);
+            }
             return Ok(false);
         }
 
@@ -563,8 +577,9 @@ impl DatabaseManager {
                     "Candidate generation '{}' is marked as incomplete staging",
                     target_gen
                 );
-                *self.last_error.write().unwrap() = Some(err_msg.clone());
-                tracing::warn!("{}", err_msg);
+                if self.note_error(&err_msg) {
+                    tracing::warn!("{}", err_msg);
+                }
                 return Ok(false);
             }
         }
@@ -653,8 +668,9 @@ impl DatabaseManager {
                 "Hot reload deferred for candidate generation '{}': memory generation budget reached ({}/{} resident). Update queued until in-flight scans retire.",
                 target_gen, resident_count, self.max_resident_generations
             );
-            *self.last_error.write().unwrap() = Some(err_msg.clone());
-            tracing::info!("{}", err_msg);
+            if self.note_error(&err_msg) {
+                tracing::info!("{}", err_msg);
+            }
             return Ok(false);
         }
 
@@ -677,8 +693,9 @@ impl DatabaseManager {
                     e,
                     current_active.generation()
                 );
-                *self.last_error.write().unwrap() = Some(err_msg.clone());
-                tracing::error!("{}", err_msg);
+                if self.note_error(&err_msg) {
+                    tracing::error!("{}", err_msg);
+                }
                 return Ok(false);
             }
         };

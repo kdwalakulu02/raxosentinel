@@ -189,7 +189,7 @@ pub fn sealed_snapshot_with_budget<B: SnapshotBudget>(
     Ok(snapshot)
 }
 
-fn terminate_group(child: &mut std::process::Child) {
+pub(crate) fn terminate_group(child: &mut std::process::Child) {
     // The child is started in a dedicated process group; kill before reaping the leader.
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
@@ -240,17 +240,22 @@ fn run_inner(args: &ScanArgs) -> Result<ScanReport, String> {
     execute_worker_on_snapshot(file, &args.target, &config)
 }
 
-pub fn execute_worker_on_snapshot(
-    snapshot: File,
+/// Builds the sandboxed worker command: own process group, `no_new_privs`, every inherited
+/// descriptor above stdio closed on exec, address space capped at `worker_memory`.
+pub(crate) fn worker_command(
     target_name: &Path,
     config: &SupervisedWorkerConfig,
-) -> Result<ScanReport, String> {
+    resident: bool,
+) -> Result<Command, String> {
     let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     command
         .arg("scan")
         .arg(target_name)
         .arg("--worker-internal")
         .arg("--json");
+    if resident {
+        command.arg("--worker-resident");
+    }
     if let Some(v) = config.max_size {
         command.arg("--max-size").arg(v.to_string());
     }
@@ -299,10 +304,6 @@ pub fn execute_worker_on_snapshot(
             command.env("RAXOSENTINEL_TEST_WORKER_ACTION", action);
         }
     }
-    command
-        .stdin(Stdio::from(snapshot))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
     let limit = config.worker_memory;
     // pre_exec runs in the child immediately before exec; setrlimit is async-signal-safe.
     unsafe {
@@ -332,6 +333,19 @@ pub fn execute_worker_on_snapshot(
             Ok(())
         });
     }
+    Ok(command)
+}
+
+pub fn execute_worker_on_snapshot(
+    snapshot: File,
+    target_name: &Path,
+    config: &SupervisedWorkerConfig,
+) -> Result<ScanReport, String> {
+    let mut command = worker_command(target_name, config, false)?;
+    command
+        .stdin(Stdio::from(snapshot))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let start = Instant::now();
     let mut child = command
         .spawn()

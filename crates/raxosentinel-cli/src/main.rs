@@ -251,6 +251,10 @@ struct ScanArgs {
     #[arg(long, hide = true)]
     worker_internal: bool,
 
+    /// Internal: keep the loaded database and scan snapshots passed over fd 0 until it closes.
+    #[arg(long, hide = true, requires = "worker_internal")]
+    worker_resident: bool,
+
     /// Target file path to scan
     #[arg(value_name = "FILE_PATH")]
     target: PathBuf,
@@ -316,7 +320,8 @@ struct ScanArgs {
 fn main() {
     let cli = Cli::parse();
 
-    let subscriber_builder = tracing_subscriber::fmt();
+    // Logs go to stderr: stdout carries reports and the coordinator READY handshake.
+    let subscriber_builder = tracing_subscriber::fmt().with_writer(std::io::stderr);
     if cli.verbose {
         subscriber_builder
             .with_max_level(tracing::Level::DEBUG)
@@ -555,10 +560,14 @@ fn run_scan(args: ScanArgs) -> i32 {
             eprintln!("Worker unexpectedly accessed original target");
             return 3;
         }
+        #[cfg(target_os = "linux")]
+        if args.worker_resident {
+            return resident::worker_loop(&db, &limits);
+        }
     }
     let mut tracker = ResourceTracker::new(limits);
     let report = if args.worker_internal {
-        scan_descriptor(&args.target, &db, &mut tracker)
+        scan_descriptor(&args.target, &db, &mut tracker, std::io::stdin().lock())
     } else {
         scan_path(&args.target, &db, &mut tracker)
     };
@@ -584,10 +593,12 @@ fn run_scan(args: ScanArgs) -> i32 {
     report.status.exit_code()
 }
 
-fn scan_descriptor(
+/// Scans a worker input descriptor (a sealed snapshot supplied by the supervisor).
+fn scan_descriptor<R: Read + std::os::fd::AsRawFd>(
     path: &Path,
     db: &SignatureDatabase,
     tracker: &mut ResourceTracker,
+    mut input: R,
 ) -> ScanReport {
     let fail = |message: String| {
         ScanReport::new(
@@ -609,8 +620,8 @@ fn scan_descriptor(
     #[cfg(target_os = "linux")]
     {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // fd 0 is supplied by the supervisor and must be a regular file.
-        if unsafe { libc::fstat(0, stat.as_mut_ptr()) } != 0 {
+        // The descriptor is supplied by the supervisor and must be a regular file.
+        if unsafe { libc::fstat(input.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
             return fail("Invalid worker input descriptor".into());
         }
         let stat = unsafe { stat.assume_init() };
@@ -618,7 +629,6 @@ fn scan_descriptor(
             return fail("Worker input descriptor is not a regular file".into());
         }
     }
-    let mut input = std::io::stdin().lock();
     let mut data = Vec::new();
     let mut chunk = [0u8; 65536];
     loop {
@@ -688,6 +698,9 @@ mod supervised {
 
 #[cfg(target_os = "linux")]
 pub mod hot_reload;
+
+#[cfg(target_os = "linux")]
+mod resident;
 
 #[cfg(target_os = "linux")]
 mod coordinator;

@@ -182,7 +182,13 @@ impl CoordinatorProcess {
             .read_line(&mut line)
             .expect("failed to read coordinator stdout");
         if n == 0 || !line.contains("RAXOSENTINEL_COORDINATOR_READY") {
-            panic!("coordinator failed to start, output: {line}");
+            let mut err = String::new();
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(mut e) = child.stderr.take() {
+                let _ = e.read_to_string(&mut err);
+            }
+            panic!("coordinator failed to start, output: {line} stderr: {err}");
         }
 
         Self {
@@ -3090,4 +3096,129 @@ fn test_phase2d8b_resource_exhaustion_and_fault_tolerance() {
         final_fds <= initial_fds + 2,
         "File descriptors must not leak across repeated scans (initial: {initial_fds}, final: {final_fds})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resident workers
+// ---------------------------------------------------------------------------
+fn resident_fixture(d: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let db_root = d.join("db_root");
+    publish_test_generation(
+        &db_root,
+        "gen-r-1",
+        &[(SYNTHETIC_SIGNATURE, SYNTHETIC_NAME)],
+    );
+    raxosentinel_signatures::rsidb::updater::write_pointer(&db_root, "current", "gen-r-1").unwrap();
+    let bad = d.join("bad.bin");
+    std::fs::write(&bad, SYNTHETIC_SIGNATURE).unwrap();
+    let good = d.join("good.txt");
+    std::fs::write(&good, b"ordinary document").unwrap();
+    (db_root, bad, good)
+}
+
+fn wait_for_children(pid: u32, want: usize) -> Vec<u32> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let kids = get_child_pids(pid);
+        if kids.len() >= want || Instant::now() > deadline {
+            return kids;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn test_resident_workers_are_reused_then_recycled_after_max_scans() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, bad, good) = resident_fixture(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+    let coord = CoordinatorProcess::spawn_root(
+        &socket,
+        &db_root,
+        &[
+            "--max-workers=1",
+            "--worker-max-scans=3",
+            "--private-generation=current",
+        ],
+    );
+
+    let first = wait_for_children(coord.child.id(), 1);
+    assert_eq!(
+        first.len(),
+        1,
+        "one resident worker is preloaded before READY"
+    );
+
+    for i in 0..2 {
+        let (target, want) = if i % 2 == 0 {
+            (&bad, "DETECTED")
+        } else {
+            (&good, "CLEAN")
+        };
+        let resp = scan_via_socket(&socket, target, None);
+        assert_eq!(resp["status"].as_str().unwrap(), want);
+        assert_eq!(resp["database_generation"].as_str().unwrap(), "gen-r-1");
+    }
+    assert_eq!(
+        get_child_pids(coord.child.id()),
+        first,
+        "worker is reused between scans"
+    );
+
+    for i in 0..7 {
+        let (target, want) = if i % 2 == 0 {
+            (&bad, "DETECTED")
+        } else {
+            (&good, "CLEAN")
+        };
+        let resp = scan_via_socket(&socket, target, None);
+        assert_eq!(resp["status"].as_str().unwrap(), want, "scan {i}: {resp}");
+    }
+    let later = wait_for_children(coord.child.id(), 1);
+    assert_eq!(later.len(), 1, "exactly one worker after recycling");
+    assert_ne!(later, first, "worker is replaced after --worker-max-scans");
+}
+
+#[test]
+fn test_resident_worker_killed_while_idle_is_replaced_without_failed_request() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, bad, good) = resident_fixture(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+    let coord = CoordinatorProcess::spawn_root(&socket, &db_root, &["--max-workers=1"]);
+
+    let resp = scan_via_socket(&socket, &good, None);
+    assert_eq!(resp["status"].as_str().unwrap(), "CLEAN");
+
+    let victims = wait_for_children(coord.child.id(), 1);
+    assert_eq!(victims.len(), 1);
+    unsafe {
+        libc::kill(victims[0] as i32, libc::SIGKILL);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    let resp = scan_via_socket(&socket, &bad, None);
+    assert_eq!(resp["status"].as_str().unwrap(), "DETECTED", "{resp}");
+    assert_eq!(
+        resp["report"]["threats"][0]["name"].as_str().unwrap(),
+        format!("MalwareBazaar.{SYNTHETIC_NAME}")
+    );
+    let resp = scan_via_socket(&socket, &good, None);
+    assert_eq!(resp["status"].as_str().unwrap(), "CLEAN");
+}
+
+#[test]
+fn test_oneshot_worker_mode_keeps_no_resident_process() {
+    let d = tempfile::tempdir().unwrap();
+    let (db_root, bad, _good) = resident_fixture(d.path());
+    let socket = d.path().join("sock_dir/coordinator.sock");
+    let coord = CoordinatorProcess::spawn_root(
+        &socket,
+        &db_root,
+        &["--max-workers=1", "--worker-mode=oneshot"],
+    );
+
+    let resp = scan_via_socket(&socket, &bad, None);
+    assert_eq!(resp["status"].as_str().unwrap(), "DETECTED");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(get_child_pids(coord.child.id()).is_empty());
 }

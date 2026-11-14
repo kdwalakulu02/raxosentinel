@@ -18,6 +18,7 @@
 
 use super::hot_reload::DatabaseManager;
 use super::print_human_report;
+use super::resident::ResidentSlot;
 use super::supervised::{
     error_report, execute_worker_on_snapshot, sealed_snapshot_with_budget, SnapshotBudget,
     SupervisedWorkerConfig,
@@ -86,6 +87,19 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 10_000u64)]
     pub worker_timeout_ms: u64,
 
+    /// `resident`: each scan thread keeps a sandboxed worker with the database loaded and reuses it;
+    /// `oneshot`: start a fresh worker (and reload the database) for every scan.
+    #[arg(long, value_enum, default_value_t = WorkerMode::Resident)]
+    pub worker_mode: WorkerMode,
+
+    /// Scans served by one resident worker before it is replaced.
+    #[arg(long, default_value_t = 500)]
+    pub worker_max_scans: u32,
+
+    /// Time allowed for a resident worker to load the database, in milliseconds.
+    #[arg(long, default_value_t = 120_000u64)]
+    pub worker_load_timeout_ms: u64,
+
     /// Maximum file size limit in bytes (default: 50 MiB).
     #[arg(long, default_value_t = 52_428_800u64)]
     pub max_size: u64,
@@ -132,6 +146,12 @@ pub struct ServeArgs {
 
     #[arg(long, hide = true)]
     pub db_store: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerMode {
+    Resident,
+    Oneshot,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -869,12 +889,46 @@ fn send_unauthorized_response(mut stream: UnixStream, reason: &str) {
     }
 }
 
+/// Lets `serve` wait until every scan thread finished its first warm-up. A ticket counts
+/// as done when dropped, including during a panic, so startup can never wait forever.
+struct WarmGate(Arc<(Mutex<usize>, Condvar)>);
+
+struct WarmTicket(Arc<(Mutex<usize>, Condvar)>);
+
+impl WarmGate {
+    fn new(count: usize) -> Self {
+        Self(Arc::new((Mutex::new(count), Condvar::new())))
+    }
+
+    fn ticket(&self) -> WarmTicket {
+        WarmTicket(Arc::clone(&self.0))
+    }
+
+    fn wait(&self) {
+        let (lock, cvar) = &*self.0;
+        let mut left = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *left > 0 {
+            left = cvar.wait(left).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Drop for WarmTicket {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.0;
+        let mut left = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *left = left.saturating_sub(1);
+        cvar.notify_all();
+    }
+}
+
 fn handle_client_connection(
     mut stream: UnixStream,
     worker_config: &SupervisedWorkerConfig,
     client_timeout_secs: u64,
     shared_state: &Arc<(Mutex<CoordinatorState>, Condvar)>,
     db_manager: Option<&Arc<DatabaseManager>>,
+    resident: Option<&mut ResidentSlot>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(client_timeout_secs);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -1044,7 +1098,13 @@ fn handle_client_connection(
             Some(effective_config.max_depth.map(|s| s.min(d)).unwrap_or(d));
     }
 
-    let scan_result = execute_worker_on_snapshot(snapshot, &target_name, &effective_config);
+    // Debug-only test actions are implemented by one-shot workers.
+    let scan_result = match resident {
+        Some(slot) if effective_config.test_worker_action.is_none() => {
+            slot.scan(snapshot, &target_name, &effective_config)
+        }
+        _ => execute_worker_on_snapshot(snapshot, &target_name, &effective_config),
+    };
 
     let response = match scan_result {
         Ok(report) => {
@@ -1147,19 +1207,50 @@ pub fn serve(args: ServeArgs) -> i32 {
         None
     };
 
+    let resident = args.worker_mode == WorkerMode::Resident;
+    let warmed = WarmGate::new(args.max_workers);
     let mut worker_handles = Vec::with_capacity(args.max_workers);
     for _ in 0..args.max_workers {
         let state_clone = Arc::clone(&shared_state);
         let worker_cfg = worker_config.clone();
         let client_timeout = args.client_timeout_secs;
         let db_mgr_clone = db_manager.clone();
+        let warm_ticket = warmed.ticket();
+        let mut slot = resident.then(|| {
+            ResidentSlot::new(
+                args.worker_max_scans,
+                Duration::from_millis(args.worker_load_timeout_ms),
+            )
+        });
         let handle = thread::spawn(move || {
+            // Resident workers follow the active generation; requests pin their own.
+            let active_config = || {
+                let mut cfg = worker_cfg.clone();
+                if let Some(dm) = db_mgr_clone.as_ref() {
+                    cfg.private_generation = Some(dm.pin_active().generation().to_string());
+                }
+                cfg
+            };
+            if let Some(slot) = slot.as_mut() {
+                slot.warm(&active_config());
+            }
+            drop(warm_ticket);
             let (lock, cvar) = &*state_clone;
             loop {
                 let stream = {
                     let mut guard = lock.lock().unwrap();
                     while guard.pending_queue.is_empty() && !guard.shutdown {
-                        guard = cvar.wait(guard).unwrap();
+                        let (g, timeout) =
+                            cvar.wait_timeout(guard, Duration::from_secs(2)).unwrap();
+                        guard = g;
+                        if timeout.timed_out() && guard.pending_queue.is_empty() && !guard.shutdown
+                        {
+                            if let Some(slot) = slot.as_mut() {
+                                drop(guard);
+                                slot.warm(&active_config());
+                                guard = lock.lock().unwrap();
+                            }
+                        }
                     }
                     if guard.pending_queue.is_empty() && guard.shutdown {
                         break;
@@ -1175,6 +1266,7 @@ pub fn serve(args: ServeArgs) -> i32 {
                     client_timeout,
                     &state_clone,
                     db_mgr_clone.as_ref(),
+                    slot.as_mut(),
                 );
 
                 {
@@ -1182,10 +1274,15 @@ pub fn serve(args: ServeArgs) -> i32 {
                     guard.active_workers -= 1;
                     cvar.notify_all();
                 }
+                if let Some(slot) = slot.as_mut() {
+                    slot.warm(&active_config());
+                }
             }
         });
         worker_handles.push(handle);
     }
+
+    warmed.wait();
 
     tracing::info!(
         "Coordinator serving on '{}' (authorized UID: {}, max workers: {}, max pending: {}, snapshot limit: {} bytes)",
@@ -1195,8 +1292,11 @@ pub fn serve(args: ServeArgs) -> i32 {
         args.max_pending,
         args.max_total_snapshot_bytes
     );
-    println!("RAXOSENTINEL_COORDINATOR_READY");
-    let _ = std::io::stdout().flush();
+    {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "RAXOSENTINEL_COORDINATOR_READY");
+        let _ = out.flush();
+    }
 
     let socket_path = args.socket.clone();
 
