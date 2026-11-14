@@ -268,6 +268,8 @@ impl UpdateEngine {
         // 1. Check all providers
         let mut updates_to_run: Vec<(&Box<dyn IntelligenceProvider>, UpdateCheckResult)> =
             Vec::new();
+        // A failing provider must not block the others; its claims are retained.
+        let mut first_error: Option<UpdateError> = None;
         for provider in &self.providers {
             let p_state = status
                 .sources
@@ -281,7 +283,7 @@ impl UpdateEngine {
                 })
                 .unwrap_or_default();
 
-            let chk = provider.check_update(&p_state)?;
+            let chk_result = provider.check_update(&p_state);
             let src_entry = status
                 .sources
                 .entry(provider.id().to_string())
@@ -291,6 +293,14 @@ impl UpdateEngine {
                     ..Default::default()
                 });
             src_entry.last_check_timestamp = now;
+            let chk = match chk_result {
+                Ok(chk) => chk,
+                Err(e) => {
+                    src_entry.last_error = Some(e.to_string());
+                    first_error.get_or_insert(e);
+                    continue;
+                }
+            };
             src_entry.latest_upstream_version = chk.version.clone();
             src_entry.last_error = None;
 
@@ -301,7 +311,10 @@ impl UpdateEngine {
 
         if updates_to_run.is_empty() {
             let _ = status.save(&self.root);
-            return Ok(None);
+            return match first_error {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
         }
 
         // 2. Create isolated staging workspace
@@ -576,6 +589,12 @@ impl UpdateEngine {
         }
         write_pointer(&self.root, CURRENT_PTR, &gen_name)?;
 
+        let mut keep = vec![gen_name.as_str()];
+        if let Some(ref old) = active_gen {
+            keep.push(old.as_str());
+        }
+        prune_generations(&self.root, &keep);
+
         // Update provider statuses
         for (provider, chk) in &updates_to_run {
             if let Some(ext) = extracted_by_source.get(provider.id()) {
@@ -749,5 +768,26 @@ impl UpdateEngine {
         })?;
 
         Ok(prev_gen)
+    }
+}
+
+/// Remove superseded generation directories so only `keep` (current and previous) remain.
+fn prune_generations(root: &Path, keep: &[&str]) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') || keep.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let is_generation = entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && path.join("database.rsidb").is_file()
+            && path.join("registry.json").is_file();
+        if is_generation {
+            let _ = fs::remove_dir_all(&path);
+        }
     }
 }

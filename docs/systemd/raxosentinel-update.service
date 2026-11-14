@@ -17,7 +17,10 @@ EnvironmentFile=-/etc/default/raxosentinel-update
 ExecStart=/usr/local/bin/raxosentinel db update --apply --root /home/vscode/raxosentinel-private-phase2d1
 
 # Execution boundaries & timeouts
-TimeoutStartSec=600
+TimeoutStartSec=1800
+MemoryMax=3G
+Nice=10
+IOSchedulingClass=idle
 
 # Security Hardening
 NoNewPrivileges=true

@@ -62,6 +62,8 @@ The automated update engine (`UpdateEngine`) executes a 9-stage linear verificat
 - **Advisory Locking**: The update engine acquires an exclusive, non-blocking lock on `updater.lock` (`libc::flock(LOCK_EX | LOCK_NB)`). Concurrent invocations exit immediately with code 75 (`EX_TEMPFAIL` / lock contention) rather than corrupting staging state.
 - **Fail-Closed Operation**: Network timeouts, truncated downloads, or verification failures terminate the update process prior to activation. The running scanner and active database remain completely untouched.
 - **Instant Rollback**: If a newly published generation exhibits unexpected runtime issues, running `raxosentinel db rollback` atomically swings the `current` pointer back to `previous`.
+- **Provider Isolation**: A provider whose check fails (outage, HTTP 429, missing credentials) is skipped and its error recorded in `update_status.json`; its existing records are retained and the other providers still update. The run only fails if no provider could be checked.
+- **Generation Pruning**: After activation only `current` and `previous` generation directories are kept; older ones are deleted.
 
 ---
 
@@ -106,6 +108,18 @@ raxosentinel db rollback --root /home/USER/raxosentinel-private
 ## 5. Unattended Scheduling (systemd)
 
 For production Linux environments, systemd service and timer units are provided in `docs/systemd/`.
+
+### Prerequisites
+
+- **ClamAV tools**: `freshclam` downloads the CVDs and `sigtool` verifies their signatures and unpacks them (`apt install clamav clamav-freshclam`). Disable the distribution's own updater so downloads are not duplicated: `systemctl mask --now clamav-freshclam.service`.
+- **Full CVDs**: The provider writes a `freshclam.conf` with `ScriptedUpdates no` so `daily.cvd`/`main.cvd` stay complete signed archives (incremental cdiffs would produce unsigned `.cld` files). freshclam exit code 1 ("already up to date") is treated as success.
+- **AppArmor**: Ubuntu confines `/usr/bin/freshclam`. Allow the CVD directory in `/etc/apparmor.d/local/usr.bin.freshclam`, then `apparmor_parser -r /etc/apparmor.d/usr.bin.freshclam`:
+  ```
+  /path/to/clamav-cvd/ r,
+  /path/to/clamav-cvd/** rwk,
+  ```
+- **MalwareBazaar** (optional): abuse.ch requires a free Auth-Key (https://auth.abuse.ch/). Set `RAXO_ABUSECH_AUTH_KEY` in the service environment; without it the provider is skipped and existing MalwareBazaar records are kept.
+- **Memory**: building a generation from the full ClamAV set peaks around 2.2 GB RSS; the unit should cap it (`MemoryMax=3G`) and run at low CPU/IO priority.
 
 ### Installation
 

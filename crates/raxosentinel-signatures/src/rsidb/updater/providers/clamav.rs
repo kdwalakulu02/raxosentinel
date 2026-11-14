@@ -315,8 +315,8 @@ pub fn run_freshclam(cvd_dir: &Path) -> Result<FreshclamReport, UpdateError> {
          DatabaseMirror database.clamav.net\n\
          ConnectTimeout 30\n\
          DNSDatabaseInfo current.cvd.clamav.net\n\
-         NotifyClamd false\n\
-         Bytecode false\n",
+         Bytecode false\n\
+         ScriptedUpdates no\n",
         cvd_dir.display(),
         cvd_dir.display()
     );
@@ -338,7 +338,8 @@ pub fn run_freshclam(cvd_dir: &Path) -> Result<FreshclamReport, UpdateError> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    if !output.status.success() {
+    // freshclam exits 1 when the databases are already up to date.
+    if !matches!(output.status.code(), Some(0) | Some(1)) {
         return Err(UpdateError::AcquisitionFailed {
             provider: "clamav".to_string(),
             message: format!(

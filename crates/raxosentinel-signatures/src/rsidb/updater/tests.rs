@@ -1746,3 +1746,63 @@ fn test_21_crash_and_interruption_safety_at_transaction_boundaries() {
         "Active database must always be 100% valid and verified"
     );
 }
+
+// ============================================================================
+// SCENARIO 22: One failing provider does not block others; old generations pruned
+// ============================================================================
+#[test]
+fn test_22_failing_provider_isolated_and_generations_pruned() {
+    let temp = setup_private_root();
+    let root = temp.path();
+
+    let kept = SignatureEntry::new(
+        HashAlgorithm::Sha256,
+        100,
+        vec![0x11; 32],
+        "Threat.Kept".to_string(),
+    );
+    create_initial_generation(root, "gen-initial", vec![kept], "src_a");
+
+    let failing = || {
+        let mut p = MockProvider::new("src_a");
+        p.check_result = Err("HTTP 429 Too Many Requests".to_string());
+        p
+    };
+
+    // Only a failing provider: the run reports the error and changes nothing.
+    let engine = UpdateEngine::new(root).with_provider(Box::new(failing()));
+    assert!(engine.apply_update(false).is_err());
+    assert_eq!(read_pointer(root, CURRENT_PTR).unwrap(), "gen-initial");
+
+    let mut generations = Vec::new();
+    for i in 0..3u8 {
+        let fresh = SignatureEntry::new(
+            HashAlgorithm::Sha256,
+            200 + i as u64,
+            vec![0x20 + i; 32],
+            format!("Threat.New{i}"),
+        );
+        let engine = UpdateEngine::new(root)
+            .with_provider(Box::new(failing()))
+            .with_provider(Box::new(
+                MockProvider::new("src_b").with_entries(vec![fresh]),
+            ));
+        let summary = engine
+            .apply_update(true)
+            .unwrap()
+            .expect("src_b must update");
+        assert_eq!(summary.total_indicators, 2);
+        generations.push(read_pointer(root, CURRENT_PTR).unwrap());
+    }
+
+    let status = UpdateStatus::load(root);
+    assert!(status.sources["src_a"].last_error.is_some());
+    let (db, _) = private_store::load_timed(root, "current").unwrap();
+    assert_eq!(db.total_records(), 2);
+
+    assert!(!root.join("gen-initial").exists());
+    assert!(!root.join(&generations[0]).exists());
+    assert!(root.join(&generations[1]).exists());
+    assert!(root.join(&generations[2]).exists());
+    assert_eq!(read_pointer(root, PREVIOUS_PTR).unwrap(), generations[1]);
+}

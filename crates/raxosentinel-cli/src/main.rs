@@ -1325,12 +1325,23 @@ fn run_db(cmd: DbCommand) -> i32 {
                 .with_provider(Box::new(clam_provider));
 
             let mb_fixture = root_path.join("phase2d4-refreshed-final/acq-7009a4d2894c668fe056658b41674308fdeec5a21f315897717eaf1bb4d9175e.json");
-            let mb_provider = if mb_fixture.exists() {
-                raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::with_fixture(mb_fixture)
-            } else {
-                raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::new()
-            };
-            engine = engine.with_provider(Box::new(mb_provider));
+            let mb_key_set = std::env::var("RAXO_ABUSECH_AUTH_KEY")
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false);
+            if mb_fixture.exists() {
+                engine = engine.with_provider(Box::new(
+                    raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::with_fixture(mb_fixture),
+                ));
+            } else if mb_key_set {
+                engine = engine.with_provider(Box::new(
+                    raxosentinel_signatures::rsidb::updater::MalwareBazaarProvider::new(),
+                ));
+            } else if check || apply {
+                // Existing MalwareBazaar records are retained by the engine.
+                eprintln!(
+                    "note: RAXO_ABUSECH_AUTH_KEY is not set; skipping MalwareBazaar (existing records kept)"
+                );
+            }
 
             if status || (!check && !apply) {
                 let st = raxosentinel_signatures::rsidb::updater::UpdateStatus::load(&root_path);
