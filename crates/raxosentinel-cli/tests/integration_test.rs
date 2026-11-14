@@ -455,8 +455,8 @@ fn test_e2e_scenario_9_enforce_zip_limits() {
     let db = SignatureDatabase::new();
     let scanner = EmailScanner::new(&db);
 
-    // 1. Enforce max entries limit (35 entries > default 30)
-    let entries: Vec<(String, Vec<u8>)> = (0..35)
+    // 1. Entries beyond the member budget are not inspected; the result is partial.
+    let entries: Vec<(String, Vec<u8>)> = (0..2005)
         .map(|i| (format!("file_{}.txt", i), b"content".to_vec()))
         .collect();
     let entry_refs: Vec<(&str, &[u8])> = entries
@@ -469,8 +469,12 @@ fn test_e2e_scenario_9_enforce_zip_limits() {
     let report = scanner
         .scan_object(&zip_many, "bomb.zip", None, &mut tracker, 0)
         .expect("scan entry count bomb");
-    assert_eq!(report.status, ScanStatus::Failed);
-    assert!(report.error.as_deref().unwrap_or("").contains("limit 30"));
+    assert_eq!(report.status, ScanStatus::Clean);
+    assert_eq!(report.sub_targets.len(), 2000);
+    assert_eq!(
+        report.incomplete,
+        vec!["Only the first 2000 archive members were inspected".to_string()]
+    );
 
     // 2. Enforce attachment size limit on single extracted member
     let tight_limits = ResourceLimits {
@@ -483,7 +487,8 @@ fn test_e2e_scenario_9_enforce_zip_limits() {
     let report_large = scanner
         .scan_object(&zip_large, "large.zip", None, &mut tight_tracker, 0)
         .expect("scan oversized member");
-    assert_eq!(report_large.status, ScanStatus::Failed);
+    assert_eq!(report_large.status, ScanStatus::Clean);
+    assert!(report_large.incomplete[0].contains("larger than"));
 }
 
 #[test]
@@ -815,14 +820,14 @@ fn test_e2e_scenario_14_missing_or_incorrect_signing_key() {
 }
 
 #[test]
-fn test_e2e_scenario_15_tar_archive_produces_unsupported_verdict() {
+fn test_e2e_scenario_15_tar_archive_is_extracted() {
     let tar_bytes =
         make_test_tar_archive("embedded_payload.bin", b"Malware payload bytes inside tar");
     let db = SignatureDatabase::new();
     let scanner = EmailScanner::new(&db);
     let mut tracker = ResourceTracker::new(ResourceLimits::default());
 
-    // 1. Direct TAR scan returns Unsupported
+    // 1. Direct TAR scan extracts and inspects the member
     let report = scanner
         .scan_object(
             &tar_bytes,
@@ -832,12 +837,8 @@ fn test_e2e_scenario_15_tar_archive_produces_unsupported_verdict() {
             0,
         )
         .expect("scan tar");
-    assert_eq!(report.status, ScanStatus::Unsupported);
-    assert!(report
-        .error
-        .as_ref()
-        .unwrap()
-        .contains("TAR container cannot be extracted"));
+    assert_eq!(report.status, ScanStatus::Clean);
+    assert_eq!(report.sub_targets.len(), 1);
 
     // 2. Truncated TAR scan returns Unsupported
     let trunc_tar = &tar_bytes[..200];

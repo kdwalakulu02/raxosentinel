@@ -31,14 +31,34 @@ pub struct ResourceLimits {
     pub max_scan_duration_ms: u64,
     /// Maximum MIME / nested message recursion depth. Default: 5.
     pub max_email_depth: usize,
-    /// Maximum number of attachments permitted per message. Default: 30.
+    /// Maximum number of MIME attachments/parts expanded per scan. Default: 100.
+    /// Only MIME parts spend this budget; other object kinds have their own.
     pub max_email_attachments: usize,
-    /// Maximum size of a single extracted attachment (bytes). Default: 25 MiB.
+    /// Maximum size of a single extracted object (bytes). Default: 50 MiB.
     pub max_email_attachment_size: u64,
-    /// Maximum cumulative extracted data across all parts/attachments (bytes). Default: 100 MiB.
+    /// Maximum cumulative extracted data across all parts/attachments (bytes). Default: 200 MiB.
     pub max_total_extracted_bytes: u64,
     /// Buffer size used for chunked streaming I/O (bytes). Default: 64 KiB.
     pub buffer_size: usize,
+    /// Maximum archive members (ZIP, OOXML, ...) expanded per scan. Default: 2,000.
+    #[serde(default = "default_archive_entries")]
+    pub max_archive_entries: usize,
+    /// Maximum PDF streams decoded per scan. Default: 10,000.
+    #[serde(default = "default_pdf_streams")]
+    pub max_pdf_streams: usize,
+    /// Maximum GZIP members expanded per scan. Default: 64.
+    #[serde(default = "default_gzip_members")]
+    pub max_gzip_members: usize,
+}
+
+fn default_archive_entries() -> usize {
+    2_000
+}
+fn default_pdf_streams() -> usize {
+    10_000
+}
+fn default_gzip_members() -> usize {
+    64
 }
 
 impl Default for ResourceLimits {
@@ -47,10 +67,32 @@ impl Default for ResourceLimits {
             max_file_size: 50 * 1024 * 1024,              // 50 MiB
             max_scan_duration_ms: 10_000,                 // 10 seconds
             max_email_depth: 5,                           // 5 nested MIME levels
-            max_email_attachments: 30,                    // 30 attachments
-            max_email_attachment_size: 25 * 1024 * 1024,  // 25 MiB
-            max_total_extracted_bytes: 100 * 1024 * 1024, // 100 MiB
+            max_email_attachments: 100,                   // 100 MIME parts
+            max_email_attachment_size: 50 * 1024 * 1024,  // 50 MiB
+            max_total_extracted_bytes: 200 * 1024 * 1024, // 200 MiB
             buffer_size: 64 * 1024,                       // 64 KiB
+            max_archive_entries: default_archive_entries(),
+            max_pdf_streams: default_pdf_streams(),
+            max_gzip_members: default_gzip_members(),
+        }
+    }
+}
+
+/// Kinds of extracted objects; each kind has an independent count budget so that,
+/// e.g., a many-page PDF never consumes the MIME attachment budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    ArchiveEntry,
+    PdfStream,
+    GzipMember,
+}
+
+impl ObjectKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ObjectKind::ArchiveEntry => "archive member",
+            ObjectKind::PdfStream => "PDF stream",
+            ObjectKind::GzipMember => "GZIP member",
         }
     }
 }
@@ -62,6 +104,7 @@ pub struct ResourceTracker {
     total_bytes_read: u64,
     total_extracted_bytes: u64,
     attachment_count: usize,
+    object_counts: [usize; 3],
 }
 
 impl ResourceTracker {
@@ -72,7 +115,42 @@ impl ResourceTracker {
             total_bytes_read: 0,
             total_extracted_bytes: 0,
             attachment_count: 0,
+            object_counts: [0; 3],
         }
+    }
+
+    /// Spends one unit of the per-kind object budget.
+    pub fn register_object(&mut self, kind: ObjectKind) -> Result<(), ScanError> {
+        self.check_timeout()?;
+        let limit = match kind {
+            ObjectKind::ArchiveEntry => self.limits.max_archive_entries,
+            ObjectKind::PdfStream => self.limits.max_pdf_streams,
+            ObjectKind::GzipMember => self.limits.max_gzip_members,
+        };
+        let count = &mut self.object_counts[kind as usize];
+        if *count >= limit {
+            return Err(ScanError::ObjectLimitExceeded {
+                kind: kind.label(),
+                limit,
+            });
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// Extraction should stop (yielding a partial result) once 70% of the scan
+    /// budget is spent, leaving time to finish and report what was inspected.
+    pub fn soft_deadline_reached(&self) -> bool {
+        self.start_time.elapsed().as_millis() as u64 >= self.limits.max_scan_duration_ms * 7 / 10
+    }
+
+    /// Bytes still available to a single extracted object.
+    pub fn object_extraction_cap(&self) -> u64 {
+        self.limits.max_email_attachment_size.min(
+            self.limits
+                .max_total_extracted_bytes
+                .saturating_sub(self.total_extracted_bytes),
+        )
     }
 
     pub fn limits(&self) -> &ResourceLimits {

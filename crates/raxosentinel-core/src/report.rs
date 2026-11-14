@@ -52,7 +52,14 @@ pub struct ScanReport {
     pub scan_duration_ms: u64,
     /// Error description if status == Failed
     pub error: Option<String>,
+    /// Reasons inspection was partial although nothing malicious was found in the
+    /// inspected content (budgets, unsupported encodings). Aggregated from children.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<String>,
 }
+
+/// Upper bound on distinct incomplete-inspection reasons carried per report.
+pub const MAX_INCOMPLETE_REASONS: usize = 16;
 
 impl ScanReport {
     pub fn new(
@@ -113,7 +120,28 @@ impl ScanReport {
             sub_targets,
             scan_duration_ms,
             error,
+            incomplete: Vec::new(),
         }
+    }
+
+    /// Records own partial-inspection reasons plus those of all direct children
+    /// (children already carry their descendants'), deduplicated and bounded.
+    pub fn with_incomplete(mut self, own: Vec<String>) -> Self {
+        let mut all: Vec<String> = Vec::new();
+        let child_reasons = self
+            .sub_targets
+            .iter()
+            .flat_map(|c| c.incomplete.iter().cloned());
+        for r in own.into_iter().chain(child_reasons) {
+            if all.len() >= MAX_INCOMPLETE_REASONS {
+                break;
+            }
+            if !all.contains(&r) {
+                all.push(r);
+            }
+        }
+        self.incomplete = all;
+        self
     }
 
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {

@@ -26,7 +26,7 @@ pub mod threat;
 
 pub use error::ScanError;
 pub use hash::{hash_bytes, hash_file_bounded, hash_reader_bounded, HashResult};
-pub use limits::{ResourceLimits, ResourceTracker};
+pub use limits::{ObjectKind, ResourceLimits, ResourceTracker};
 pub use memory::MemoryUsage;
 pub use report::{ScanReport, TargetMetadata};
 pub use status::ScanStatus;

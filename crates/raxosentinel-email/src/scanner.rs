@@ -17,8 +17,10 @@
  */
 
 use mail_parser::{Message, MessageParser, MessagePart};
+use raxosentinel_core::report::MAX_INCOMPLETE_REASONS;
 use raxosentinel_core::{
-    hash_bytes, ResourceTracker, ScanError, ScanReport, ScanStatus, TargetMetadata, Threat,
+    hash_bytes, ObjectKind, ResourceTracker, ScanError, ScanReport, ScanStatus, TargetMetadata,
+    Threat,
 };
 use raxosentinel_filetypes::{check_extension_mismatch, detect_type, is_tar_header};
 use raxosentinel_signatures::SignatureDatabase;
@@ -163,7 +165,7 @@ impl<'a> EmailScanner<'a> {
             };
 
         let mut threats: Vec<Threat> = Vec::new();
-        let mut sub_reports: Vec<ScanReport> = Vec::new();
+        let mut ex = Extraction::default();
 
         // 1. Check raw email hash (builtin rules and RSIDB)
         if let Some(hash_threat) = self.db.match_hash(&sha256) {
@@ -177,14 +179,8 @@ impl<'a> EmailScanner<'a> {
         self.scan_bodies(&parsed, &mut threats, tracker)?;
 
         // 3. Scan attachments and embedded parts (including inline payloads)
-        self.scan_attachments(
-            raw_bytes,
-            &parsed,
-            &mut threats,
-            &mut sub_reports,
-            tracker,
-            depth,
-        )?;
+        self.scan_attachments(raw_bytes, &parsed, &mut threats, &mut ex, tracker, depth)?;
+        let sub_reports = ex.reports;
 
         // Consolidate duplicate threats across bodies or attachments
         let threats = SignatureDatabase::deduplicate_threats(threats);
@@ -244,7 +240,8 @@ impl<'a> EmailScanner<'a> {
             sub_reports,
             duration_ms,
             overall_details,
-        ))
+        )
+        .with_incomplete(ex.partial))
     }
 
     fn scan_bodies(
@@ -298,142 +295,53 @@ impl<'a> EmailScanner<'a> {
         raw_bytes: &[u8],
         msg: &Message,
         threats: &mut Vec<Threat>,
-        sub_reports: &mut Vec<ScanReport>,
+        ex: &mut Extraction,
         tracker: &mut ResourceTracker,
         depth: usize,
     ) -> Result<(), ScanError> {
-        // 1. Scan explicit attachments
-        for (idx, attachment) in msg.attachments().enumerate() {
+        // Explicit attachments first, then inline/unclassified non-body parts.
+        let parts: Vec<(MessagePart, String)> = msg
+            .attachments()
+            .enumerate()
+            .map(|(i, p)| (p, format!("attachment_{i}")))
+            .chain(
+                msg.other_parts()
+                    .enumerate()
+                    .filter(|(_, p)| !p.in_text_body() && !p.in_html_body())
+                    .map(|(i, p)| (p, format!("inline_part_{i}"))),
+            )
+            .collect();
+
+        for (part, fallback_name) in parts {
             tracker.check_timeout()?;
-
-            let filename = attachment
-                .attachment_name()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("attachment_{}", idx));
-
-            let declared_mime = attachment
-                .content_type()
-                .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("*")));
-
-            // Pre-check estimated decoded length to prevent Base64 / QP memory expansion bomb!
-            let estimated_size = attachment.decoded_len() as u64;
-            if let Err(e) = tracker.register_attachment(estimated_size) {
-                match e {
-                    ScanError::AttachmentLimitExceeded { .. }
-                    | ScanError::ExtractedSizeLimitExceeded { .. }
-                    | ScanError::Timeout { .. } => return Err(e),
-                    _ => {
-                        let sub_report = ScanReport::new(
-                            TargetMetadata {
-                                path: None,
-                                file_name: Some(filename),
-                                file_size_bytes: estimated_size,
-                                sha256: String::new(),
-                                detected_mime: "application/octet-stream".to_string(),
-                                declared_mime,
-                            },
-                            ScanStatus::Failed,
-                            Vec::new(),
-                            Vec::new(),
-                            0,
-                            Some(format!("Attachment quota error: {}", e)),
-                        );
-                        sub_reports.push(sub_report);
-                        continue;
-                    }
-                }
-            }
-
-            let decoded_data = attachment.decoded();
-
-            let sub_report_res = self.scan_single_attachment(
-                &filename,
-                declared_mime.as_deref(),
-                &attachment,
-                raw_bytes,
-                &decoded_data,
-                tracker,
-                depth,
-            );
-
-            match sub_report_res {
-                Ok(sub_report) => {
-                    for t in &sub_report.threats {
-                        threats.push(t.clone());
-                    }
-                    sub_reports.push(sub_report);
-                }
-                Err(e) => match e {
-                    ScanError::Timeout { .. } => return Err(e),
-                    _ => {
-                        let sub_report = ScanReport::new(
-                            TargetMetadata {
-                                path: None,
-                                file_name: Some(filename),
-                                file_size_bytes: decoded_data.len() as u64,
-                                sha256: hash_bytes(&decoded_data),
-                                detected_mime: detect_type(&decoded_data).mime_type,
-                                declared_mime,
-                            },
-                            ScanStatus::Failed,
-                            Vec::new(),
-                            Vec::new(),
-                            0,
-                            Some(format!("Attachment scan failed: {}", e)),
-                        );
-                        sub_reports.push(sub_report);
-                    }
-                },
-            }
-        }
-
-        // 2. Scan other parts (e.g. inline attachments, unclassified non-body parts)
-        for (idx, part) in msg.other_parts().enumerate() {
-            tracker.check_timeout()?;
-            if part.in_text_body() || part.in_html_body() {
-                continue;
+            if tracker.soft_deadline_reached() {
+                ex.partial(SOFT_DEADLINE_REASON);
+                break;
             }
 
             let filename = part
                 .attachment_name()
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("inline_part_{}", idx));
-
+                .unwrap_or(fallback_name);
             let declared_mime = part
                 .content_type()
                 .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("*")));
 
+            // Pre-check estimated decoded length to prevent Base64 / QP memory expansion bomb!
             let estimated_size = part.decoded_len() as u64;
             if let Err(e) = tracker.register_attachment(estimated_size) {
-                match e {
-                    ScanError::AttachmentLimitExceeded { .. }
-                    | ScanError::ExtractedSizeLimitExceeded { .. }
-                    | ScanError::Timeout { .. } => return Err(e),
-                    _ => {
-                        let sub_report = ScanReport::new(
-                            TargetMetadata {
-                                path: None,
-                                file_name: Some(filename),
-                                file_size_bytes: estimated_size,
-                                sha256: String::new(),
-                                detected_mime: "application/octet-stream".to_string(),
-                                declared_mime,
-                            },
-                            ScanStatus::Failed,
-                            Vec::new(),
-                            Vec::new(),
-                            0,
-                            Some(format!("Attachment quota error: {}", e)),
-                        );
-                        sub_reports.push(sub_report);
-                        continue;
-                    }
+                if !e.is_budget() {
+                    return Err(e);
                 }
+                ex.partial(budget_reason(&e));
+                if matches!(e, ScanError::FileSizeLimitExceeded { .. }) {
+                    continue;
+                }
+                break;
             }
 
             let decoded_data = part.decoded();
-
-            let sub_report_res = self.scan_single_attachment(
+            match self.scan_single_attachment(
                 &filename,
                 declared_mime.as_deref(),
                 &part,
@@ -441,36 +349,28 @@ impl<'a> EmailScanner<'a> {
                 &decoded_data,
                 tracker,
                 depth,
-            );
-
-            match sub_report_res {
+            ) {
                 Ok(sub_report) => {
-                    for t in &sub_report.threats {
-                        threats.push(t.clone());
-                    }
-                    sub_reports.push(sub_report);
+                    threats.extend(sub_report.threats.iter().cloned());
+                    ex.reports.push(sub_report);
                 }
-                Err(e) => match e {
-                    ScanError::Timeout { .. } => return Err(e),
-                    _ => {
-                        let sub_report = ScanReport::new(
-                            TargetMetadata {
-                                path: None,
-                                file_name: Some(filename),
-                                file_size_bytes: decoded_data.len() as u64,
-                                sha256: hash_bytes(&decoded_data),
-                                detected_mime: detect_type(&decoded_data).mime_type,
-                                declared_mime,
-                            },
-                            ScanStatus::Failed,
-                            Vec::new(),
-                            Vec::new(),
-                            0,
-                            Some(format!("Attachment scan failed: {}", e)),
-                        );
-                        sub_reports.push(sub_report);
-                    }
-                },
+                Err(e @ ScanError::Timeout { .. }) => return Err(e),
+                Err(e) if e.is_budget() => ex.partial(budget_reason(&e)),
+                Err(e) => ex.reports.push(ScanReport::new(
+                    TargetMetadata {
+                        path: None,
+                        file_name: Some(filename),
+                        file_size_bytes: decoded_data.len() as u64,
+                        sha256: hash_bytes(&decoded_data),
+                        detected_mime: detect_type(&decoded_data).mime_type,
+                        declared_mime,
+                    },
+                    ScanStatus::Failed,
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    Some(format!("Attachment scan failed: {}", e)),
+                )),
             }
         }
 
@@ -491,7 +391,6 @@ impl<'a> EmailScanner<'a> {
         let start_ms = tracker.elapsed_millis();
         tracker.check_timeout()?;
 
-        let sha256 = hash_bytes(data);
         let detected_type = detect_type(data);
 
         // Check if this part is a nested email message
@@ -507,6 +406,7 @@ impl<'a> EmailScanner<'a> {
         if report.status == ScanStatus::Clean {
             if let Some(issue) = validate_attachment_encoding(part, raw_bytes, data).err() {
                 let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
+                let incomplete = report.incomplete.clone();
                 return Ok(ScanReport::new(
                     report.target,
                     ScanStatus::Unsupported,
@@ -514,10 +414,10 @@ impl<'a> EmailScanner<'a> {
                     report.sub_targets,
                     duration_ms,
                     Some(issue),
-                ));
+                )
+                .with_incomplete(incomplete));
             }
         }
-        let _ = sha256;
         Ok(report)
     }
 
@@ -525,8 +425,10 @@ impl<'a> EmailScanner<'a> {
     /// archive member): extension mismatch, builtin SHA-256 rules, RSIDB exact-hash
     /// lookups, byte patterns, and bounded recursion into supported containers.
     ///
-    /// Verdict precedence: Infected > Failed > Unsupported > Clean. Archives that cannot
-    /// be fully inspected (encrypted, unsupported format/method, limits) are never Clean.
+    /// Verdict precedence: Infected > Failed > Unsupported > Clean. Content that cannot
+    /// be inspected for structural reasons (encryption, unsupported formats) is never
+    /// Clean. Content skipped only because a resource budget ran out keeps the verdict
+    /// of what was inspected and is listed in `incomplete`.
     pub fn scan_object(
         &self,
         data: &[u8],
@@ -561,86 +463,44 @@ impl<'a> EmailScanner<'a> {
         }
         tracker.check_timeout()?;
 
-        let mut sub_reports = Vec::new();
-        let mut container_issue: Option<(ScanStatus, String)> = None;
-        match classify_container(data, filename, declared_mime) {
-            ContainerKind::Zip => {
-                let (subs, issue) = self.scan_zip(data, filename, tracker, depth + 1)?;
-                sub_reports = subs;
-                container_issue = issue;
-                // ZipArchive exposes one directory. Multiple end records can indicate
-                // concatenated archives; do not claim complete inspection of them.
-                if data
-                    .windows(4)
-                    .filter(|w| *w == b"PK\x05\x06")
-                    .take(2)
-                    .count()
-                    > 1
-                    && container_issue.is_none()
-                {
-                    container_issue = Some((ScanStatus::Unsupported,
-                        "Multiple ZIP end records; not all embedded archives may have been inspected".into()));
-                }
-            }
-            ContainerKind::Gzip => {
-                let (subs, issue) = self.scan_gzip(data, filename, tracker, depth + 1)?;
-                sub_reports = subs;
-                container_issue = issue;
-            }
+        let mut ex = match classify_container(data, filename, declared_mime) {
+            ContainerKind::Zip => self.scan_zip(data, filename, tracker, depth + 1)?,
+            ContainerKind::Gzip => self.scan_gzip(data, filename, tracker, depth + 1)?,
+            ContainerKind::Tar => self.scan_tar(data, filename, tracker, depth + 1)?,
             ContainerKind::Unsupported(kind) => {
-                container_issue = Some((
+                let mut ex = Extraction::default();
+                ex.raise(
                     ScanStatus::Unsupported,
-                    format!(
-                        "{} container cannot be extracted; contents not inspected",
-                        kind
-                    ),
-                ));
+                    format!("{kind} container cannot be extracted; contents not inspected"),
+                );
+                ex
             }
-            ContainerKind::None => {}
-        }
+            ContainerKind::None => Extraction::default(),
+        };
 
         if data.starts_with(b"%PDF-") {
-            let (pdf_reports, issue) = self.scan_pdf(data, filename, tracker, depth + 1)?;
-            sub_reports.extend(pdf_reports);
-            if container_issue.is_none() {
-                container_issue = issue;
-            }
+            ex.absorb(self.scan_pdf(data, filename, tracker, depth + 1)?);
         }
 
         // Recognizable unsupported embedded containers cannot be silently treated
         // as fully inspected, even when the outer object is another format.
-        let unsupported_magic: &[(&[u8], &str)] = &[
-            (b"Rar!\x1a\x07", "RAR"),
-            (b"7z\xbc\xaf\x27\x1c", "7-Zip"),
-            (b"\x1f\x8b\x08", "GZIP"),
-            (b"BZh", "BZIP2"),
-            (b"\xfd7zXZ\x00", "XZ"),
-            (b"MSCF", "CAB"),
-        ];
-        if container_issue.is_none() {
-            for (magic, kind) in unsupported_magic {
-                tracker.check_timeout()?;
-                if *kind == "GZIP" && data.starts_with(b"\x1f\x8b\x08") {
-                    continue;
-                }
-                if data.windows(magic.len()).any(|w| w == *magic) {
-                    container_issue = Some((
-                        ScanStatus::Unsupported,
-                        format!(
-                            "Possible embedded {} container; contents not inspected",
-                            kind
-                        ),
-                    ));
-                    break;
-                }
+        if ex.issue.is_none() {
+            tracker.check_timeout()?;
+            if let Some(kind) = find_embedded_container(data) {
+                ex.raise(
+                    ScanStatus::Unsupported,
+                    format!(
+                        "Embedded {kind} container cannot be extracted; contents not inspected"
+                    ),
+                );
             }
         }
 
-        for sr in &sub_reports {
+        for sr in &ex.reports {
             threats.extend(sr.threats.iter().cloned());
         }
         let threats = SignatureDatabase::deduplicate_threats(threats);
-        let (status, details) = combine_verdict(&threats, container_issue, &sub_reports);
+        let (status, details) = combine_verdict(&threats, ex.issue, &ex.reports);
         let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
 
         Ok(ScanReport::new(
@@ -654,143 +514,145 @@ impl<'a> EmailScanner<'a> {
             },
             status,
             threats,
-            sub_reports,
+            ex.reports,
             duration_ms,
             details,
-        ))
+        )
+        .with_incomplete(ex.partial))
     }
 
-    /// Strict classic-PDF parsing; no rendering, repair or document mutation.
-    #[allow(clippy::type_complexity)]
+    /// Decodes and scans every PDF stream (full filter chains incl. predictors).
+    /// Parsing is lenient so damaged-but-readable documents are still inspected;
+    /// only password-protected documents are reported as not inspectable.
     fn scan_pdf(
         &self,
         data: &[u8],
         parent: &str,
         tracker: &mut ResourceTracker,
         depth: usize,
-    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
-        tracker.check_depth(depth)?;
-        tracker.check_timeout()?;
-        let options = lopdf::LoadOptions {
-            strict: true,
-            max_decompressed_size: Some(0),
-            ..Default::default()
+    ) -> Result<Extraction, ScanError> {
+        let mut ex = Extraction::default();
+        if let Err(e) = tracker.check_depth(depth) {
+            ex.budget(e)?;
+            return Ok(ex);
+        }
+        let load = |strict: bool| {
+            lopdf::Document::load_mem_with_options(
+                data,
+                lopdf::LoadOptions {
+                    strict,
+                    max_decompressed_size: Some(PDF_LOAD_STREAM_LIMIT),
+                    ..Default::default()
+                },
+            )
         };
-        let doc = match lopdf::Document::load_mem_with_options(data, options) {
+        let doc = match load(true).or_else(|_| load(false)) {
             Ok(doc) => doc,
             Err(e) => {
-                return Ok((
-                    vec![],
-                    Some((
-                        ScanStatus::Unsupported,
-                        format!("PDF structure not inspected: {e}"),
-                    )),
-                ))
+                ex.partial(format!(
+                    "PDF structure could not be parsed ({}); embedded streams not inspected",
+                    short_error(&e.to_string())
+                ));
+                return Ok(ex);
             }
         };
         tracker.check_timeout()?;
-        if doc.trailer.has(b"Encrypt") || doc.is_encrypted() {
-            return Ok((
-                vec![],
-                Some((
-                    ScanStatus::Unsupported,
-                    "Encrypted PDF not inspected".into(),
-                )),
-            ));
+        // An empty user password is tried during loading; only a real password remains.
+        if doc.is_encrypted() {
+            ex.raise(
+                ScanStatus::Unsupported,
+                "Password-protected PDF; content not inspected".into(),
+            );
+            return Ok(ex);
         }
-        let mut reports = Vec::new();
-        let mut issue = None;
+
         for (id, object) in &doc.objects {
-            tracker.check_timeout()?;
             let lopdf::Object::Stream(stream) = object else {
                 continue;
             };
-            let supported = if stream.dict.has(b"Filter") {
-                stream
-                    .filters()
-                    .is_ok_and(|filters| filters.len() == 1 && filters[0] == b"FlateDecode")
-            } else {
-                true
-            };
-            if !supported || stream.dict.has(b"F") || stream.dict.has(b"DecodeParms") {
-                issue = Some((
-                    ScanStatus::Unsupported,
-                    "PDF unsupported filter, decode parameters or external stream".into(),
-                ));
-                continue;
+            tracker.check_timeout()?;
+            if tracker.soft_deadline_reached() {
+                ex.partial(SOFT_DEADLINE_REASON);
+                break;
             }
-            tracker.register_attachment(0)?;
-            let cap = tracker.limits().max_email_attachment_size.min(
-                tracker
-                    .limits()
-                    .max_total_extracted_bytes
-                    .saturating_sub(tracker.total_extracted_bytes()),
-            ) as usize;
-            let bytes = if stream.dict.has(b"Filter") {
-                match stream.decompressed_content_with_limit(cap) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        issue = Some((
-                            ScanStatus::Unsupported,
-                            format!("PDF stream decoding incomplete: {e}"),
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                if stream.content.len() > cap {
-                    issue = Some((
-                        ScanStatus::Unsupported,
-                        "PDF stream extraction limit".into(),
-                    ));
+            if let Err(e) = tracker.register_object(ObjectKind::PdfStream) {
+                ex.budget(e)?;
+                break;
+            }
+            let cap = tracker.object_extraction_cap() as usize;
+            let bytes = match decode_pdf_stream(stream, cap) {
+                Ok(bytes) => bytes,
+                Err(PdfDecodeError::Budget) => {
+                    ex.partial(oversize_reason(tracker, "Decoded PDF stream"));
                     continue;
                 }
-                stream.content.clone()
+                Err(PdfDecodeError::Undecodable(raw, why)) => {
+                    ex.partial(format!("PDF stream {why}; raw stream bytes inspected"));
+                    raw
+                }
             };
-            tracker.check_timeout()?;
-            tracker.record_extracted_bytes(bytes.len())?;
-            reports.push(self.scan_object(
+            if let Err(e) = tracker.record_extracted_bytes(bytes.len()) {
+                ex.budget(e)?;
+                break;
+            }
+            match self.scan_object(
                 &bytes,
                 &format!("{parent}/pdf-object-{}-{}", id.0, id.1),
                 None,
                 tracker,
                 depth,
-            )?);
+            ) {
+                // Clean leaf streams carry no information; keep reports bounded.
+                Ok(r)
+                    if r.status == ScanStatus::Clean
+                        && r.threats.is_empty()
+                        && r.sub_targets.is_empty()
+                        && r.incomplete.is_empty() => {}
+                Ok(r) => ex.reports.push(r),
+                Err(e) if e.is_budget() => ex.partial(budget_reason(&e)),
+                Err(e) => return Err(e),
+            }
         }
-        Ok((reports, issue))
+        Ok(ex)
     }
 
     /// Inspect each GZIP member independently, preserving exact-hash matching.
-    #[allow(clippy::type_complexity)]
     fn scan_gzip(
         &self,
         data: &[u8],
         parent: &str,
         tracker: &mut ResourceTracker,
         depth: usize,
-    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
+    ) -> Result<Extraction, ScanError> {
         use std::io::Read;
-        tracker.check_depth(depth)?;
+        let mut ex = Extraction::default();
+        if let Err(e) = tracker.check_depth(depth) {
+            ex.budget(e)?;
+            return Ok(ex);
+        }
         let mut remaining = data;
-        let mut reports = Vec::new();
+        let mut member = 0usize;
         while !remaining.is_empty() {
             tracker.check_timeout()?;
             if !remaining.starts_with(b"\x1f\x8b\x08") {
-                return Ok((
-                    reports,
-                    Some((
+                // Zero padding after the last member is common and harmless.
+                if remaining.iter().any(|&b| b != 0) {
+                    ex.raise(
                         ScanStatus::Unsupported,
                         "Uninspected trailing GZIP content".into(),
-                    )),
-                ));
+                    );
+                }
+                break;
             }
-            tracker.register_attachment(0)?;
-            let cap = tracker.limits().max_email_attachment_size.min(
-                tracker
-                    .limits()
-                    .max_total_extracted_bytes
-                    .saturating_sub(tracker.total_extracted_bytes()),
-            );
+            if tracker.soft_deadline_reached() {
+                ex.partial(SOFT_DEADLINE_REASON);
+                break;
+            }
+            if let Err(e) = tracker.register_object(ObjectKind::GzipMember) {
+                ex.budget(e)?;
+                break;
+            }
+            let cap = tracker.object_extraction_cap();
             // bufread leaves the following member untouched; read::GzDecoder may over-read.
             let mut decoder = flate2::bufread::GzDecoder::new(remaining);
             let mut buf = Vec::new();
@@ -801,141 +663,234 @@ impl<'a> EmailScanner<'a> {
                     Ok(0) => break,
                     Ok(n) => {
                         let consumed = remaining.len().saturating_sub(decoder.get_ref().len());
-                        if (buf.len() as u64).saturating_add(n as u64) > cap
-                            || (buf.len() as u64).saturating_add(n as u64)
-                                > (consumed as u64).saturating_mul(1000)
-                        {
-                            return Ok((
-                                reports,
-                                Some((
-                                    ScanStatus::Failed,
-                                    "GZIP extraction size or 1000:1 ratio budget exceeded".into(),
-                                )),
-                            ));
+                        let total = (buf.len() as u64).saturating_add(n as u64);
+                        if total > cap || total > (consumed as u64).saturating_mul(1000) {
+                            ex.partial(
+                                "GZIP member exceeds the extraction budget (size or 1000:1 ratio); not inspected",
+                            );
+                            return Ok(ex);
                         }
                         buf.try_reserve(n).map_err(|_| {
                             ScanError::Internal("Cannot allocate gzip buffer".into())
                         })?;
-                        tracker.record_extracted_bytes(n)?;
+                        if let Err(e) = tracker.record_extracted_bytes(n) {
+                            ex.budget(e)?;
+                            return Ok(ex);
+                        }
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     Err(e) => {
-                        return Ok((
-                            reports,
-                            Some((
-                                ScanStatus::Unsupported,
-                                format!("GZIP member not inspected: {e}"),
-                            )),
-                        ))
+                        ex.raise(
+                            ScanStatus::Unsupported,
+                            format!("GZIP member not inspected: {e}"),
+                        );
+                        return Ok(ex);
                     }
                 }
             }
             let next = decoder.into_inner();
             if next.len() >= remaining.len() {
-                return Ok((
-                    reports,
-                    Some((ScanStatus::Failed, "GZIP decoder made no progress".into())),
-                ));
+                ex.raise(ScanStatus::Failed, "GZIP decoder made no progress".into());
+                return Ok(ex);
             }
-            reports.push(self.scan_object(
+            match self.scan_object(
                 &buf,
-                &format!("{parent}/gzip-member-{}", reports.len()),
+                &format!("{parent}/gzip-member-{member}"),
                 None,
                 tracker,
                 depth,
-            )?);
+            ) {
+                Ok(r) => ex.reports.push(r),
+                Err(e) if e.is_budget() => ex.partial(budget_reason(&e)),
+                Err(e) => return Err(e),
+            }
+            member += 1;
             remaining = next;
         }
-        Ok((reports, None))
+        Ok(ex)
+    }
+
+    /// Extracts and scans regular-file TAR members (ustar, GNU, PAX) in memory.
+    /// Links, devices and directories carry no content and are skipped.
+    fn scan_tar(
+        &self,
+        data: &[u8],
+        parent: &str,
+        tracker: &mut ResourceTracker,
+        depth: usize,
+    ) -> Result<Extraction, ScanError> {
+        use std::io::Read;
+        let mut ex = Extraction::default();
+        if let Err(e) = tracker.check_depth(depth) {
+            ex.budget(e)?;
+            return Ok(ex);
+        }
+        let mut archive = tar::Archive::new(std::io::Cursor::new(data));
+        let entries = match archive.entries() {
+            Ok(entries) => entries,
+            Err(e) => {
+                ex.raise(
+                    ScanStatus::Unsupported,
+                    format!("Malformed TAR container: {}", short_error(&e.to_string())),
+                );
+                return Ok(ex);
+            }
+        };
+        let mut members = 0usize;
+        for entry in entries {
+            tracker.check_timeout()?;
+            if tracker.soft_deadline_reached() {
+                ex.partial(SOFT_DEADLINE_REASON);
+                break;
+            }
+            let mut entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    ex.raise(
+                        ScanStatus::Unsupported,
+                        format!(
+                            "TAR container unreadable after {members} members: {}",
+                            short_error(&e.to_string())
+                        ),
+                    );
+                    break;
+                }
+            };
+            let kind = entry.header().entry_type();
+            if !(kind.is_file() || kind.is_gnu_sparse()) {
+                continue;
+            }
+            members += 1;
+            let name: String = String::from_utf8_lossy(&entry.path_bytes())
+                .chars()
+                .take(256)
+                .collect();
+            let label = format!("{parent}/{name}");
+            if let Err(e) = tracker.register_object(ObjectKind::ArchiveEntry) {
+                ex.budget(e)?;
+                break;
+            }
+            let output_limit = tracker.object_extraction_cap();
+            if entry.size() > output_limit {
+                ex.partial(oversize_reason(tracker, "Archive member"));
+                continue;
+            }
+            let mut buf = Vec::new();
+            if let Err(e) = (&mut entry)
+                .take(output_limit.saturating_add(1))
+                .read_to_end(&mut buf)
+            {
+                ex.raise(
+                    ScanStatus::Unsupported,
+                    format!(
+                        "TAR member {label} unreadable: {}",
+                        short_error(&e.to_string())
+                    ),
+                );
+                break;
+            }
+            if buf.len() as u64 > output_limit {
+                ex.partial(oversize_reason(tracker, "Archive member"));
+                continue;
+            }
+            if let Err(e) = tracker.record_extracted_bytes(buf.len()) {
+                ex.budget(e)?;
+                break;
+            }
+            match self.scan_object(&buf, &label, None, tracker, depth) {
+                Ok(r) => ex.reports.push(r),
+                Err(e) if e.is_budget() => ex.partial(budget_reason(&e)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ex)
     }
 
     /// Extracts and scans ZIP members in memory under the shared resource budget.
     /// Never writes to disk; member names are used only as display labels.
-    #[allow(clippy::type_complexity)]
     fn scan_zip(
         &self,
         data: &[u8],
         parent: &str,
         tracker: &mut ResourceTracker,
         depth: usize,
-    ) -> Result<(Vec<ScanReport>, Option<(ScanStatus, String)>), ScanError> {
+    ) -> Result<Extraction, ScanError> {
         use std::io::Read;
-        let mut subs = Vec::new();
-
+        let mut ex = Extraction::default();
         if let Err(e) = tracker.check_depth(depth) {
-            if matches!(e, ScanError::Timeout { .. }) {
-                return Err(e);
-            }
-            return Ok((
-                subs,
-                Some((ScanStatus::Failed, format!("ZIP not inspected: {}", e))),
-            ));
+            ex.budget(e)?;
+            return Ok(ex);
         }
 
         let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(data)) {
             Ok(a) => a,
             Err(e) => {
-                return Ok((
-                    subs,
-                    Some((
-                        ScanStatus::Unsupported,
-                        format!("Malformed ZIP container: {}", e),
-                    )),
-                ))
+                ex.raise(
+                    ScanStatus::Unsupported,
+                    format!("Malformed ZIP container: {}", e),
+                );
+                return Ok(ex);
             }
         };
 
-        let max_entries = tracker.limits().max_email_attachments;
-        if archive.len() > max_entries {
-            return Ok((
-                subs,
-                Some((
-                    ScanStatus::Failed,
-                    format!("ZIP has {} entries (limit {})", archive.len(), max_entries),
-                )),
-            ));
+        // ZipArchive exposes one central directory. Local headers or end records
+        // outside every member's byte range may belong to another (or a truncated)
+        // embedded archive, so the container cannot be reported as fully inspected.
+        // Signatures inside member data (e.g. a stored nested ZIP) are inspected
+        // when that member is extracted.
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(archive.len());
+        for i in 0..archive.len() {
+            if let Ok(f) = archive.by_index_raw(i) {
+                let end = f.data_start().saturating_add(f.compressed_size());
+                ranges.push((f.header_start(), end));
+            }
         }
-
-        let cap = tracker.limits().max_email_attachment_size;
-        // Extra local headers may belong to another or truncated embedded ZIP.
-        // ZipArchive only exposes one central directory, so do not report CLEAN.
-        let extra_headers = data
-            .windows(4)
-            .filter(|w| *w == b"PK\x03\x04")
-            .take(archive.len().saturating_add(1))
-            .count()
-            > archive.len();
-        let mut issue: Option<(ScanStatus, String)> = extra_headers.then(|| {
-            (
-                ScanStatus::Unsupported,
-                "Additional ZIP local headers may contain uninspected content".into(),
-            )
-        });
-        let raise = |issue: &mut Option<(ScanStatus, String)>, st: ScanStatus, msg: String| {
-            let replace = match issue {
-                None => true,
-                Some((cur, _)) => *cur == ScanStatus::Unsupported && st == ScanStatus::Failed,
-            };
-            if replace {
-                *issue = Some((st, msg));
-            }
+        // The directory region runs from the central directory to the end of the
+        // archive's end-of-central-directory record (including its comment); any
+        // later bytes (appended archives) are outside it. Offsets are absolute.
+        let central_start = archive.central_directory_start();
+        let dir_end = memchr_all(data, b"PK\x05\x06")
+            .find(|&p| p as u64 >= central_start)
+            .map(|p| {
+                let comment = data
+                    .get(p + 20..p + 22)
+                    .map_or(0, |c| u16::from_le_bytes([c[0], c[1]]) as usize);
+                (p + 22 + comment) as u64
+            })
+            .unwrap_or(data.len() as u64);
+        let outside = |pos: usize| {
+            let pos = pos as u64;
+            !(central_start..dir_end).contains(&pos)
+                && !ranges.iter().any(|&(s, e)| pos > s && pos < e)
         };
+        let stray_local = memchr_all(data, b"PK\x03\x04")
+            .filter(|&p| outside(p))
+            .any(|p| !ranges.iter().any(|&(s, _)| s == p as u64));
+        let stray_eocd = memchr_all(data, b"PK\x05\x06").any(&outside);
+        if stray_local || stray_eocd {
+            ex.raise(
+                ScanStatus::Unsupported,
+                "Additional ZIP structures outside the central directory may contain uninspected content".into(),
+            );
+        }
 
         for i in 0..archive.len() {
             tracker.check_timeout()?;
+            if tracker.soft_deadline_reached() {
+                ex.partial(SOFT_DEADLINE_REASON);
+                break;
+            }
             let mut file = match archive.by_index(i) {
                 Ok(f) => f,
                 Err(zip::result::ZipError::UnsupportedArchive(m)) => {
-                    raise(
-                        &mut issue,
+                    ex.raise(
                         ScanStatus::Unsupported,
                         format!("ZIP member {} not inspectable: {}", i, m),
                     );
                     continue;
                 }
                 Err(e) => {
-                    raise(
-                        &mut issue,
+                    ex.raise(
                         ScanStatus::Failed,
                         format!("ZIP member {} unreadable: {}", i, e),
                     );
@@ -948,44 +903,25 @@ impl<'a> EmailScanner<'a> {
             let name: String = file.name().chars().take(256).collect();
             let label = format!("{}/{}", parent, name);
             if file.encrypted() {
-                raise(
-                    &mut issue,
+                ex.raise(
                     ScanStatus::Unsupported,
                     format!("Encrypted ZIP member: {}", label),
                 );
                 continue;
             }
 
+            if let Err(e) = tracker.register_object(ObjectKind::ArchiveEntry) {
+                ex.budget(e)?;
+                break;
+            }
+            let output_limit = tracker.object_extraction_cap();
             let declared = file.size();
-            if let Err(e) = tracker.register_attachment(declared) {
-                match e {
-                    ScanError::Timeout { .. } => return Err(e),
-                    ScanError::AttachmentLimitExceeded { .. }
-                    | ScanError::ExtractedSizeLimitExceeded { .. } => {
-                        raise(
-                            &mut issue,
-                            ScanStatus::Failed,
-                            format!("ZIP extraction budget exhausted: {}", e),
-                        );
-                        break;
-                    }
-                    _ => {
-                        raise(
-                            &mut issue,
-                            ScanStatus::Failed,
-                            format!("ZIP member {} rejected: {}", label, e),
-                        );
-                        continue;
-                    }
-                }
+            if declared > output_limit {
+                ex.partial(oversize_reason(tracker, "Archive member"));
+                continue;
             }
 
             // Check the deadline between bounded decompression reads.
-            let remaining_budget = tracker
-                .limits()
-                .max_total_extracted_bytes
-                .saturating_sub(tracker.total_extracted_bytes());
-            let output_limit = cap.min(declared.saturating_add(remaining_budget));
             let mut buf = Vec::new();
             let mut chunk = [0u8; 64 * 1024];
             let mut extraction_error = None;
@@ -1014,52 +950,259 @@ impl<'a> EmailScanner<'a> {
                 }
             }
             if let Some(e) = extraction_error {
-                raise(
-                    &mut issue,
+                ex.raise(
                     ScanStatus::Failed,
                     format!("ZIP member {} extraction failed: {}", label, e),
                 );
                 continue;
             }
             if buf.len() as u64 > output_limit {
-                raise(
-                    &mut issue,
-                    ScanStatus::Failed,
-                    format!("ZIP member {} exceeds extraction budget", label),
-                );
+                ex.partial(oversize_reason(tracker, "Archive member"));
                 continue;
             }
-            if buf.len() as u64 > declared {
-                if let Err(e) =
-                    tracker.record_extracted_bytes((buf.len() as u64 - declared) as usize)
-                {
-                    raise(
-                        &mut issue,
-                        ScanStatus::Failed,
-                        format!("ZIP extraction budget exhausted: {}", e),
-                    );
-                    break;
-                }
+            if let Err(e) = tracker.record_extracted_bytes(buf.len()) {
+                ex.budget(e)?;
+                break;
             }
             drop(file);
 
             match self.scan_object(&buf, &label, None, tracker, depth) {
-                Ok(r) => subs.push(r),
+                Ok(r) => ex.reports.push(r),
                 Err(e @ ScanError::Timeout { .. }) => return Err(e),
-                Err(e) => raise(
-                    &mut issue,
+                Err(e) if e.is_budget() => ex.partial(budget_reason(&e)),
+                Err(e) => ex.raise(
                     ScanStatus::Failed,
                     format!("ZIP member {} scan failed: {}", label, e),
                 ),
             }
         }
-        Ok((subs, issue))
+        Ok(ex)
     }
+}
+
+const SOFT_DEADLINE_REASON: &str = "Scan time budget reached; remaining content not inspected";
+
+/// Per-stream bound for object/xref streams decoded while a PDF is loaded.
+const PDF_LOAD_STREAM_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Result of expanding one container: child reports, a structural issue that
+/// prevents a Clean verdict, and reasons inspection was partial.
+#[derive(Default)]
+struct Extraction {
+    reports: Vec<ScanReport>,
+    issue: Option<(ScanStatus, String)>,
+    partial: Vec<String>,
+}
+
+impl Extraction {
+    /// Keeps the first issue, upgrading Unsupported to Failed.
+    fn raise(&mut self, status: ScanStatus, msg: String) {
+        let replace = match &self.issue {
+            None => true,
+            Some((cur, _)) => *cur == ScanStatus::Unsupported && status == ScanStatus::Failed,
+        };
+        if replace {
+            self.issue = Some((status, msg));
+        }
+    }
+
+    fn partial(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if self.partial.len() < MAX_INCOMPLETE_REASONS && !self.partial.contains(&msg) {
+            self.partial.push(msg);
+        }
+    }
+
+    /// Records a budget error as partial inspection; propagates any other error.
+    fn budget(&mut self, e: ScanError) -> Result<(), ScanError> {
+        if e.is_budget() {
+            self.partial(budget_reason(&e));
+            Ok(())
+        } else {
+            Err(e)
+        }
+    }
+
+    fn absorb(&mut self, other: Extraction) {
+        self.reports.extend(other.reports);
+        if let Some((status, msg)) = other.issue {
+            self.raise(status, msg);
+        }
+        for p in other.partial {
+            self.partial(p);
+        }
+    }
+}
+
+/// Stable, deduplicable description of an exhausted budget.
+fn budget_reason(e: &ScanError) -> String {
+    const MIB: u64 = 1024 * 1024;
+    match e {
+        ScanError::DepthLimitExceeded { limit, .. } => {
+            format!("Content nested deeper than {limit} levels not inspected")
+        }
+        ScanError::AttachmentLimitExceeded { limit } => {
+            format!("Only the first {limit} MIME parts were inspected")
+        }
+        ScanError::ObjectLimitExceeded { kind, limit } => {
+            format!("Only the first {limit} {kind}s were inspected")
+        }
+        ScanError::ExtractedSizeLimitExceeded { limit, .. } => format!(
+            "Extraction budget of {} MiB reached; remaining content not inspected",
+            limit / MIB
+        ),
+        ScanError::FileSizeLimitExceeded { limit, .. } => {
+            format!(
+                "Embedded object larger than {} MiB not inspected",
+                limit / MIB
+            )
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Explains why an object exceeding `object_extraction_cap` was skipped.
+fn oversize_reason(tracker: &ResourceTracker, what: &str) -> String {
+    let limits = tracker.limits();
+    let per_object = limits.max_email_attachment_size;
+    if tracker.object_extraction_cap() < per_object {
+        budget_reason(&ScanError::ExtractedSizeLimitExceeded {
+            limit: limits.max_total_extracted_bytes,
+            current: 0,
+        })
+    } else {
+        format!(
+            "{what} larger than {} MiB not inspected",
+            per_object / (1024 * 1024)
+        )
+    }
+}
+
+fn short_error(msg: &str) -> String {
+    msg.chars().take(120).collect()
+}
+
+enum PdfDecodeError {
+    /// Decoded output would exceed the extraction budget.
+    Budget,
+    /// The stream cannot be fully decoded; carries the best bytes available.
+    Undecodable(Vec<u8>, String),
+}
+
+/// Image codecs whose output is pixels, not embedded files or scripts. Their
+/// encoded bytes are scanned as-is, which is what exact-hash and byte rules expect.
+const PDF_IMAGE_FILTERS: &[&[u8]] = &[
+    b"DCTDecode",
+    b"JPXDecode",
+    b"JBIG2Decode",
+    b"CCITTFaxDecode",
+];
+
+fn decode_pdf_stream(stream: &lopdf::Stream, cap: usize) -> Result<Vec<u8>, PdfDecodeError> {
+    let is_budget = |e: &lopdf::Error| {
+        matches!(
+            e,
+            lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })
+        )
+    };
+    let filters: Vec<Vec<u8>> = match stream.filters() {
+        Ok(f) => f.into_iter().map(|f| f.to_vec()).collect(),
+        Err(_) if !stream.dict.has(b"Filter") => Vec::new(),
+        Err(_) => {
+            return Err(PdfDecodeError::Undecodable(
+                stream.content.clone(),
+                "has a malformed /Filter entry".into(),
+            ))
+        }
+    };
+    if filters.is_empty() {
+        if stream.content.len() > cap {
+            return Err(PdfDecodeError::Budget);
+        }
+        return Ok(stream.content.clone());
+    }
+
+    // Decode the general-purpose prefix of the chain; stop at the first image codec.
+    let prefix_len = filters
+        .iter()
+        .position(|f| PDF_IMAGE_FILTERS.contains(&f.as_slice()))
+        .unwrap_or(filters.len());
+    if prefix_len == 0 {
+        if stream.content.len() > cap {
+            return Err(PdfDecodeError::Budget);
+        }
+        return Ok(stream.content.clone());
+    }
+    let decoded = if prefix_len == filters.len() {
+        stream.decompressed_content_with_limit(cap)
+    } else {
+        let mut dict = stream.dict.clone();
+        let prefix: Vec<lopdf::Object> = filters[..prefix_len]
+            .iter()
+            .map(|f| lopdf::Object::Name(f.clone()))
+            .collect();
+        dict.set("Filter", lopdf::Object::Array(prefix));
+        if let Ok(lopdf::Object::Array(params)) = stream.dict.get(b"DecodeParms") {
+            let params: Vec<lopdf::Object> = params.iter().take(prefix_len).cloned().collect();
+            dict.set("DecodeParms", lopdf::Object::Array(params));
+        }
+        lopdf::Stream::new(dict, stream.content.clone())
+            .with_compression(false)
+            .decompressed_content_with_limit(cap)
+    };
+    match decoded {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if is_budget(&e) => Err(PdfDecodeError::Budget),
+        Err(lopdf::Error::Unimplemented(_)) => {
+            let names: Vec<String> = filters[..prefix_len]
+                .iter()
+                .map(|f| String::from_utf8_lossy(f).chars().take(32).collect())
+                .collect();
+            Err(PdfDecodeError::Undecodable(
+                stream.content.clone(),
+                format!("uses unsupported filter chain [{}]", names.join(", ")),
+            ))
+        }
+        Err(_) => Err(PdfDecodeError::Undecodable(
+            stream.content.clone(),
+            "could not be decoded (corrupt data)".into(),
+        )),
+    }
+}
+
+/// Positions of every occurrence of `needle` in `hay`.
+fn memchr_all<'h>(hay: &'h [u8], needle: &'static [u8]) -> impl Iterator<Item = usize> + 'h {
+    hay.windows(needle.len())
+        .enumerate()
+        .filter(move |(_, w)| *w == needle)
+        .map(|(i, _)| i)
+}
+
+/// Strong (6+ byte) signatures of container formats that cannot be extracted yet.
+/// Short magics (e.g. 3-byte GZIP/BZIP2 prefixes) occur by chance in compressed
+/// or image data and are deliberately not used.
+fn find_embedded_container(data: &[u8]) -> Option<&'static str> {
+    const MAGICS: &[(&[u8], &str)] = &[
+        (b"Rar!\x1a\x07", "RAR"),
+        (b"7z\xbc\xaf\x27\x1c", "7-Zip"),
+        (b"\xfd7zXZ\x00", "XZ"),
+        (b"MSCF\x00\x00\x00\x00", "CAB"),
+    ];
+    for (magic, kind) in MAGICS {
+        if memchr_all(data, magic).next().is_some() {
+            return Some(kind);
+        }
+    }
+    // BZIP2 stream header: "BZh" + block size 1-9 + block magic (pi digits).
+    memchr_all(data, b"1AY&SY")
+        .any(|p| p >= 4 && &data[p - 4..p - 1] == b"BZh" && (b'1'..=b'9').contains(&data[p - 1]))
+        .then_some("BZIP2")
 }
 
 enum ContainerKind {
     None,
     Gzip,
+    Tar,
     Zip,
     Unsupported(&'static str),
 }
@@ -1067,14 +1210,18 @@ enum ContainerKind {
 /// Content-based container classification, with fallback to declared metadata
 /// for truncated or incomplete containers that cannot be safely inspected.
 fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) -> ContainerKind {
-    if data.windows(4).any(|w| w == b"PK\x03\x04")
+    // An embedded ZIP (self-extractor, polyglot, prepended data) is recognized by a
+    // structurally plausible local header, so the four bytes "PK\3\4" occurring by
+    // chance in compressed or image data do not turn a PDF into a malformed ZIP.
+    let claims_zip = data.starts_with(b"PK\x03\x04")
         || data.starts_with(b"PK\x05\x06")
         || filename.to_ascii_lowercase().ends_with(".zip")
-        || declared_mime.is_some_and(|m| m.eq_ignore_ascii_case("application/zip"))
-    {
+        || declared_mime.is_some_and(|m| m.eq_ignore_ascii_case("application/zip"));
+    let embedded_zip = || memchr_all(data, b"PK\x03\x04").any(|p| plausible_local_header(data, p));
+    if claims_zip || embedded_zip() {
         ContainerKind::Zip
     } else if is_tar_header(data) || is_tar_claim(data, filename, declared_mime) {
-        ContainerKind::Unsupported("TAR")
+        ContainerKind::Tar
     } else if data.starts_with(b"Rar!\x1a\x07") {
         ContainerKind::Unsupported("RAR")
     } else if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
@@ -1089,6 +1236,30 @@ fn classify_container(data: &[u8], filename: &str, declared_mime: Option<&str>) 
         ContainerKind::Unsupported("CAB")
     } else {
         ContainerKind::None
+    }
+}
+
+/// Whether a ZIP local file header at `pos` has sane fields (version, method,
+/// name length, printable name). Truncated archives still qualify.
+fn plausible_local_header(data: &[u8], pos: usize) -> bool {
+    let Some(h) = data.get(pos..pos + 30) else {
+        return false;
+    };
+    let u16le = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]);
+    let version = u16le(4);
+    let method = u16le(8);
+    let name_len = u16le(26) as usize;
+    let extra_len = u16le(28) as usize;
+    const METHODS: &[u16] = &[0, 1, 6, 8, 9, 12, 14, 19, 93, 95, 96, 97, 98, 99];
+    if (version & 0xff) > 63 || !METHODS.contains(&method) || name_len == 0 || name_len > 1024 {
+        return false;
+    }
+    if extra_len > 8192 {
+        return false;
+    }
+    match data.get(pos + 30..pos + 30 + name_len) {
+        Some(name) => name.iter().all(|&b| b >= 0x20 && b != 0x7f),
+        None => false,
     }
 }
 
@@ -1526,28 +1697,169 @@ mod tests {
                         ScanStatus::Infected
                     }
                 );
-                assert!(!report.sub_targets.is_empty());
+                // Clean leaf streams are omitted from the report; detections are kept.
+                assert_eq!(
+                    report.sub_targets.is_empty(),
+                    report.status == ScanStatus::Clean
+                );
+                assert!(report.incomplete.is_empty());
+                // An exhausted budget is reported as partial inspection, not a failure.
                 let mut tracker = ResourceTracker::new(ResourceLimits {
                     max_total_extracted_bytes: 1,
                     ..Default::default()
                 });
-                assert_ne!(
-                    scanner
-                        .scan_object(&data, "limited.pdf", None, &mut tracker, 0)
-                        .unwrap()
-                        .status,
-                    ScanStatus::Clean
-                );
+                let limited = scanner
+                    .scan_object(&data, "limited.pdf", None, &mut tracker, 0)
+                    .unwrap();
+                assert!(!limited.incomplete.is_empty());
+                if compressed && report.status == ScanStatus::Clean {
+                    assert_eq!(limited.status, ScanStatus::Clean);
+                }
             }
         }
         let mut tracker = ResourceTracker::new(ResourceLimits::default());
-        assert_eq!(
-            scanner
-                .scan_object(b"%PDF-1.4\ntruncated", "broken.pdf", None, &mut tracker, 0)
-                .unwrap()
-                .status,
-            ScanStatus::Unsupported
+        let broken = scanner
+            .scan_object(b"%PDF-1.4\ntruncated", "broken.pdf", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(broken.status, ScanStatus::Clean);
+        assert!(broken.incomplete[0].contains("could not be parsed"));
+    }
+
+    fn pdf_with_stream(dict: lopdf::Dictionary, content: Vec<u8>) -> Vec<u8> {
+        use lopdf::{dictionary, Document, Stream};
+        let mut doc = Document::with_version("1.4");
+        let pages = doc.add_object(
+            dictionary! { "Type" => "Pages", "Kids" => Vec::<lopdf::Object>::new(), "Count" => 0 },
         );
+        let root = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        doc.trailer.set("Root", root);
+        doc.add_object(Stream::new(dict, content).with_compression(false));
+        let mut data = Vec::new();
+        doc.save_to(&mut data).unwrap();
+        data
+    }
+
+    #[test]
+    fn pdf_many_streams_predictors_and_filter_chains() {
+        use lopdf::dictionary;
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+        // More streams than the old shared 30-object limit: fully inspected and clean.
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages = doc.add_object(
+            dictionary! { "Type" => "Pages", "Kids" => Vec::<lopdf::Object>::new(), "Count" => 0 },
+        );
+        let root = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        doc.trailer.set("Root", root);
+        for i in 0..120 {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(format!("BT /F1 12 Tf ({i}) Tj ET").as_bytes())
+                .unwrap();
+            doc.add_object(
+                lopdf::Stream::new(
+                    dictionary! { "Filter" => "FlateDecode" },
+                    enc.finish().unwrap(),
+                )
+                .with_compression(false),
+            );
+        }
+        let mut data = Vec::new();
+        doc.save_to(&mut data).unwrap();
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "pages.pdf", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean, "{:?}", report.error);
+        assert!(report.incomplete.is_empty(), "{:?}", report.incomplete);
+
+        // Flate with a PNG predictor (DecodeParms) is decoded and inspected.
+        let mut rows = Vec::new();
+        for chunk in eicar.chunks(17) {
+            rows.push(0u8); // PNG "None" predictor per row
+            rows.extend_from_slice(chunk);
+            rows.extend(std::iter::repeat_n(b' ', 17 - chunk.len()));
+        }
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&rows).unwrap();
+        let data = pdf_with_stream(
+            dictionary! {
+                "Filter" => "FlateDecode",
+                "DecodeParms" => dictionary! { "Predictor" => 12, "Columns" => 17 },
+            },
+            enc.finish().unwrap(),
+        );
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "predictor.pdf", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Infected);
+
+        // ASCIIHex + Flate chain is decoded.
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(eicar).unwrap();
+        let hex: String = enc
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let data = pdf_with_stream(
+            dictionary! { "Filter" => vec![lopdf::Object::Name(b"ASCIIHexDecode".to_vec()), lopdf::Object::Name(b"FlateDecode".to_vec())] },
+            format!("{hex}>").into_bytes(),
+        );
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "chain.pdf", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Infected);
+
+        // Image codecs are not decoded; their bytes are scanned as-is without a partial note.
+        let data = pdf_with_stream(
+            dictionary! { "Filter" => "DCTDecode" },
+            b"\xff\xd8\xff\xe0 not really a jpeg".to_vec(),
+        );
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "image.pdf", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert!(report.incomplete.is_empty(), "{:?}", report.incomplete);
+
+        // An unknown filter is a partial inspection of the raw bytes, not a withhold.
+        let data = pdf_with_stream(
+            dictionary! { "Filter" => "MadeUpDecode" },
+            b"opaque".to_vec(),
+        );
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "unknown.pdf", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert!(report.incomplete[0].contains("unsupported filter"));
+    }
+
+    #[test]
+    fn weak_embedded_magic_is_not_a_container() {
+        let db = SignatureDatabase::with_defaults();
+        let scanner = EmailScanner::new(&db);
+        // Short magics that appear by chance in ordinary binary data.
+        let data = b"\x89PNG....BZh9....\x1f\x8b\x08....MSCF....PK\x03\x04....".to_vec();
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "image.png", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Clean, "{:?}", report.error);
+        // Strong magics are still treated as uninspectable embedded containers.
+        let mut data = data;
+        data.extend_from_slice(b"Rar!\x1a\x07\x01\x00");
+        let mut tracker = ResourceTracker::new(ResourceLimits::default());
+        let report = scanner
+            .scan_object(&data, "image.png", None, &mut tracker, 0)
+            .unwrap();
+        assert_eq!(report.status, ScanStatus::Unsupported);
     }
 
     #[test]
@@ -1567,12 +1879,15 @@ mod tests {
         assert_eq!(report.status, ScanStatus::Clean);
         assert_eq!(report.sub_targets.len(), 2);
         let mut tracker = ResourceTracker::new(ResourceLimits {
-            max_email_attachments: 1,
+            max_gzip_members: 1,
             ..Default::default()
         });
-        assert!(scanner
+        let limited = scanner
             .scan_object(&data, "limited.gz", None, &mut tracker, 0)
-            .is_err());
+            .unwrap();
+        assert_eq!(limited.status, ScanStatus::Clean);
+        assert_eq!(limited.sub_targets.len(), 1);
+        assert!(limited.incomplete[0].contains("GZIP member"));
         data.extend_from_slice(b"uninspected suffix");
         let mut tracker = ResourceTracker::new(ResourceLimits::default());
         assert_eq!(
@@ -1746,7 +2061,7 @@ Content-Disposition: attachment; filename=\"invoice.pdf\"\r\n\
     }
 
     #[test]
-    fn test_email_attachment_limit_exceeded() {
+    fn test_email_attachment_limit_is_partial() {
         let raw_mime = b"MIME-Version: 1.0\r\n\
 From: sender@example.com\r\n\
 To: recipient@example.com\r\n\
@@ -1773,12 +2088,13 @@ B\r\n\
         };
         let mut tracker = ResourceTracker::new(limits);
 
-        let res = scanner.scan_bytes(raw_mime, None, &mut tracker);
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            ScanError::AttachmentLimitExceeded { limit } => assert_eq!(limit, 1),
-            other => panic!("Unexpected error: {:?}", other),
-        }
+        let report = scanner.scan_bytes(raw_mime, None, &mut tracker).unwrap();
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert_eq!(
+            report.incomplete,
+            vec!["Only the first 1 MIME parts were inspected".to_string()]
+        );
     }
 
     #[test]
@@ -1938,7 +2254,7 @@ Content-Disposition: attachment; filename=\"corrupt.bin\"\r\n\r\n\
     }
 
     #[test]
-    fn test_benign_email_with_failed_attachment_scan() {
+    fn test_oversized_attachment_is_partial_not_failed() {
         // Attachment exceeds max_email_attachment_size
         let raw_mime = b"MIME-Version: 1.0\r\n\
 Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\r\n\
@@ -1964,14 +2280,9 @@ QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3
             .scan_bytes(raw_mime, Some("failed_att.eml"), &mut tracker)
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Failed);
-        assert_eq!(report.sub_targets.len(), 1);
-        assert_eq!(report.sub_targets[0].status, ScanStatus::Failed);
-        assert!(report.sub_targets[0]
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Attachment quota error"));
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert!(report.sub_targets.is_empty());
+        assert!(report.incomplete[0].contains("larger than"));
     }
 
     #[test]
@@ -2148,7 +2459,7 @@ Hello world=ZZ invalid escape\r\n\
     }
 
     #[test]
-    fn test_tar_archive_produces_unsupported_verdict_never_clean() {
+    fn test_tar_archive_members_are_extracted_and_scanned() {
         let tar_data = make_test_tar("clean_document.txt", b"Benign text content inside TAR.");
         let db = SignatureDatabase::new();
         let scanner = EmailScanner::new(&db);
@@ -2165,20 +2476,17 @@ Hello world=ZZ invalid escape\r\n\
             )
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Unsupported);
-        assert!(report
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("TAR container cannot be extracted"));
+        assert_eq!(report.status, ScanStatus::Clean, "{:?}", report.error);
+        assert_eq!(report.sub_targets.len(), 1);
+        assert!(report.incomplete.is_empty());
     }
 
     #[test]
-    fn test_tar_archive_with_hash_only_malware_returns_unsupported_never_clean() {
+    fn test_tar_archive_with_malware_member_is_detected() {
         let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
         let tar_data = make_test_tar("eicar.txt", eicar);
 
-        let db = SignatureDatabase::new();
+        let db = SignatureDatabase::with_defaults();
         let scanner = EmailScanner::new(&db);
         let limits = ResourceLimits::default();
         let mut tracker = ResourceTracker::new(limits);
@@ -2193,12 +2501,8 @@ Hello world=ZZ invalid escape\r\n\
             )
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Unsupported);
-        assert!(report
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("TAR container cannot be extracted"));
+        assert_eq!(report.status, ScanStatus::Infected);
+        assert_eq!(report.sub_targets[0].status, ScanStatus::Infected);
     }
 
     #[test]
@@ -2224,7 +2528,7 @@ Hello world=ZZ invalid escape\r\n\
     }
 
     #[test]
-    fn test_nested_tar_inside_zip_produces_unsupported() {
+    fn test_nested_tar_inside_zip_is_scanned() {
         use std::io::Write;
         let tar_data = make_test_tar("inner.txt", b"Safe inner text");
 
@@ -2256,9 +2560,9 @@ Hello world=ZZ invalid escape\r\n\
             )
             .unwrap();
 
-        assert_eq!(report.status, ScanStatus::Unsupported);
+        assert_eq!(report.status, ScanStatus::Clean, "{:?}", report.error);
         assert_eq!(report.sub_targets.len(), 1);
-        assert_eq!(report.sub_targets[0].status, ScanStatus::Unsupported);
+        assert_eq!(report.sub_targets[0].sub_targets.len(), 1);
     }
 
     fn base64_encode(data: &[u8]) -> String {

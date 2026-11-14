@@ -194,11 +194,18 @@ RaxoSentinel enforces strict bounded limits to prevent denial-of-service, decomp
 |---|---|---|---|
 | `max_file_size` | `--max-size <BYTES>` | 50 MiB | Maximum file size scanned. Larger files abort with `FileSizeLimitExceeded`. |
 | `max_scan_duration_ms` | `--timeout <SECS>` | 10 s | Maximum wall-clock scan duration before triggering `Timeout`. |
-| `max_email_depth` | `--max-depth <NUM>` | 5 | Maximum MIME message nesting depth. |
-| `max_email_attachments` | Configuration | 30 | Maximum number of attachments extracted per message. |
-| `max_email_attachment_size` | Configuration | 25 MiB | Maximum individual attachment size. |
-| `max_total_extracted_bytes`| Configuration | 100 MiB | Cumulative extracted quota across all message parts. |
+| `max_email_depth` | `--max-depth <NUM>` | 5 | Maximum container nesting depth (MIME, archives, PDF streams). |
+| `max_email_attachments` | Configuration | 100 | Maximum MIME parts expanded per message. |
+| `max_archive_entries` | Configuration | 2,000 | Maximum ZIP/TAR members expanded per scan. |
+| `max_pdf_streams` | Configuration | 10,000 | Maximum PDF streams decoded per scan. |
+| `max_gzip_members` | Configuration | 64 | Maximum GZIP members expanded per scan. |
+| `max_email_attachment_size` | Configuration | 50 MiB | Maximum size of any single extracted object. |
+| `max_total_extracted_bytes`| Configuration | 200 MiB | Cumulative extracted quota across the whole scan. |
 | `buffer_size` | Configuration | 64 KiB | Streaming read buffer size. Memory allocation does not scale with file size. |
+
+Each object kind has its own count budget, so a many-page PDF never consumes the MIME or archive budget. Reaching a count, size or depth budget, or 70% of the time budget, stops further expansion without failing the scan: the verdict covers everything inspected, and the report lists what was skipped in `incomplete` (for example `"Only the first 2000 archive members were inspected"`). Content that cannot be inspected for structural reasons (password-protected PDFs, encrypted ZIP members, RAR/7-Zip/XZ/CAB containers, malformed archives) is still `UNSCANNED`, never `CLEAN`.
+
+PDF streams are decoded through full filter chains (Flate with PNG/TIFF predictors, LZW, ASCII85, ASCIIHex, RunLength, Brotli). Image codecs (DCT, JPX, JBIG2, CCITT) are scanned as encoded bytes. PDFs with an empty user password are decrypted and inspected. TAR (ustar/GNU/PAX), GZIP and ZIP members are extracted in memory.
 
 ---
 

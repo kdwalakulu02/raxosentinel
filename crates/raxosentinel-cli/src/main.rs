@@ -665,7 +665,14 @@ fn scan_descriptor(
             report.target.path = Some(path.display().to_string());
             report
         }
-        Err(e) => fail(format!("Scan failed: {e}")),
+        Err(e) => {
+            // Keep the real identity so callers can still verify which file failed.
+            let mut report = fail(format!("Scan failed: {e}"));
+            report.target.file_size_bytes = data.len() as u64;
+            report.target.sha256 = raxosentinel_core::hash_bytes(&data);
+            report.target.detected_mime = file_type.mime_type;
+            report
+        }
     }
 }
 

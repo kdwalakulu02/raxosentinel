@@ -43,6 +43,9 @@ pub enum ScanError {
     #[error("Attachment count limit exceeded: maximum allowed is {limit}")]
     AttachmentLimitExceeded { limit: usize },
 
+    #[error("{kind} limit reached: at most {limit} are inspected per scan")]
+    ObjectLimitExceeded { kind: &'static str, limit: usize },
+
     #[error(
         "Total extracted data limit exceeded: reached {current} bytes (limit is {limit} bytes)"
     )]
@@ -59,6 +62,21 @@ pub enum ScanError {
 
     #[error("Internal scanner error: {0}")]
     Internal(String),
+}
+
+impl ScanError {
+    /// Resource budget exhaustion (counts, sizes, nesting). Extraction stops and the
+    /// result is reported as partially inspected rather than failed.
+    pub fn is_budget(&self) -> bool {
+        matches!(
+            self,
+            ScanError::DepthLimitExceeded { .. }
+                | ScanError::AttachmentLimitExceeded { .. }
+                | ScanError::ObjectLimitExceeded { .. }
+                | ScanError::ExtractedSizeLimitExceeded { .. }
+                | ScanError::FileSizeLimitExceeded { .. }
+        )
+    }
 }
 
 impl serde::Serialize for ScanError {

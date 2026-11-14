@@ -144,13 +144,18 @@ fn real_files_nested_archives_mime_and_limits() {
         std::fs::write(&path, polyglot).unwrap();
         assert_eq!(run(&path, &db, &[]).1["status"], "DETECTED");
     }
-    let mut malformed = b"%PDF-1.4\nPK\x03\x04".to_vec();
-    malformed.extend_from_slice(b"incomplete archive");
+    // Four chance bytes "PK\3\4" are not an archive; a real (truncated) header is.
+    let mut chance = b"%PDF-1.4\nPK\x03\x04".to_vec();
+    chance.extend_from_slice(b"incomplete archive");
     let malformed_path = dir.join("malformed.pdf");
+    std::fs::write(&malformed_path, chance).unwrap();
+    assert_eq!(run(&malformed_path, &db, &[]).1["status"], "CLEAN");
+    let complete = zip(&[("clean.txt", b"harmless")]);
+    let mut malformed = b"%PDF-1.4\n".to_vec();
+    malformed.extend_from_slice(&complete[..45]);
     std::fs::write(&malformed_path, malformed).unwrap();
     assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
     let mut truncated = b"%PDF-1.4\n".to_vec();
-    let complete = zip(&[("clean.txt", b"harmless")]);
     truncated.extend_from_slice(&complete[..complete.len() - 10]);
     std::fs::write(&malformed_path, truncated).unwrap();
     assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
@@ -164,7 +169,10 @@ fn real_files_nested_archives_mime_and_limits() {
     std::fs::write(&malformed_path, trailing_truncated).unwrap();
     assert_eq!(run(&malformed_path, &db, &[]).1["status"], "UNSCANNED");
     let embedded_gzip = dir.join("embedded-gzip.pdf");
+    // A 3-byte GZIP magic is too weak to imply an embedded archive.
     std::fs::write(&embedded_gzip, b"%PDF-1.4\n\x1f\x8b\x08\x00").unwrap();
+    assert_eq!(run(&embedded_gzip, &db, &[]).1["status"], "CLEAN");
+    std::fs::write(&embedded_gzip, b"%PDF-1.4\nRar!\x1a\x07\x01\x00").unwrap();
     assert_eq!(run(&embedded_gzip, &db, &[]).1["status"], "UNSCANNED");
     let inner = zip(&[("payload.txt", PAYLOAD)]);
     let nested = dir.join("nested.zip");
@@ -207,19 +215,32 @@ fn real_files_nested_archives_mime_and_limits() {
     let missing = dir.join("missing.txt");
     assert_eq!(run(&missing, &db, &[]).1["status"], "ERROR");
     assert_eq!(run(&clean, &db, &["--max-size", "1"]).1["status"], "ERROR");
-    assert_ne!(
-        run(&nested, &db, &["--max-depth", "0"]).1["status"],
-        "CLEAN"
-    );
-    let names: Vec<String> = (0..31).map(|i| format!("file{i}.txt")).collect();
+    // Budgets limit how much is inspected; they report partial inspection, not errors.
+    let shallow = run(&nested, &db, &["--max-depth", "0"]).1;
+    assert_eq!(shallow["status"], "CLEAN");
+    assert!(shallow["incomplete"][0]
+        .as_str()
+        .unwrap()
+        .contains("nested deeper"));
+    let names: Vec<String> = (0..2001).map(|i| format!("file{i}.txt")).collect();
     let many: Vec<(&str, &[u8])> = names.iter().map(|s| (s.as_str(), &b"x"[..])).collect();
     let many_path = dir.join("many.zip");
     std::fs::write(&many_path, zip(&many)).unwrap();
-    assert_eq!(run(&many_path, &db, &[]).1["status"], "ERROR");
-    let zeros = vec![0u8; 26 * 1024 * 1024];
+    let many_report = run(&many_path, &db, &[]).1;
+    assert_eq!(many_report["status"], "CLEAN");
+    assert_eq!(
+        many_report["incomplete"][0],
+        "Only the first 2000 archive members were inspected"
+    );
+    let zeros = vec![0u8; 51 * 1024 * 1024];
     let bomb = dir.join("compressed.zip");
     std::fs::write(&bomb, zip(&[("zero.bin", &zeros)])).unwrap();
-    assert_eq!(run(&bomb, &db, &[]).1["status"], "ERROR");
+    let bomb_report = run(&bomb, &db, &[]).1;
+    assert_eq!(bomb_report["status"], "CLEAN");
+    assert!(bomb_report["incomplete"][0]
+        .as_str()
+        .unwrap()
+        .contains("larger than"));
     let limits = ResourceLimits {
         max_total_extracted_bytes: 4,
         ..Default::default()
@@ -230,7 +251,8 @@ fn real_files_nested_archives_mime_and_limits() {
     let report = EmailScanner::new(&database)
         .scan_object(&archive, "limit.zip", None, &mut tracker, 0)
         .unwrap();
-    assert_eq!(report.status, ScanStatus::Failed);
+    assert_eq!(report.status, ScanStatus::Clean);
+    assert!(report.incomplete[0].contains("Extraction budget"));
     let limits = ResourceLimits {
         max_scan_duration_ms: 0,
         ..Default::default()
