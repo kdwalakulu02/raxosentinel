@@ -384,6 +384,10 @@ impl DatabaseManager {
         }
 
         let (index, timings) = private_store::load_timed(&root, &generation)
+            .and_then(|(index, timings)| {
+                private_store::verify_content(&root, &generation, &index)?;
+                Ok((index, timings))
+            })
             .map_err(|e| format!("Private database verification failed for '{generation}': {e}"))?;
 
         let handle = Arc::new(ActiveDatabaseHandle::new(
@@ -682,7 +686,11 @@ impl DatabaseManager {
         );
 
         // 4. Verify candidate generation integrity before adopting
-        let (candidate_index, timings) = match private_store::load_timed(&self.root, &target_gen) {
+        let (candidate_index, timings) = match private_store::load_timed(&self.root, &target_gen)
+            .and_then(|(index, timings)| {
+                private_store::verify_content(&self.root, &target_gen, &index)?;
+                Ok((index, timings))
+            }) {
             Ok(pair) => pair,
             Err(e) => {
                 self.degraded.store(true, Ordering::SeqCst);

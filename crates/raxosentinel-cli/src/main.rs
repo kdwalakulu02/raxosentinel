@@ -504,8 +504,15 @@ fn run_scan(args: ScanArgs) -> i32 {
                 }
             }
         };
-        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load(root, &gen) {
-            Ok(index) => db.attach_rsidb(Arc::new(index)),
+        match raxosentinel_signatures::rsidb::malwarebazaar::private_store::load_with_content(
+            root, &gen,
+        ) {
+            Ok((index, content)) => {
+                db.attach_rsidb(Arc::new(index));
+                if let Some(engine) = content {
+                    db.attach_content(Arc::new(engine));
+                }
+            }
             Err(e) => {
                 eprintln!("Error: private database rejected: {e}");
                 return 3;

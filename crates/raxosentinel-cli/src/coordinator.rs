@@ -260,6 +260,7 @@ pub fn verify_startup_database(args: &ServeArgs) -> Result<(), String> {
             }
         }
         private_store::load(root, &generation)
+            .and_then(|index| private_store::verify_content(root, &generation, &index))
             .map_err(|e| format!("Private database verification failed: {e}"))?;
         tracing::info!("Private generation '{}' verified successfully", generation);
     } else if let Some(ref release) = args.public_release {

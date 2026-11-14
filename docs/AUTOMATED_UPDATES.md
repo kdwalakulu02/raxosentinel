@@ -45,6 +45,7 @@ The automated update engine (`UpdateEngine`) executes a 9-stage linear verificat
 3. **Verification**: Upstream integrity and authenticity are verified. Corrupted or partial archives are rejected immediately.
 4. **Normalization**: Hashes are extracted into canonical format (`RecordKey` with MD5, SHA-1, or SHA-256). Exclusions (`.fp`, `.sfp`, `.ign`, `.ign2`) are parsed and applied to eliminate known false positives.
 5. **Validation**: Record formats, file sizes, and metadata are strictly validated. Bytecode signatures are strictly ignored—zero ClamAV bytecode is executed.
+   - **Content signatures**: ClamAV body (`.ndb`) and logical (`.ldb`) signatures that the native content engine supports (hex patterns, wildcards, gaps, alternatives, `i/w/a/f` modifiers, logical expressions; no PCRE, macros or executable-section offsets) are written to `content-clamav.sigs` in the generation. Its SHA-256 is bound into the signed database manifest; workers verify it and compile it in memory (~0.5 s, ~70 MB per worker).
 6. **Reconciliation**:
    - **Multi-Source Claims**: If multiple sources claim the same hash, both attributions are recorded. If Source A drops a hash but Source B still reports it, the indicator is preserved in the active database.
    - **Mass Deletion Protection**: If an update would reduce total active indicators by more than the configured anomaly threshold (default: 20%), the engine aborts with `UpdateError::SuspiciousReduction` to prevent upstream ingestion failures from disarming protection.

@@ -23,6 +23,7 @@ use raxosentinel_core::{
     Threat,
 };
 use raxosentinel_filetypes::{check_extension_mismatch, detect_type, is_tar_header};
+use raxosentinel_signatures::content::Target;
 use raxosentinel_signatures::SignatureDatabase;
 use std::path::Path;
 
@@ -126,6 +127,9 @@ impl<'a> EmailScanner<'a> {
                 for t in self.db.match_bytes(raw_bytes) {
                     unparsed_threats.push(t.with_location("email_root"));
                 }
+                for t in self.db.match_content(raw_bytes).0 {
+                    unparsed_threats.push(t.with_location("email_root"));
+                }
 
                 let duration_ms = tracker.elapsed_millis().saturating_sub(start_ms);
                 let (status, details) = if !unparsed_threats.is_empty() {
@@ -174,9 +178,16 @@ impl<'a> EmailScanner<'a> {
         for t in self.db.match_rsidb(raw_bytes) {
             threats.push(t.with_location("email_root"));
         }
+        let (mail_threats, mail_partial) = self.db.match_content_as(raw_bytes, Target::Mail);
+        for t in mail_threats {
+            threats.push(t.with_location("email_root"));
+        }
+        if mail_partial {
+            ex.partial(CONTENT_BUDGET_REASON);
+        }
 
         // 2. Scan email bodies (text and html)
-        self.scan_bodies(&parsed, &mut threats, tracker)?;
+        self.scan_bodies(&parsed, &mut threats, &mut ex, tracker)?;
 
         // 3. Scan attachments and embedded parts (including inline payloads)
         self.scan_attachments(raw_bytes, &parsed, &mut threats, &mut ex, tracker, depth)?;
@@ -248,6 +259,7 @@ impl<'a> EmailScanner<'a> {
         &self,
         msg: &Message,
         threats: &mut Vec<Threat>,
+        ex: &mut Extraction,
         tracker: &ResourceTracker,
     ) -> Result<(), ScanError> {
         tracker.check_timeout()?;
@@ -267,6 +279,13 @@ impl<'a> EmailScanner<'a> {
                 for t in body_threats {
                     threats.push(t.with_location(format!("body:text/plain:part_{}", idx)));
                 }
+                let (content, partial) = self.db.match_content(body_bytes);
+                for t in content {
+                    threats.push(t.with_location(format!("body:text/plain:part_{}", idx)));
+                }
+                if partial {
+                    ex.partial(CONTENT_BUDGET_REASON);
+                }
             }
         }
 
@@ -283,6 +302,13 @@ impl<'a> EmailScanner<'a> {
                 let body_threats = self.db.match_bytes(body_bytes);
                 for t in body_threats {
                     threats.push(t.with_location(format!("body:text/html:part_{}", idx)));
+                }
+                let (content, partial) = self.db.match_content(body_bytes);
+                for t in content {
+                    threats.push(t.with_location(format!("body:text/html:part_{}", idx)));
+                }
+                if partial {
+                    ex.partial(CONTENT_BUDGET_REASON);
                 }
             }
         }
@@ -461,6 +487,10 @@ impl<'a> EmailScanner<'a> {
         for t in self.db.match_bytes(data) {
             threats.push(t.with_location(location.clone()));
         }
+        let (content, content_partial) = self.db.match_content(data);
+        for t in content {
+            threats.push(t.with_location(location.clone()));
+        }
         tracker.check_timeout()?;
 
         let mut ex = match classify_container(data, filename, declared_mime) {
@@ -478,6 +508,9 @@ impl<'a> EmailScanner<'a> {
             ContainerKind::None => Extraction::default(),
         };
 
+        if content_partial {
+            ex.partial(CONTENT_BUDGET_REASON);
+        }
         if data.starts_with(b"%PDF-") {
             ex.absorb(self.scan_pdf(data, filename, tracker, depth + 1)?);
         }
@@ -980,6 +1013,8 @@ impl<'a> EmailScanner<'a> {
     }
 }
 
+const CONTENT_BUDGET_REASON: &str =
+    "Content signature matching reached its work budget; object partially inspected";
 const SOFT_DEADLINE_REASON: &str = "Scan time budget reached; remaining content not inspected";
 
 /// Per-stream bound for object/xref streams decoded while a PDF is loaded.
@@ -1940,6 +1975,56 @@ mod tests {
                 .unwrap()
                 .status,
             ScanStatus::Clean
+        );
+    }
+
+    #[test]
+    fn content_signatures_detect_and_budget_only_marks_partial() {
+        use raxosentinel_signatures::content::ContentEngine;
+        let sigs = "ndb\tTest.Body-1:0:*:6576696c*7061796c6f6164\n\
+                    ldb\tTest.Mail-1;Target:4;0;582d4576696c2d4d61696c65723a\n";
+        let mime = |attachment: &str| {
+            format!(
+                "From: a@example.com\r\nX-Evil-Mailer: 1\r\nTo: b@example.com\r\nSubject: t\r\n\
+                 MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+                 --B\r\nContent-Type: text/plain\r\n\r\nhello\r\n\
+                 --B\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=\"cv.bin\"\r\n\r\n{attachment}\r\n--B--\r\n"
+            )
+        };
+        let mut db = SignatureDatabase::with_defaults();
+        db.attach_content(std::sync::Arc::new(ContentEngine::from_text(sigs).unwrap()));
+        let scanner = EmailScanner::new(&db);
+        let scan = |db_scanner: &EmailScanner, raw: &str| {
+            let mut tracker = ResourceTracker::new(ResourceLimits::default());
+            db_scanner
+                .scan_bytes(raw.as_bytes(), Some("m.eml"), &mut tracker)
+                .unwrap()
+        };
+
+        let report = scan(&scanner, &mime("evil ... payload"));
+        assert_eq!(report.status, ScanStatus::Infected);
+        let names: Vec<_> = report.threats.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Test.Body-1"), "{names:?}");
+        // The raw message carries `X-Evil-Mailer:` and is matched as a Mail target.
+        assert!(names.contains(&"Test.Mail-1"), "{names:?}");
+
+        // Running out of matching budget is a partial-inspection note, never a withhold.
+        let mut slow = SignatureDatabase::with_defaults();
+        slow.attach_content(std::sync::Arc::new(
+            ContentEngine::from_text("ndb\tTest.Slow-1:0:*:616263*78797a\n")
+                .unwrap()
+                .with_step_budget(100),
+        ));
+        let report = scan(&EmailScanner::new(&slow), &mime(&"abc".repeat(2000)));
+        assert_eq!(report.status, ScanStatus::Clean);
+        assert!(
+            report
+                .incomplete
+                .iter()
+                .any(|r| r.contains("Content signature")),
+            "{:?}",
+            report.incomplete
         );
     }
 

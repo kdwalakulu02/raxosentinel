@@ -11,6 +11,7 @@ libc = "0.2"
 tempfile.workspace = true
 raxosentinel-core = { path = "../raxosentinel-core" }
 aho-corasick.workspace = true
+memchr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true

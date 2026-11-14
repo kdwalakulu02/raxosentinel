@@ -37,6 +37,9 @@ pub struct FreshclamReport {
 
 /// Query the official ClamAV DNS TXT record at `current.cvd.clamav.net`.
 /// Returns the raw TXT record string, e.g. "1.4.6:63:28173:1793768400:1:90:49192:339".
+/// Generation file carrying the supported ClamAV ndb/ldb content signatures.
+pub const CONTENT_FILE: &str = "content-clamav.sigs";
+
 pub fn query_clamav_dns_txt() -> Result<String, String> {
     // Discover DNS resolver from /etc/resolv.conf, default to 127.0.0.53:53
     let mut server: SocketAddr = "127.0.0.53:53".parse().unwrap();
@@ -927,8 +930,46 @@ impl IntelligenceProvider for ClamAvProvider {
             }
         }
 
+        // 4. Body/logical content signatures the native content engine supports.
+        let mut content = String::new();
+        let mut content_count = 0usize;
+        for (file, kind) in [
+            ("main/main.ndb", "ndb"),
+            ("daily/daily.ndb", "ndb"),
+            ("main/main.ldb", "ldb"),
+            ("daily/daily.ldb", "ldb"),
+        ] {
+            let path = dir.join(file);
+            if !path.exists() {
+                continue;
+            }
+            let text = fs::read_to_string(&path).map_err(|e| UpdateError::ExtractionFailed {
+                provider: self.id().to_string(),
+                message: format!("Failed to read {}: {e}", path.display()),
+            })?;
+            for line in text.lines() {
+                let line = line.trim_end_matches('\r');
+                if line.is_empty()
+                    || line.starts_with('#')
+                    || ign_names.contains(crate::content::signature_name(kind, line))
+                    || !crate::content::is_supported(kind, line)
+                {
+                    continue;
+                }
+                content.push_str(kind);
+                content.push('\t');
+                content.push_str(line);
+                content.push('\n');
+                content_count += 1;
+            }
+        }
+
         let ev_bytes = &acquisition.evidence_files[0].1;
         let ev_sha256 = hex::encode(Sha256::digest(ev_bytes));
+        let mut evidence_files = acquisition.evidence_files.clone();
+        if content_count > 0 {
+            evidence_files.push((CONTENT_FILE.to_string(), content.into_bytes()));
+        }
 
         let source_info = UnifiedSource {
             id: self.id().to_string(),
@@ -950,7 +991,7 @@ impl IntelligenceProvider for ClamAvProvider {
             entries,
             claims,
             revocations,
-            evidence_files: acquisition.evidence_files.clone(),
+            evidence_files,
             gross_records,
             rejected_records,
             duplicate_records,

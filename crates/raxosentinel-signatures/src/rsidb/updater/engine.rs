@@ -393,7 +393,10 @@ impl UpdateEngine {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
-                        if fname.starts_with("evidence-") || fname.starts_with("acq-") {
+                        if fname.starts_with("evidence-")
+                            || fname.starts_with("acq-")
+                            || fname.starts_with(private_store::unified::CONTENT_PREFIX)
+                        {
                             if let Ok(bytes) = fs::read(&path) {
                                 existing_evidence.insert(fname.to_string(), bytes);
                             }
@@ -556,8 +559,18 @@ impl UpdateEngine {
         .map_err(|e| UpdateError::DatabaseVerificationFailed(gen_name.clone(), e))?;
 
         // 9. Strict database verification before activation
-        let (verified_db, _timings) = private_store::load_timed(&self.root, &gen_name)
+        let (verified_db, content) = private_store::load_with_content(&self.root, &gen_name)
             .map_err(|e| UpdateError::DatabaseVerificationFailed(gen_name.clone(), e))?;
+        if let Some(engine) = content {
+            if engine.signature_count() == 0
+                || !engine.scan(b"benign clean test data").names.is_empty()
+            {
+                return Err(UpdateError::DatabaseVerificationFailed(
+                    gen_name,
+                    "Content signatures failed verification".to_string(),
+                ));
+            }
+        }
 
         // Spot-check indicator lookups
         if verified_db.total_records() != final_count {

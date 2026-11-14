@@ -17,6 +17,7 @@
  */
 
 use crate::builtin::{default_hash_rules, default_pattern_rules};
+use crate::content::{ContentEngine, ContentMatches, Target};
 use crate::models::{HashRule, PatternRule};
 use crate::rsidb::RsidbIndex;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -24,6 +25,30 @@ use raxosentinel_core::{ResourceTracker, ScanError, Severity, Threat, ThreatCate
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
+
+fn content_threats(result: ContentMatches, size: usize) -> (Vec<Threat>, bool) {
+    let threats = result
+        .names
+        .into_iter()
+        .map(|name| {
+            let category = if name.contains("Phishing") {
+                ThreatCategory::Phishing
+            } else {
+                ThreatCategory::Other("content-signature".to_string())
+            };
+            let mut t = Threat::new(
+                &name,
+                category,
+                Severity::High,
+                "Content signature match",
+                format!("content:size={size}"),
+            );
+            t.detection_type = raxosentinel_core::DetectionType::Deterministic;
+            t
+        })
+        .collect();
+    (threats, result.budget_exhausted)
+}
 
 const MAX_REPORTED_PATTERN_OFFSETS: usize = 32;
 
@@ -35,6 +60,8 @@ pub struct SignatureDatabase {
     max_pattern_len: usize,
     /// Optional validated native RSIDB hash index (MD5/SHA-1/SHA-256 + size).
     rsidb: Option<Arc<dyn RsidbIndex>>,
+    /// Optional ClamAV-compatible body/logical signature engine.
+    content: Option<Arc<ContentEngine>>,
 }
 
 impl Default for SignatureDatabase {
@@ -52,6 +79,7 @@ impl SignatureDatabase {
             automaton: None,
             max_pattern_len: 0,
             rsidb: None,
+            content: None,
         }
     }
 
@@ -94,6 +122,33 @@ impl SignatureDatabase {
                 t
             })
             .collect()
+    }
+
+    /// Attaches a compiled content-signature engine.
+    pub fn attach_content(&mut self, engine: Arc<ContentEngine>) {
+        self.content = Some(engine);
+    }
+
+    /// Returns true when a content-signature engine is attached.
+    pub fn has_content(&self) -> bool {
+        self.content.is_some()
+    }
+
+    /// Runs the content-signature engine over a complete object. The flag reports
+    /// that matching stopped early, so the object was only partially inspected.
+    pub fn match_content(&self, data: &[u8]) -> (Vec<Threat>, bool) {
+        match &self.content {
+            Some(engine) => content_threats(engine.scan(data), data.len()),
+            None => (Vec::new(), false),
+        }
+    }
+
+    /// Like `match_content`, restricted to the signatures of one known type.
+    pub fn match_content_as(&self, data: &[u8], target: Target) -> (Vec<Threat>, bool) {
+        match &self.content {
+            Some(engine) => content_threats(engine.scan_as(data, target), data.len()),
+            None => (Vec::new(), false),
+        }
     }
 
     /// Creates a database loaded with standard built-in rules (EICAR, test rules, heuristics).

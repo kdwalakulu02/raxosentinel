@@ -1557,6 +1557,7 @@ dependencies = [
  "libc",
  "mail-parser",
  "md-5 0.10.6",
+ "memchr",
  "memmap2",
  "rand 0.8.8",
  "raxosentinel-core",

@@ -17,6 +17,7 @@
  */
 
 pub mod builtin;
+pub mod content;
 pub mod database;
 pub mod loader;
 pub mod models;
